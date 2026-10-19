@@ -1,6 +1,7 @@
 /out/
 /dist/
 /rust/target/
+/src-tauri/target/
 /.codegraph/
 /CMakeUserPresets.json
 *.user

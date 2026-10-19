@@ -1,74 +1,59 @@
-# magpie_hud
+# magpie-hud
 
-Rust + CXX-Qt 0.10 + Qt6 Widgets + WebView2，应用标识 magpie_hud，初始版本 0.1.0。
+目标：使用 **Tauri 2 + 系统 WebView** 构建 Windows 独立悬浮窗，只读 Magpie 的 `usage.jsonl`，显示简化分流图与固定两行带本地时间的路由说明。不修改 Magpie，不读取密钥，不集成进 rs_agent_router；MVP 不依赖 HTTP API。
 
-~~~text
-ui/mainwindow.ui        Qt Designer 界面真源
-ui/qrc.qrc              应用资源清单，可在 Designer 中编辑
-ui/img/                随应用携带的图标
-cpp/                   Qt 窗口、控件与信号连接
-cpp/native_webview.*   原生 WebView2 页面控件
-resources/html/        随应用发布的本地 HTML 页面
-rust/src/backend.rs    Rust QObject / Qt 线程回传边界
-rust/src/business.rs   纯 Rust 业务
-rust/Cargo.toml        应用版本和 Rust 依赖（独立 app_backend crate）
-build.ps1              检查、构建、运行、测试、目录打包
-dist/                  发布目录
-~~~
+**当前状态：M1–M3 已实现 Tauri 2 悬浮窗。** 程序只读 `usage.jsonl`，显示三节点流向、固定两行说明，并支持托盘、置顶、位置恢复和工作区约束。
 
-默认使用 Windows 自带的 Windows PowerShell 5.1，PowerShell 7 也可运行：
+UI 基准见 [独立 HTML 原型](docs/ui/magpie-hud.html) 与 [M1 §2 设计总纲](docs/feat/Feat_261019_1_悬浮窗基础闭环.md)。默认 840×280，石墨深色底、洋红三节点流向、底部固定两行时间说明；外围工具可演示正常、等待、缺文件、坏行、缺字段和长文本。示例使用虚构账号，不读取本机日志。原型静态/脚本验证通过；本轮浏览器预览工具仍绑定旧项目目录，未完成视觉截图，原生置顶/拖动/托盘和多屏尚待 Tauri 验证。
 
-~~~powershell
-powershell.exe -NoProfile -File .\build.ps1 -Action check
-powershell.exe -NoProfile -File .\build.ps1 -Action run
-powershell.exe -NoProfile -File .\build.ps1 -Action test
-powershell.exe -NoProfile -File .\build.ps1 -Action package
-~~~
+完整需求见 [Magpie 路由监视悬浮窗 SPEC](docs/spec/magpie-route-float-SPEC.md)，由用户于 2026-10-19 提供，原文归档。产品和目录名采用用户指定的 `magpie-hud`，覆盖 SPEC 中可改的建议名称 `magpie-route-float`。
 
-不传 `-Action` 时默认编译并打开窗口。在传统 PowerShell 中也可直接执行
-`.\build.ps1`；在 PowerShell 7 中直接执行则由当前版本运行，不会自动切换。
-`build.ps1` 请保持 UTF-8 BOM 编码，以便传统 PowerShell 正确读取中文。
+优先交付 M1+M2；M3 的多屏工作区与配置要求仍属于完整产品验收。数据在请求完成后写入，≤500ms 的刷新验收从完整记录落盘开始计算。完整排除原因待二期对接路由 API；当前需求允许第二行使用明确占位，不能编造原因。
 
-构建读取本机 %LOCALAPPDATA%\Smallcat\rsqt\toolchain.json，也可通过
--Toolchain 指定其他配置。首次构建需要联网下载 Rust 依赖和固定版本的
-CXX-Qt CMake 集成；首次产生的 rust/Cargo.lock 应纳入应用版本管理。
-编译缓存位于 %LOCALAPPDATA%\Smallcat\rsqt\b 下，以项目绝对路径哈希隔离，
-构建时打印实际路径。使用短路径和固定后端 crate 名，规避 MSVC 的路径长度限制。
+## 运行
 
-继续用现有 PySide6 Designer 编辑 .ui。构建由 CMake AUTOUIC 自动生成 C++
-头文件，不运行 pyside6-uic，不手改生成产物。Python 自定义控件不能直接放入
-此工程，需按实际需求提供 C++ 控件。模板使用 Qt 原生按钮。
+要求 Rust stable、Windows 10/11 WebView2 Runtime 和项目内 Tauri CLI 2。全局 `cargo tauri` 若仍是 1.x，不能用来构建本项目。
 
-初始窗口的 styleSheet 继承 Tools 创建器的 qss_base.ui，后续在 Designer 中
-选择 MainWindow 编辑样式。模板自带“执行示例”按钮图标，使用应用内的
-ui/qrc.qrc 与 ui/img/play-circle.svg；资源路径为 :/common/img/play-circle.svg。
-添加图片时先放入 ui/img/，再在 Designer 资源编辑器中加入 qrc.qrc。
-CMake AUTORCC 会自动把资源编进 EXE，修改 .ui、.qrc 或图标后重新 build 即可。
+```powershell
+cargo install tauri-cli --version "^2.0.0" --locked
+cargo tauri dev
+cargo tauri build
+```
 
-业务入口在 Rust，耗时任务进入后台线程，通过 CXX-Qt 队列回 Qt 线程更新属性。
-QObject 和控件只在 GUI 线程访问；任务持有输入数据的副本。示例任务不访问网络
-或数据库；实际长任务需要按业务补取消与退出等待，不能跨线程直接操作窗口。
+默认读取 `%USERPROFILE%\.config\magpie\usage.jsonl`，配置位于 `%APPDATA%\magpie-hud\config.json`。配置可改 `usageJsonlPath`、`magpieHost`、窗口位置和 `alwaysOnTop`；地址只用于显示，不发起 HTTP 请求。第二行在日志没有完整排除原因时显示明确占位。
 
-版本真源为 rust/Cargo.toml，CMake 读取后写入 Qt 应用版本。Debug 与 Release
-都使用 MSVC /MD 和 Qt Release DLL，并采用 GUI 子系统，均不另开控制台。
-通过 build.ps1 运行时，编译信息和应用的 Qt 日志、标准输出显示在原终端；
-脚本只让应用附加已有终端。直接双击 EXE 时显示应用窗口，没有终端日志窗口。
-package 使用
-windeployqt 和 PE 依赖扫描收集动态库，并复制 resources/html；产物为目录，
-不能仅复制 exe。
+本程序是 Magpie 的只读外挂监视器，不修改 Magpie，不读取密钥，也不集成进 rs_agent_router。
 
-WebView2 默认显示 resources/html/magpie_hud_1.html。页面经 WebView2 虚拟域名
-映射加载，允许同目录的相对 CSS、JS 和图片资源；页面导航限制在应用资源域名。
-修改页面后重新 build。开发机需要 WebView2 SDK：build.ps1 默认读取
-%LOCALAPPDATA%\RSDeployBuild\WebView2，也可传 -WebView2Sdk 指定解压后的 SDK 根目录。
-目标机器需安装 Microsoft Edge WebView2 Evergreen Runtime；缺失时控件显示错误，
-Qt 原生界面仍可打开。Runtime 不随 package 目录打包；发布安装流程需确保已安装。
-在有桌面的开发机上，可对构建产物运行 `magpie_hud.exe --webview-smoke`；
-退出码 0 表示本地 HTML 已由 WebView2 加载，1 表示失败，
-2 表示十秒内未完成。普通 `-Action test` 使用离屏 Qt 平台，只验证原生 GUI/Rust 链路。
-参见 [Microsoft WebView2 分发说明](https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution)。
+## 验证状态
 
-Qt 采用社区 conda-forge 的开源开发包。分发来源不改变许可证要求；正式发布时
-须按实际 Qt 模块及第三方库随附许可证、版权与所需源码获取信息。参见
-[Qt 许可说明](https://doc.qt.io/qt-6/licensing.html)、
-[conda-forge Qt 包说明](https://conda-forge.org/blog/2026/07/01/qt6-status-in-conda-forge/)。
+`cargo test --lib` 5 项通过，`cargo build` 通过。隔离环境完成启动、追加临时日志、进程保持响应和退出冒烟。真实 Magpie 的 500ms 刷新、系统托盘视觉、三屏/DPI 与任务栏边界尚未在目标桌面完成人工验收。
+
+## 变更记录
+
+2026-10-19 | 0.1.0 | 用 Tauri 2 实现路由悬浮窗，替换 RSQt 脚手架；完成日志尾部监视、两行说明、三节点、托盘、配置与工作区约束。
+
+## SOP的开发信息
+
+### Feat
+
+| 编号 | 简述 | 阶段 | 描述 |
+| --- | --- | --- | --- |
+| [Feat_261019_1](docs/feat/Feat_261019_1_悬浮窗基础闭环.md) | 悬浮窗基础闭环 | 开发 | T1–T3 完成：Tauri 窗口、尾部解析与两行实时说明。 |
+| [Feat_261019_2](docs/feat/Feat_261019_2_分流图与托盘.md) | 分流图与托盘 | 开发 | T4 完成：三节点 SVG、320ms 高亮和系统托盘。 |
+| [Feat_261019_3](docs/feat/Feat_261019_3_多屏与配置.md) | 多屏与配置 | 开发 | T5 完成：位置恢复、工作区约束和本地配置；实机多屏待验收。 |
+
+## 变更记录
+
+2026-10-19 | 0.1.0（脚手架版本） | 归档路由悬浮窗 SPEC，建立 M1/M2/M3 三份需求档案，明确后续切换 Tauri 2；本轮未改应用代码。
+
+2026-10-19 | 0.1.0（脚手架版本） | 按用户授权自行设计 WebView UI，新增独立 HTML 原型及本地预览配置，归档三份 FEAT §2；静态/脚本验证通过，浏览器视觉及原生窗口行为待验收。
+
+## SOP的开发信息
+
+### Feat
+
+| 编号 | 简述 | 阶段 | 描述 |
+| --- | --- | --- | --- |
+| [Feat_261019_1](docs/feat/Feat_261019_1_悬浮窗基础闭环.md) | 悬浮窗基础闭环 | UI | 整窗总纲与独立 HTML 原型已归档，840×280 三段布局；视觉及 Tauri 接入待验收。 |
+| [Feat_261019_2](docs/feat/Feat_261019_2_分流图与托盘.md) | 分流图与托盘 | UI | 三节点 SVG、320ms 命中高亮与托盘交互已归档；系统托盘待接入。 |
+| [Feat_261019_3](docs/feat/Feat_261019_3_多屏与配置.md) | 多屏与配置 | UI | 窗口恢复、工作区与配置反馈行为已归档，不新增设置页；实机多屏待验收。 |
