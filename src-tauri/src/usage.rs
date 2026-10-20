@@ -625,4 +625,48 @@ mod tests {
         assert!(ledger.change_day(ledger.day.succ_opt().unwrap()));
         assert_eq!(ledger.snapshot("h", "ready", None).daily.requests, 0);
     }
+
+    /// 文案公式只使用真实字段；缺字段、无效分母和非有限耗时不冒充 0。
+    #[test]
+    fn formats_time_tokens_and_cache_without_inventing_values() {
+        let mut ledger = ledger();
+        let mut value = fixture(8, "alpha", 200);
+        value["req"] = json!("group/smart-split");
+        value["cache_write"] = json!(50);
+        ledger.ingest(value.to_string().as_bytes());
+        let note = &ledger.snapshot("h", "ready", None).sessions[0].notes[0];
+        assert_eq!(note.time.len(), 8);
+        assert!(note.text.contains("1.0k token"));
+        assert!(note.text.contains("缓存命中率 88.9%（估算）"));
+        assert!(note.text.contains("3.0s"));
+        assert!(note.text.contains("1.0s 后首响"));
+        assert!(!note.text.contains("cache_write") && !note.text.contains("50"));
+
+        let mut missing = fixture(9, "beta", 200);
+        missing.as_object_mut().unwrap().remove("ms");
+        missing["ttft_ms"] = json!(f64::NAN);
+        missing["in"] = json!(0);
+        missing["out"] = json!(0);
+        missing["cache_read"] = json!(0);
+        ledger.ingest(missing.to_string().as_bytes());
+        let incomplete = &ledger.snapshot("h", "ready", None).sessions[0].notes[0];
+        assert!(!incomplete.text.contains("token"));
+        assert!(!incomplete.text.contains("缓存命中率"));
+        assert!(!incomplete.text.contains("NaN"));
+        assert_eq!(ledger.snapshot("h", "ready", None).daily.tokens_per_second, Some(50.0));
+    }
+
+    /// 非对象、空文件和未换行记录都不形成路由，也不伪造时间。
+    #[test]
+    fn ignores_empty_non_object_and_incomplete_records() {
+        let mut ledger = ledger();
+        ledger.ingest(b"");
+        ledger.ingest(b"[]");
+        ledger.ingest(br#"{"route_id":1,"status":200}"#);
+        let view = ledger.snapshot("h", "ready", None);
+        assert!(view.sessions.is_empty());
+        assert_eq!(view.notes[0].time, "--:--:--");
+        assert_eq!(view.daily.requests, 0);
+        assert_eq!(view.state, "warning");
+    }
 }

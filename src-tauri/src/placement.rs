@@ -66,5 +66,9 @@ mod tests {
         assert_eq!(monitor_for_window(window, &[left, right]), Some(right));
         assert_eq!(constrain(window, right), PhysicalRect { x: 0, y: 700, width: 840, height: 280 });
         assert_eq!(constrain(window, PhysicalRect { x: 10, y: 20, width: 500, height: 100 }), PhysicalRect { x: 10, y: 20, width: 500, height: 100 });
+        let disconnected = PhysicalRect { x: 5000, y: 3000, width: 840, height: 280 };
+        assert_eq!(monitor_for_window(disconnected, &[left, right]), Some(right));
+        let overlap = PhysicalRect { x: -200, y: 900, width: 400, height: 200 };
+        assert_eq!(monitor_for_window(overlap, &[left, right]), Some(left));
     }
 }

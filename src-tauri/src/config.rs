@@ -84,6 +84,24 @@ pub fn usage_path(config: &AppConfig) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// 空路径回到默认日志，空白地址与关闭置顶必须原样保存。
+    #[test]
+    fn preserves_empty_path_blank_host_and_pin_choice() {
+        let directory = std::env::temp_dir().join(format!("magpie-hud-config-fields-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        let path = directory.join("config.json");
+        let mut config = AppConfig::default();
+        config.usage_jsonl_path = "   ".into();
+        config.magpie_host = "   ".into();
+        config.always_on_top = false;
+        save_config(&path, &config).unwrap();
+        let loaded = load_config(&path).unwrap();
+        assert_eq!(loaded.magpie_host, "   ");
+        assert!(!loaded.always_on_top);
+        assert_eq!(usage_path(&loaded), default_usage_path());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     /// 验证默认配置、损坏配置报错和自定义路径往返。
     #[test]
     fn roundtrips_without_hiding_invalid_json() {

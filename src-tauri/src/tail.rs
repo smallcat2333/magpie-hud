@@ -153,6 +153,13 @@ mod tests {
         std::fs::write(&path, format!("{line}\n")).unwrap();
         cursor.update(&path, &mut ledger).unwrap();
         assert_eq!(ledger.snapshot("h", "ready", None).daily.requests, 1);
+        std::fs::write(&path, format!("{{\"not\":\"json\"}}\n{line}\n")).unwrap();
+        cursor.update(&path, &mut ledger).unwrap();
+        assert_eq!(ledger.snapshot("h", "ready", None).daily.requests, 1);
+        let oversized = format!("{{\"route_id\":99,\"payload\":\"{}\"}}\n", "x".repeat(70_000));
+        std::fs::write(&path, oversized).unwrap();
+        cursor.update(&path, &mut ledger).unwrap();
+        assert_eq!(ledger.snapshot("h", "ready", None).daily.requests, 0);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
