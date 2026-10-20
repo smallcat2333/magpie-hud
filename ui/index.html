@@ -109,7 +109,7 @@
           <section class="router-node" tabindex="0" aria-label="本机 magpie 路由器">
             <div class="router-emblem"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 16 7 5l5 9L17 5l4 11M7 5l5 3 5-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg></div>
             <strong class="router-name">magpie</strong>
-            <span class="router-host" title="127.0.0.1:3425">127.0.0.1:3425</span>
+            <span class="router-host" id="router-host" title="127.0.0.1:3425">127.0.0.1:3425</span>
           </section>
           <svg class="connector" viewBox="0 0 100 112" preserveAspectRatio="none" aria-hidden="true">
             <path class="route-track" d="M6 38C58 38 54 65 94 65"/>
@@ -147,10 +147,8 @@
     text('router-host', s.magpieHost); text('account-caption', s.active ? '本次命中' : '等待记录');
     text('account-name', s.account); text('account-model', s.model);
     for (const n of [1,2]) { text('line'+n+'-time', s['line'+n+'Time']); text('line'+n+'-kind', s['line'+n+'Kind']); text('line'+n+'-text', s['line'+n+'Text']); }
-    document.querySelector('.agent-node').title = s.agent + '
-' + s.request;
-    document.querySelector('.account-node').title = s.account + '
-' + s.model;
+    document.querySelector('.agent-node').title = s.agent + '\n' + s.request;
+    document.querySelector('.account-node').title = s.account + '\n' + s.model;
     if (animate && s.active && !reduced.matches) pulse();
   }
   function pulse() { animations.forEach(a => a.cancel()); animations = [...document.querySelectorAll('.route-flare')].map(path => path.animate([{strokeDashoffset:112,opacity:0},{opacity:1,offset:.15},{strokeDashoffset:-12,opacity:0}],{duration:320,easing:'linear'})); }
