@@ -1,184 +1,628 @@
-//! Magpie usage.jsonl 的尾部解析与中文文案生成。
-//!
-//! 输入是外部追加日志，字段可能缺失或半行未写完；输出是固定两个信息槽的结构化快照。
-//! 只读取调用方传入的文本，不访问密钥文件或网络。
+//! 当日日志的会话聚合、真实请求状态与统计快照；不读取凭据或推测账号冷却时间。
 
-use chrono::DateTime;
+use chrono::{DateTime, Local, NaiveDate};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// 前端一次渲染所需的完整路由快照；图与两行必须来自同一份数据。
+/// 固定日志槽；没有真实时间时显示明确占位。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Note {
+    pub time: String,
+    pub kind: String,
+    pub text: String,
+}
+
+/// 当日统计。Credits 是日志记录的消耗单位，不等同货币；速度按有效生成时间加权。
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyStats {
+    pub requests: u64,
+    pub tokens: u64,
+    pub credits: Option<f64>,
+    pub credited_requests: u64,
+    pub output_tokens: u64,
+    pub generation_ms: f64,
+    pub speed_samples: u64,
+    pub tokens_per_second: Option<f64>,
+}
+
+impl DailyStats {
+    /// 将一个完成请求计入统计；路由分类器调用在入口处排除，不重复累计。
+    fn add(&mut self, record: &Record) {
+        self.requests += 1;
+        self.tokens += record.tokens;
+        if let Some(credits) = record.credits {
+            self.credits = Some(self.credits.unwrap_or(0.0) + credits);
+            self.credited_requests += 1;
+        }
+        if record.success() {
+            if let Some(duration) = record.generation_ms {
+                self.output_tokens += record.output;
+                self.generation_ms += duration;
+                self.speed_samples += 1;
+                self.tokens_per_second =
+                    Some(self.output_tokens as f64 * 1000.0 / self.generation_ms);
+            }
+        }
+    }
+}
+
+/// 一次已完成的外部记录，仅保留展示和聚合所需字段。
+#[derive(Clone, Debug)]
+struct Record {
+    identity: String,
+    timestamp_ms: i64,
+    sequence: u64,
+    time: String,
+    session: String,
+    agent: String,
+    request: String,
+    account: String,
+    model: String,
+    provider: String,
+    effort: String,
+    status: Option<u16>,
+    error: Option<String>,
+    tries: u64,
+    tokens: u64,
+    output: u64,
+    duration_ms: Option<f64>,
+    ttft_ms: Option<f64>,
+    cache_hit_percent: Option<f64>,
+    generation_ms: Option<f64>,
+    credits: Option<f64>,
+}
+
+impl Record {
+    /// 明确的 2xx 才算成功；取消和缺失状态不冒充成功。
+    fn success(&self) -> bool {
+        self.status
+            .is_some_and(|status| (200..300).contains(&status))
+    }
+
+    /// 区分调用方取消和服务失败，防止把 499 变成账号冷却。
+    fn outcome(&self) -> &'static str {
+        if self.success() {
+            "success"
+        } else if self.status == Some(499) {
+            "cancelled"
+        } else if self.status.is_some() {
+            "failed"
+        } else {
+            "unknown"
+        }
+    }
+
+    /// 输出带原始状态码的简短中文说明，不虚构重试间隔。
+    fn detail(&self, recovered: bool) -> String {
+        match self.outcome() {
+            "success" if self.tries > 1 => format!("重试 {} 次后完成", self.tries - 1),
+            "success" if recovered => "后续请求成功 · 已恢复".into(),
+            "success" => "请求已完成".into(),
+            "cancelled" => "请求已取消 · 不是账号冷却".into(),
+            "failed" => format!("失败 HTTP {} · 恢复时间未记录", self.status.unwrap()),
+            _ => "日志未提供请求状态".into(),
+        }
+    }
+
+    /// 第一行展示请求本身，包含失败原因；第二行在会话快照中补充恢复依据。
+    fn note(&self, recovered: bool) -> Note {
+        let kind = match self.outcome() {
+            "success" => {
+                if recovered || self.tries > 1 {
+                    "恢复"
+                } else {
+                    "完成"
+                }
+            }
+            "cancelled" => "取消",
+            "failed" => "失败",
+            _ => "状态",
+        };
+        let mut text = format!(
+            "{} ({}) · {} · {}",
+            self.account,
+            self.model,
+            self.effort,
+            self.detail(recovered)
+        );
+        if let Some(duration) = self.duration_ms {
+            text.push_str(&format!(" · {:.1}s", duration / 1000.0));
+        }
+        if self.tokens > 0 {
+            text.push_str(&format!(" · {:.1}k token", self.tokens as f64 / 1000.0));
+        }
+        if let Some(ttft) = self.ttft_ms {
+            text.push_str(&format!(" · {:.1}s 后首响", ttft / 1000.0));
+        }
+        if let Some(hit) = self.cache_hit_percent {
+            text.push_str(&format!(" · 缓存命中率 {:.1}%（估算）", hit));
+        }
+        if let Some(error) = &self.error {
+            text.push_str(&format!(" · {error}"));
+        }
+        Note {
+            time: self.time.clone(),
+            kind: kind.into(),
+            text,
+        }
+    }
+}
+
+/// 每个真实账号的两行路由块；恢复只根据已记录失败后的成功或 tries 判定。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteCard {
+    pub id: String,
+    pub session_id: String,
+    pub session_label: String,
+    pub account: String,
+    pub model: String,
+    pub provider: String,
+    pub effort: String,
+    pub state: String,
+    pub detail: String,
+    pub error: Option<String>,
+    pub time: String,
+    pub current: bool,
+    pub note: Note,
+}
+
+/// 会话的路由块、最新两行说明和当日统计，前端可无需再次读文件直接切换。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionView {
+    pub id: String,
+    pub label: String,
+    pub timestamp_ms: i64,
+    pub latest_sequence: u64,
+    pub agent: String,
+    pub request: String,
+    pub routes: Vec<RouteCard>,
+    pub notes: [Note; 2],
+    pub daily: DailyStats,
+}
+
+/// 图、会话列表、全局统计使用同一次原子快照，revision 控制前端去重。
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteSnapshot {
-    /// 文件状态：ready、waiting、missing、warning。
+    pub revision: u64,
+    pub date: String,
     pub state: String,
-    /// 顶部状态文案。
     pub watch_label: String,
-    /// 是否存在可展示的命中记录。
-    pub active: bool,
-    /// 用于去重的 route_id 与时间组合；空表示当前不是有效新记录。
-    pub identity: String,
-    /// 请求来源名称。
-    pub agent: String,
-    /// 请求模型。
-    pub request: String,
-    /// 仅用于显示的 Magpie 地址。
     pub magpie_host: String,
-    /// 命中账号；无记录时为明确占位。
-    pub account: String,
-    /// 实际服务模型。
-    pub model: String,
-    /// 第一行来源时间，缺失时为 `--:--:--`。
-    pub line1_time: String,
-    /// 第一行类型。
-    pub line1_kind: String,
-    /// 第一行说明。
-    pub line1_text: String,
-    /// 第二行来源时间。
-    pub line2_time: String,
-    /// 第二行类型。
-    pub line2_kind: String,
-    /// 第二行说明或明确占位。
-    pub line2_text: String,
+    pub sessions: Vec<SessionView>,
+    pub daily: DailyStats,
+    pub notes: [Note; 2],
+    pub error: Option<String>,
 }
 
-/// 从日志尾部提取最新有效记录。
-///
-/// `tail` 可以包含被 64KB 边界截断的首行；该行和末尾未换行半行都会跳过。
-/// 返回 `None` 表示尾部没有完整且可解析的记录。
-pub fn latest_record(tail: &str) -> Option<Value> {
-    let mut lines = tail.lines().map(str::trim).filter(|line| !line.is_empty());
-    if !tail.starts_with('{') {
-        lines.next();
+/// 内存中的当日完成请求；启动流式读取历史，之后只追加新完整行。
+pub struct UsageLedger {
+    day: NaiveDate,
+    records: Vec<Record>,
+    seen: HashSet<String>,
+    pub revision: u64,
+    malformed: u64,
+}
+
+impl UsageLedger {
+    /// 创建指定本地日期账本，支持测试跨日重置。
+    pub fn new(day: NaiveDate) -> Self {
+        Self {
+            day,
+            records: Vec::new(),
+            seen: HashSet::new(),
+            revision: 0,
+            malformed: 0,
+        }
     }
-    let complete = if tail.ends_with('\n') { lines.collect::<Vec<_>>() } else {
-        let mut values = lines.collect::<Vec<_>>();
-        values.pop();
-        values
-    };
-    complete.into_iter().rev().find_map(|line| serde_json::from_str::<Value>(line).ok())
-}
 
-/// 把最新记录转成前端快照。
-///
-/// `warning` 为 true 时保留记录内容，但把顶部状态改为解析异常。
-/// 成功记录按实机口径使用 HTTP `status == 200`；`model` 是带窗口后缀的服务模型。
-pub fn snapshot_from_record(record: &Value, magpie_host: &str, warning: bool) -> RouteSnapshot {
-    let account = text(record, &["providerAccount", "host"]).unwrap_or_else(|| "账号未提供".to_string());
-    let model = text(record, &["model"]).unwrap_or_else(|| "服务模型未提供".to_string());
-    let request = text(record, &["req"]).unwrap_or_else(|| "请求模型未提供".to_string());
-    let agent = agent_label(&text(record, &["agent"]).unwrap_or_else(|| "Agent 未提供".to_string()));
-    let time = record.get("t").and_then(Value::as_str).and_then(local_hms);
-    let route_id = record.get("route_id").map(Value::to_string).unwrap_or_default();
-    let stamp = record.get("t").and_then(Value::as_str).unwrap_or("");
-    RouteSnapshot {
-        state: if warning { "warning" } else { "ready" }.to_string(),
-        watch_label: if warning { "解析异常 · 保留上一帧" } else { "最近一次路由" }.to_string(),
-        active: true,
-        identity: format!("{route_id}|{stamp}"),
-        agent,
-        request: request.clone(),
-        magpie_host: magpie_host.to_string(),
-        account: account.clone(),
-        model: model.clone(),
-        line1_time: time.clone().unwrap_or_else(|| "--:--:--".to_string()),
-        line1_kind: "命中".to_string(),
-        line1_text: hit_line(record, &account, &model, &request),
-        line2_time: time.unwrap_or_else(|| "--:--:--".to_string()),
-        line2_kind: "说明".to_string(),
-        line2_text: "候补/其它账号未选中（占位说明，日志未提供完整排除原因）".to_string(),
+    /// 本地日期变更时清空当日数据；返回是否发生变更。
+    pub fn change_day(&mut self, day: NaiveDate) -> bool {
+        if self.day == day {
+            return false;
+        }
+        let revision = self.revision + 1;
+        *self = Self::new(day);
+        self.revision = revision;
+        true
+    }
+
+    /// 文件轮转后从头重建，避免旧文件累计值与新文件重复。
+    pub fn reset(&mut self) {
+        let revision = self.revision + 1;
+        *self = Self::new(self.day);
+        self.revision = revision;
+    }
+
+    /// 处理一行完整 JSON；外部坏行保留已有结果，分类器调用不算完成请求。
+    pub fn ingest(&mut self, line: &[u8]) {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            return;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            self.malformed += 1;
+            self.revision += 1;
+            return;
+        };
+        if !value.is_object() {
+            self.malformed += 1;
+            self.revision += 1;
+            return;
+        }
+        if value.get("kind").and_then(Value::as_str) == Some("routing") {
+            return;
+        }
+        let timestamp =
+            string(&value, "t").and_then(|text| DateTime::parse_from_rfc3339(text).ok());
+        // 无效日期不能正确归入当日，绝不将其计入今日金额或 token。
+        let Some(timestamp) = timestamp else {
+            self.malformed += 1;
+            self.revision += 1;
+            return;
+        };
+        let local = timestamp.with_timezone(&Local);
+        if local.date_naive() != self.day {
+            return;
+        }
+        let identity = format!(
+            "{}|{}|{}|{}|{}",
+            value
+                .get("route_id")
+                .map(Value::to_string)
+                .unwrap_or_default(),
+            timestamp.timestamp_millis(),
+            string(&value, "providerAccount").unwrap_or(""),
+            value
+                .get("status")
+                .map(Value::to_string)
+                .unwrap_or_default(),
+            string(&value, "rid").unwrap_or("")
+        );
+        if !self.seen.insert(identity.clone()) {
+            return;
+        }
+        let number = |key| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let duration = finite_number(&value, "ms");
+        let generation = duration
+            .zip(finite_number(&value, "ttft_ms"))
+            .map(|(ms, ttft)| ms - ttft)
+            .filter(|ms| *ms > 0.0);
+        let agent = string(&value, "agent").unwrap_or("Agent 未提供");
+        self.records.push(Record {
+            identity,
+            timestamp_ms: timestamp.timestamp_millis(),
+            sequence: self.records.len() as u64,
+            time: local.format("%H:%M:%S").to_string(),
+            session: string(&value, "session")
+                .filter(|s| !s.is_empty())
+                .unwrap_or("")
+                .into(),
+            agent: if agent == "claude-desktop" {
+                "Claude Desktop".into()
+            } else {
+                agent.into()
+            },
+            request: string(&value, "req").unwrap_or("请求模型未提供").into(),
+            account: string(&value, "providerAccount")
+                .filter(|s| !s.is_empty())
+                .or_else(|| string(&value, "host"))
+                .unwrap_or("账号未提供")
+                .into(),
+            model: string(&value, "model")
+                .or_else(|| string(&value, "served"))
+                .unwrap_or("服务模型未提供")
+                .into(),
+            provider: string(&value, "provider").unwrap_or("").into(),
+            effort: string(&value, "effort").unwrap_or("强度未提供").into(),
+            status: value
+                .get("status")
+                .and_then(Value::as_u64)
+                .and_then(|s| u16::try_from(s).ok()),
+            error: string(&value, "err").map(str::to_owned),
+            tries: number("tries").max(1),
+            tokens: number("in")
+                .saturating_add(number("out"))
+                .saturating_add(number("cache_read")),
+            output: number("out"),
+            duration_ms: duration,
+            ttft_ms: finite_number(&value, "ttft_ms"),
+            cache_hit_percent: finite_number(&value, "in").zip(finite_number(&value, "cache_read")).and_then(|(input, cache)| (input + cache > 0.0).then(|| cache / (input + cache) * 100.0)),
+            generation_ms: generation,
+            credits: finite_number(&value, "credits"),
+        });
+        self.malformed = 0;
+        self.revision += 1;
+    }
+
+    /// 生成排序稳定的当日会话视图；仅展示会话最新请求和仍有失败依据的账号。
+    pub fn snapshot(&self, host: &str, file_state: &str, error: Option<String>) -> RouteSnapshot {
+        let mut grouped: BTreeMap<&str, Vec<&Record>> = BTreeMap::new();
+        let mut daily = DailyStats::default();
+        for record in &self.records {
+            daily.add(record);
+            grouped.entry(&record.session).or_default().push(record);
+        }
+        let mut sessions = Vec::new();
+        for (session, records) in grouped {
+            // t 是请求开始时间；完成顺序以完整日志行的追加顺序为准。
+            let latest = *records.last().unwrap();
+            let label = if session.is_empty() {
+                "未标记会话".into()
+            } else {
+                format!("会话 {}", short_session(session))
+            };
+            let mut account_history: HashMap<&str, Vec<&Record>> = HashMap::new();
+            let mut stats = DailyStats::default();
+            for record in &records {
+                stats.add(record);
+                account_history
+                    .entry(&record.account)
+                    .or_default()
+                    .push(record);
+            }
+            let mut routes = Vec::new();
+            for history in account_history.values() {
+                let record = *history.last().unwrap();
+                let current = record.identity == latest.identity;
+                if !current && record.outcome() != "failed" {
+                    continue;
+                }
+                let recovered = record.success()
+                    && history
+                        .iter()
+                        .rev()
+                        .skip(1)
+                        .find(|other| other.status != Some(499))
+                        .is_some_and(|previous| previous.outcome() == "failed");
+                let state = if record.success() && (recovered || record.tries > 1) {
+                    "recovered"
+                } else {
+                    record.outcome()
+                };
+                routes.push((
+                    record.sequence,
+                    RouteCard {
+                        id: record.identity.clone(),
+                        session_id: session.into(),
+                        session_label: label.clone(),
+                        account: record.account.clone(),
+                        model: record.model.clone(),
+                        provider: record.provider.clone(),
+                        effort: record.effort.clone(),
+                        state: state.into(),
+                        detail: record.detail(recovered),
+                        error: record.error.clone(),
+                        time: record.time.clone(),
+                        current,
+                        note: record.note(recovered),
+                    },
+                ));
+            }
+            routes.sort_by(|a, b| b.0.cmp(&a.0));
+            let routes: Vec<_> = routes.into_iter().map(|(_, route)| route).collect();
+            let latest_card = routes.iter().find(|route| route.current).unwrap();
+            let second = if let Some(failed) = routes
+                .iter()
+                .find(|route| !route.current && route.state == "failed")
+            {
+                failed.note.clone()
+            } else {
+                Note {
+                    time: latest.time.clone(),
+                    kind: "会话".into(),
+                    text: format!(
+                        "{label} · {} · {} · {}",
+                        latest.model,
+                        latest.effort,
+                        if latest.tries > 1 {
+                            format!("尝试 {} 次；此前失败账号和冷却时长未记录", latest.tries)
+                        } else {
+                            "日志不包含其它账号的排除原因或恢复倒计时".into()
+                        }
+                    ),
+                }
+            };
+            sessions.push(SessionView {
+                id: session.into(),
+                label,
+                timestamp_ms: latest.timestamp_ms,
+                latest_sequence: latest.sequence,
+                agent: latest.agent.clone(),
+                request: latest.request.clone(),
+                notes: [latest_card.note.clone(), second],
+                routes,
+                daily: stats,
+            });
+        }
+        sessions.sort_by(|a, b| b.latest_sequence.cmp(&a.latest_sequence).then(a.id.cmp(&b.id)));
+        let mut notes = sessions
+            .first()
+            .map(|s| s.notes.clone())
+            .unwrap_or_else(|| {
+                [
+                    Note {
+                        time: "--:--:--".into(),
+                        kind: "等待".into(),
+                        text: "等待 Magpie 路由写入…".into(),
+                    },
+                    Note {
+                        time: "--:--:--".into(),
+                        kind: "来源".into(),
+                        text: "只读 usage.jsonl".into(),
+                    },
+                ]
+            });
+        if file_state == "missing" {
+            notes[0].kind = "文件".into();
+            notes[0].text = "未检测到 Magpie usage.jsonl，请确认 Magpie 已运行过".into();
+        }
+        let warning = error.is_some() || self.malformed > 0;
+        let state = if warning {
+            "warning"
+        } else if file_state == "missing" {
+            "missing"
+        } else if sessions.is_empty() {
+            "waiting"
+        } else {
+            "ready"
+        };
+        RouteSnapshot {
+            revision: self.revision,
+            date: self.day.to_string(),
+            state: state.into(),
+            watch_label: match state {
+                "warning" => "读取异常 · 保留有效数据",
+                "missing" => "文件未检测到",
+                "waiting" => "等待今日记录",
+                _ => "当日记录 · 只读监视",
+            }
+            .into(),
+            magpie_host: host.into(),
+            sessions,
+            daily,
+            notes,
+            error: error
+                .or_else(|| (self.malformed > 0).then(|| "日志中有无效行，已保留有效记录".into())),
+        }
     }
 }
 
-/// 生成无有效记录时的空态；`missing` 与 `waiting` 使用需求规定的不同文案。
-pub fn empty_snapshot(state: &str, path: &str, magpie_host: &str) -> RouteSnapshot {
-    let missing = state == "missing";
-    RouteSnapshot {
-        state: state.to_string(),
-        watch_label: if missing { "文件未检测到" } else { "等待记录" }.to_string(),
-        active: false,
-        identity: String::new(),
-        agent: "等待请求".to_string(),
-        request: "请求模型待记录".to_string(),
-        magpie_host: magpie_host.to_string(),
-        account: "尚无命中账号".to_string(),
-        model: "服务模型待记录".to_string(),
-        line1_time: "--:--:--".to_string(),
-        line1_kind: "等待".to_string(),
-        line1_text: if missing { "未检测到 Magpie usage.jsonl，请确认 Magpie 已运行过" } else { "等待 Magpie 路由写入…" }.to_string(),
-        line2_time: "--:--:--".to_string(),
-        line2_kind: "路径".to_string(),
-        line2_text: path.to_string(),
-    }
+/// 取非空字符串；仅对外部字段做必要检查。
+fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
-
-/// 生成第一行命中说明。
-///
-/// 时长、token 与缓存命中率仅在字段类型和分母有效时出现；缺失值不显示为 0。
-fn hit_line(record: &Value, account: &str, model: &str, request: &str) -> String {
-    let mut line = format!("{account} ({model})");
-    if let Some(effort) = text(record, &["effort"]) { line.push_str(&format!(" 以 {effort}")); }
-    if let Some(ms) = number(record, "ms") { line.push_str(&format!(" 用 {:.1}s", ms / 1000.0)); }
-    line.push_str(" 完成");
-    let input = number(record, "in");
-    let output = number(record, "out");
-    let cache = number(record, "cache_read");
-    if let (Some(input), Some(output), Some(cache)) = (input, output, cache) {
-        line.push_str(&format!(" · {:.1}k token", (input + output + cache) / 1000.0));
-    }
-    if let Some(ttft) = number(record, "ttft_ms") { line.push_str(&format!(" · {:.1}s 后首响", ttft / 1000.0)); }
-    if let (Some(input), Some(cache)) = (input, cache) {
-        if input + cache > 0.0 { line.push_str(&format!(" · 缓存命中率 {:.1}%（估算）", cache / (input + cache) * 100.0)); }
-    }
-    line.push_str(&format!("。req={request}"));
-    line
+/// 金额和耗时必须是非负有限数字，缺失值保持未知。
+fn finite_number(value: &Value, key: &str) -> Option<f64> {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0)
 }
-
-/// 按候选字段顺序读取非空字符串。
-fn text(record: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| record.get(*key).and_then(Value::as_str).filter(|value| !value.is_empty()).map(str::to_string))
-}
-
-/// 读取 JSON 数字；字符串数字属于外部脏数据，不在这里猜测转换。
-fn number(record: &Value, key: &str) -> Option<f64> {
-    record.get(key).and_then(Value::as_f64)
-}
-
-/// 把带偏移的 ISO 时间转换为记录自身偏移下的 `HH:mm:ss`；无偏移时按 UTC 显示。
-fn local_hms(value: &str) -> Option<String> {
-    DateTime::parse_from_rfc3339(value).ok().map(|time| time.format("%H:%M:%S").to_string())
-}
-
-/// 把已知 Agent 标识显示为可读名称，未知值原样保留。
-fn agent_label(agent: &str) -> String {
-    match agent { "claude-desktop" => "Claude Desktop".to_string(), other => other.to_string() }
+/// 会话短号只用于显示，完整 ID 仍用于分组和选择，避免短号碰撞合并。
+fn short_session(value: &str) -> String {
+    value.chars().filter(|c| *c != '-').take(8).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    /// 验证成功记录的模型、统计公式、时间与第二行占位。
+    /// 构造固定日期样本，避免测试依赖机器时区和当前日期。
+    fn fixture(id: u64, session: &str, status: u16) -> Value {
+        json!({"route_id":id,"t":format!("2026-10-20T00:00:{:02}+00:00",id),"session":session,"providerAccount":"one@example.com","agent":"claude-desktop","model":"gpt-test","effort":"high","status":status,"in":100,"out":100,"cache_read":800,"ms":3000,"ttft_ms":1000})
+    }
+    /// 将样本加入与其本地时间相同日期的账本。
+    fn ledger() -> UsageLedger {
+        UsageLedger::new(
+            DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Local)
+                .date_naive(),
+        )
+    }
+    /// 检查当日分组、重复跳过、路由分类器排除和加权速度。
     #[test]
-    fn formats_complete_record() {
-        let tail = "{\"route_id\":7,\"t\":\"2026-10-19T20:33:19.5306096+08:00\",\"agent\":\"claude-desktop\",\"providerAccount\":\"relay@example.com\",\"model\":\"grok-4.7-build-fast@500k\",\"req\":\"group/smart-split\",\"effort\":\"low\",\"ms\":3800,\"ttft_ms\":3000,\"in\":1000,\"out\":2000,\"cache_read\":187000,\"status\":200}\n";
-        let snapshot = snapshot_from_record(&latest_record(tail).unwrap(), "127.0.0.1:3425", false);
-        assert_eq!(snapshot.line1_time, "20:33:19");
-        assert_eq!(snapshot.model, "grok-4.7-build-fast@500k");
-        assert!(snapshot.line1_text.contains("190.0k token"));
-        assert!(snapshot.line1_text.contains("缓存命中率 99.5%（估算）"));
-        assert!(snapshot.line2_text.contains("占位说明"));
+    fn aggregates_sessions_without_double_counting() {
+        let mut ledger = ledger();
+        let first = fixture(1, "alpha", 200);
+        ledger.ingest(first.to_string().as_bytes());
+        ledger.ingest(first.to_string().as_bytes());
+        let mut second = fixture(2, "beta", 200);
+        second["credits"] = json!(1.25);
+        ledger.ingest(second.to_string().as_bytes());
+        second["kind"] = json!("routing");
+        ledger.ingest(second.to_string().as_bytes());
+        let view = ledger.snapshot("localhost", "ready", None);
+        assert_eq!(view.daily.requests, 2);
+        assert_eq!(view.daily.tokens, 2000);
+        assert_eq!(view.daily.credits, Some(1.25));
+        assert_eq!(view.daily.credited_requests, 1);
+        assert_eq!(view.daily.tokens_per_second, Some(50.0));
+        assert_eq!(view.sessions.len(), 2);
+    }
+    /// 失败之后成功才显示恢复，取消不表示账号冷却，重试次数仅陈述日志事实。
+    #[test]
+    fn distinguishes_failure_cancel_and_recovery() {
+        let mut ledger = ledger();
+        ledger.ingest(fixture(1, "alpha", 503).to_string().as_bytes());
+        assert_eq!(
+            ledger.snapshot("h", "ready", None).sessions[0].routes[0].state,
+            "failed"
+        );
+        ledger.ingest(fixture(2, "alpha", 200).to_string().as_bytes());
+        assert_eq!(
+            ledger.snapshot("h", "ready", None).sessions[0].routes[0].state,
+            "recovered"
+        );
+        ledger.ingest(fixture(3, "beta", 499).to_string().as_bytes());
+        let view = ledger.snapshot("h", "ready", None);
+        assert_eq!(view.sessions[0].routes[0].state, "cancelled");
+        assert!(!view.sessions[0].notes[0].text.contains("完成"));
+    }
+    /// 缺费用和生成时间保持未知；无 session 的记录明确归入未标记组。
+    #[test]
+    fn missing_fields_and_out_of_order_records_remain_truthful() {
+        let mut ledger = ledger();
+        let mut latest = fixture(3, "", 200);
+        latest.as_object_mut().unwrap().remove("ttft_ms");
+        ledger.ingest(fixture(1, "", 503).to_string().as_bytes());
+        ledger.ingest(latest.to_string().as_bytes());
+        let view = ledger.snapshot("h", "ready", None);
+        assert_eq!(view.sessions[0].label, "未标记会话");
+        assert_eq!(view.sessions[0].routes[0].state, "recovered");
+        assert_eq!(view.daily.credits, None);
+        assert_eq!(view.daily.tokens_per_second, None);
+        assert_eq!(view.daily.requests, 2);
     }
 
-    /// 验证半行、坏行与截断首行都被跳过，且缺字段不显示为零。
+    /// 较旧失败账号仍可作为对照，但不会凭空创建冷却秒数。
     #[test]
-    fn skips_partial_lines_and_missing_stats() {
-        let tail = "uncated{\"bad\":true}\n{\"route_id\":9,\"providerAccount\":\"relay@example.com\"}\n{\"broken\":";
-        let snapshot = snapshot_from_record(&latest_record(tail).unwrap(), "127.0.0.1:3425", false);
-        assert_eq!(snapshot.identity, "9|");
-        assert_eq!(snapshot.line1_time, "--:--:--");
-        assert!(!snapshot.line1_text.contains("token"));
-        assert!(latest_record("{\"only\":").is_none());
+    fn keeps_failed_account_when_another_account_succeeds() {
+        let mut ledger = ledger();
+        ledger.ingest(fixture(1, "alpha", 503).to_string().as_bytes());
+        let mut other = fixture(2, "alpha", 200);
+        other["providerAccount"] = json!("another@example.com");
+        other["tries"] = json!(2);
+        ledger.ingest(other.to_string().as_bytes());
+        let view = ledger.snapshot("h", "ready", None);
+        let routes = &view.sessions[0].routes;
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].state, "recovered");
+        assert_eq!(routes[1].state, "failed");
+        assert!(routes[1].detail.contains("恢复时间未记录"));
+        assert_eq!(view.sessions[0].notes[1].kind, "失败");
+    }
+
+    /// 请求开始时间可逆序，最新与恢复必须按文件完成顺序判断。
+    #[test]
+    fn completion_order_wins_over_start_timestamp() {
+        let mut ledger = ledger();
+        ledger.ingest(fixture(10, "alpha", 503).to_string().as_bytes());
+        ledger.ingest(fixture(2, "alpha", 200).to_string().as_bytes());
+        ledger.ingest(fixture(1, "beta", 200).to_string().as_bytes());
+        let view = ledger.snapshot("h", "ready", None);
+        assert_eq!(view.sessions[0].id, "beta");
+        assert_eq!(view.sessions[1].routes[0].state, "recovered");
+    }
+
+    /// 跨日清空且坏行不清掉有效画面。
+    #[test]
+    fn resets_at_midnight_and_keeps_valid_on_bad_line() {
+        let mut ledger = ledger();
+        ledger.ingest(fixture(1, "alpha", 200).to_string().as_bytes());
+        ledger.ingest(b"{");
+        assert_eq!(ledger.snapshot("h", "ready", None).state, "warning");
+        assert_eq!(ledger.snapshot("h", "ready", None).sessions.len(), 1);
+        assert!(ledger.change_day(ledger.day.succ_opt().unwrap()));
+        assert_eq!(ledger.snapshot("h", "ready", None).daily.requests, 0);
     }
 }

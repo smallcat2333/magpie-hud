@@ -12,8 +12,8 @@
       {
         "label": "main",
         "title": "MagpieHUD",
-        "width": 840,
-        "height": 280,
+        "width": 1120,
+        "height": 400,
         "minWidth": 720,
         "minHeight": 280,
         "resizable": false,
