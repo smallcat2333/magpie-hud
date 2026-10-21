@@ -64,7 +64,7 @@ def main():
     config_dir.mkdir(parents=True)
     path = scratch / "usage.jsonl"
     append(path, record(1, "failed@example.com", 503, err="temporary upstream failure"))
-    (config_dir / "config.json").write_text(json.dumps({"usageJsonlPath": str(path), "magpieHost": "127.0.0.1:3425", "window": None, "alwaysOnTop": False}), encoding="utf-8")
+    (config_dir / "config.json").write_text(json.dumps({"usageJsonlPath": str(path), "magpieHost": "127.0.0.1:1", "window": None, "alwaysOnTop": False}), encoding="utf-8")
     with socket.socket() as available:
         available.bind(("127.0.0.1", 0))
         port = available.getsockname()[1]
@@ -103,7 +103,7 @@ def main():
         client.wait("document.getElementById('session-select').options.length === 3")
         client.evaluate("(() => { const s=document.getElementById('session-select'); s.value='session-alpha'; s.dispatchEvent(new Event('change')); })()")
         assert client.evaluate("document.getElementById('daily-tokens').textContent") == "3.0k"
-        assert client.evaluate("document.getElementById('stats-scope').textContent") == "会话 sessiona"
+        assert client.evaluate("document.getElementById('stats-scope').textContent") == "未命名会话"
         assert client.evaluate("document.querySelectorAll('.note-row').length") == 2
         assert client.evaluate("document.querySelector('.card-copy').children.length") == 2
         # 半行不渲染；补换行后才计入，重复触发不重复统计。

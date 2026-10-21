@@ -1,6 +1,7 @@
 //! Tauri 窗口、托盘与只读日志监视。单一运行状态缓存当日统计和会话，前端启动主动拉取快照。
 
 mod config;
+mod live;
 mod placement;
 mod tail;
 mod usage;
@@ -26,6 +27,7 @@ struct Runtime {
     config_error: Option<String>,
     ledger: UsageLedger,
     cursor: LogCursor,
+    live: live::LiveState,
     snapshot: RouteSnapshot,
 }
 
@@ -43,6 +45,7 @@ impl Runtime {
             config_error,
             ledger,
             cursor: LogCursor::default(),
+            live: live::LiveState::default(),
             snapshot,
         };
         runtime.refresh(None);
@@ -65,6 +68,7 @@ impl Runtime {
         if snapshot.sessions.is_empty() {
             snapshot.notes[1].text = path.display().to_string();
         }
+        self.live.apply(&mut snapshot);
         snapshot.revision = self.snapshot.revision;
         if snapshot == self.snapshot {
             return None;
@@ -91,6 +95,7 @@ pub fn run() {
             setup_window(app.handle())?;
             setup_tray(app.handle())?;
             start_watcher(app.handle().clone());
+            start_live(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![startup_state, set_pinned])
@@ -98,7 +103,7 @@ pub fn run() {
         .expect("MagpieHUD 启动失败");
 }
 
-/// 恢复窗口并将旧版保存尺寸抬到新的布局下限，工作区不足时仍允许缩小。
+/// 恢复用户保存的横竖尺寸，按实际工作区限制整窗，不强制回宽模式。
 fn setup_window(app: &AppHandle) -> tauri::Result<()> {
     let config = app
         .state::<Arc<Mutex<Runtime>>>()
@@ -109,8 +114,8 @@ fn setup_window(app: &AppHandle) -> tauri::Result<()> {
     let window = app.get_webview_window("main").expect("缺少 main 窗口");
     window.set_always_on_top(config.always_on_top)?;
     if let Some(mut placement) = config.window {
-        placement.width = placement.width.max(1120.0);
-        placement.height = placement.height.max(400.0);
+        placement.width = placement.width.max(360.0);
+        placement.height = placement.height.max(280.0);
         window.set_position(LogicalPosition::new(placement.x, placement.y))?;
         window.set_size(LogicalSize::new(placement.width, placement.height))?;
     }
@@ -227,6 +232,64 @@ fn start_watcher(app: AppHandle) {
     });
 }
 
+/// 路由长轮询与活跃请求分开读取，等待路由变化不阻塞活跃结束检测。
+fn start_live(app: AppHandle) {
+    let shared = Arc::clone(app.state::<Arc<Mutex<Runtime>>>().inner());
+    let host = shared.lock().expect("状态锁损坏").config.magpie_host.clone();
+    let base = match live::gateway_url(&host) {
+        Ok(base) => base,
+        Err(error) => {
+            shared.lock().expect("状态锁损坏").live.error = Some(error);
+            return;
+        }
+    };
+    let trace_app = app.clone();
+    let trace_shared = Arc::clone(&shared);
+    let trace_base = base.clone();
+    std::thread::spawn(move || {
+        let agent = live::client(Duration::from_secs(30));
+        loop {
+            let seq = trace_shared.lock().expect("状态锁损坏").live.seq;
+            let url = format!("{trace_base}/v1/magpie/trace?after={seq}{}", if seq > 0 { "&wait=1" } else { "" });
+            match live::read_json::<live::TraceUpdate>(&agent, &url) {
+                Ok(update) => {
+                    let mut runtime = trace_shared.lock().expect("状态锁损坏");
+                    runtime.live.update(update);
+                    if let Some(snapshot) = runtime.refresh(None) {
+                        let _ = trace_app.emit("route-update", snapshot);
+                    }
+                }
+                Err(_) => std::thread::sleep(Duration::from_secs(2)),
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let agent = live::client(Duration::from_secs(2));
+        let mut titles = live::Titles::default();
+        let mut names = std::collections::HashMap::new();
+        let mut last_titles = Instant::now() - Duration::from_secs(3);
+        loop {
+            if last_titles.elapsed() >= Duration::from_secs(2) {
+                names = titles.scan(&live::desktop_roots());
+                last_titles = Instant::now();
+            }
+            let result = live::read_json::<live::Activity>(&agent, &format!("{base}/v1/magpie/concurrency"));
+            {
+                let mut runtime = shared.lock().expect("状态锁损坏");
+                runtime.live.names = names.clone();
+                match result {
+                    Ok(activity) => { runtime.live.activity = activity; runtime.live.error = None; }
+                    Err(error) => { runtime.live.activity = live::Activity::default(); runtime.live.error = Some(error); }
+                }
+                if let Some(snapshot) = runtime.refresh(None) {
+                    let _ = app.emit("route-update", snapshot);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
 /// 提供已缓存的快照，避免页面每次切会话都重读日志。
 #[tauri::command]
 fn startup_state(app: AppHandle) -> StartupState {
@@ -292,8 +355,12 @@ fn constrain_current(window: &WebviewWindow) -> tauri::Result<()> {
         return Ok(());
     };
     let next = constrain(current, work);
-    // 先取消原有最小尺寸限制，工作区较小时以完整可见为准。
-    window.set_min_size(None::<LogicalSize<f64>>)?;
+    // 工作区不足时降低最小尺寸，正常桌面仍保留可操作的缩放下限。
+    let scale = window.scale_factor()?;
+    window.set_min_size(Some(PhysicalSize::new(
+        ((360.0 * scale) as u32).min(work.width),
+        ((280.0 * scale) as u32).min(work.height),
+    )))?;
     window.set_size(PhysicalSize::new(next.width, next.height))?;
     window.set_position(PhysicalPosition::new(next.x, next.y))
 }

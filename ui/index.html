@@ -13,7 +13,7 @@
 <main class="hud" id="hud" data-state="waiting">
   <header class="window-bar" id="drag-region" data-tauri-drag-region>
     <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg>
-    <strong class="brand-name">magpie</strong><span class="brand-subtitle">路由监视</span>
+    <h1 class="brand-name">magpie</h1><span class="brand-subtitle">路由监视</span>
     <span class="watch-state" id="watch-label" role="status">等待今日记录</span>
     <label class="scope-label" for="session-select">查看</label>
     <select id="session-select" aria-label="按会话查看路由"><option value="*">最近会话</option></select>
@@ -26,7 +26,7 @@
       <dl>
         <div class="metric" id="tokens-metric" tabindex="0"><dt>Token</dt><dd id="daily-tokens">—</dd><small id="request-count">等待记录</small></div>
         <div class="metric" id="cost-metric" tabindex="0"><dt>费用 <span id="cost-unit"></span></dt><dd id="daily-cost">未记录</dd><small id="cost-coverage">日志无费用数据</small></div>
-        <div class="metric" id="speed-metric" tabindex="0"><dt>Tks <span>tok/s</span></dt><dd id="daily-speed">—</dd><small>当日加权输出速度</small></div>
+        <div class="metric" id="speed-metric" tabindex="0"><dt>TPS <span>tok/s</span></dt><dd id="daily-speed">—</dd><small>当日加权输出速度</small></div>
       </dl>
       <span class="stats-scope" id="stats-scope">全部会话</span>
     </aside>
@@ -54,5 +54,13 @@
     <div class="note-row"><time id="line2-time">--:--:--</time><span class="note-kind" id="line2-kind">来源</span><p id="line2-text">只读 usage.jsonl</p></div>
   </section>
 </main>
+<div class="resize-edge north" data-resize="North" aria-hidden="true"></div>
+<div class="resize-edge south" data-resize="South" aria-hidden="true"></div>
+<div class="resize-edge east" data-resize="East" aria-hidden="true"></div>
+<div class="resize-edge west" data-resize="West" aria-hidden="true"></div>
+<div class="resize-corner north-west" data-resize="NorthWest" aria-hidden="true"></div>
+<div class="resize-corner north-east" data-resize="NorthEast" aria-hidden="true"></div>
+<div class="resize-corner south-west" data-resize="SouthWest" aria-hidden="true"></div>
+<div class="resize-corner south-east" data-resize="SouthEast" title="拖动调整宽度和高度" aria-hidden="true"></div>
 </body>
 </html>

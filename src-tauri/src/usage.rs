@@ -53,6 +53,7 @@ impl DailyStats {
 #[derive(Clone, Debug)]
 struct Record {
     identity: String,
+    route_id: Option<i64>,
     timestamp_ms: i64,
     sequence: u64,
     time: String,
@@ -167,6 +168,9 @@ pub struct RouteCard {
     pub error: Option<String>,
     pub time: String,
     pub current: bool,
+    pub route_id: Option<i64>,
+    pub tokens: Option<u64>,
+    pub tokens_per_second: Option<f64>,
     pub note: Note,
 }
 
@@ -295,6 +299,7 @@ impl UsageLedger {
         let agent = string(&value, "agent").unwrap_or("Agent 未提供");
         self.records.push(Record {
             identity,
+            route_id: value.get("route_id").and_then(Value::as_i64),
             timestamp_ms: timestamp.timestamp_millis(),
             sequence: self.records.len() as u64,
             time: local.format("%H:%M:%S").to_string(),
@@ -351,10 +356,10 @@ impl UsageLedger {
         for (session, records) in grouped {
             // t 是请求开始时间；完成顺序以完整日志行的追加顺序为准。
             let latest = *records.last().unwrap();
-            let label = if session.is_empty() {
+            let label: String = if session.is_empty() {
                 "未标记会话".into()
             } else {
-                format!("会话 {}", short_session(session))
+                "未命名会话".into()
             };
             let mut account_history: HashMap<&str, Vec<&Record>> = HashMap::new();
             let mut stats = DailyStats::default();
@@ -399,6 +404,10 @@ impl UsageLedger {
                         error: record.error.clone(),
                         time: record.time.clone(),
                         current,
+                        route_id: record.route_id,
+                        tokens: Some(record.tokens),
+                        tokens_per_second: record.generation_ms.filter(|_| record.success())
+                            .map(|ms| record.output as f64 * 1000.0 / ms),
                         note: record.note(recovered),
                     },
                 ));
@@ -505,10 +514,6 @@ fn finite_number(value: &Value, key: &str) -> Option<f64> {
         .get(key)
         .and_then(Value::as_f64)
         .filter(|n| n.is_finite() && *n >= 0.0)
-}
-/// 会话短号只用于显示，完整 ID 仍用于分组和选择，避免短号碰撞合并。
-fn short_session(value: &str) -> String {
-    value.chars().filter(|c| *c != '-').take(8).collect()
 }
 
 #[cfg(test)]

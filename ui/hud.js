@@ -53,11 +53,13 @@
   /** 状态文字与符号一起展示，失败/取消不依赖颜色区分。 */
   function statusInfo(card) {
     switch (card.state) {
-      case 'recovered': return ['✓', card.detail.startsWith('重试') ? '重试成功' : '已恢复'];
+      case 'running': return ['↻', '请求中'];
+      case 'waiting': return ['…', '等待中'];
+      case 'recovered': return ['✓', card.detail.startsWith('重试') ? '重试成功' : '已恢复']; // taste-skill-ignore: 请求结果符号与文字共同表达状态
       case 'failed': return ['!', '失败'];
       case 'cancelled': return ['−', '已取消'];
       case 'unknown': return ['?', '状态未知'];
-      default: return ['✓', '已完成'];
+      default: return ['✓', '已完成']; // taste-skill-ignore: 请求完成符号，不是装饰图标
     }
   }
 
@@ -93,8 +95,8 @@
     const top = document.createElement('span');
     top.className = 'card-top';
     const account = document.createElement('span');
-    account.className = 'account';
-    account.textContent = shortAccount(card.account);
+    account.className = 'session-title';
+    account.textContent = session.label;
     const tag = document.createElement('span');
     tag.className = 'state-tag';
     const mark = document.createElement('span');
@@ -105,8 +107,8 @@
     const bottom = document.createElement('span');
     bottom.className = 'card-bottom';
     const label = document.createElement('span');
-    label.className = 'session-short';
-    label.textContent = session.label;
+    label.className = 'card-account';
+    label.textContent = shortAccount(card.account);
     const separator = document.createElement('span');
     separator.className = 'divider';
     separator.textContent = '·';
@@ -118,7 +120,17 @@
     effort.textContent = card.effort;
     bottom.append(label, separator, model, effort);
     copy.append(top, bottom);
-    button.append(icon, copy);
+    const metrics = document.createElement('span');
+    metrics.className = 'card-metrics';
+    const tokens = document.createElement('span');
+    tokens.className = 'card-tokens';
+    tokens.textContent = card.tokens == null ? '待统计 Token' : `${compact(card.tokens)} Token`;
+    const speed = document.createElement('span');
+    speed.className = 'card-tps';
+    speed.textContent = card.tokensPerSecond == null ? '— TPS' : `${card.tokensPerSecond.toFixed(1)} TPS`;
+    metrics.title = '本次请求 Token = 输入 + 输出 + 缓存读取；TPS = 输出 / (总耗时 − 首字耗时)。进行中尚无精确用量时等待最终记录。';
+    metrics.append(tokens, speed);
+    button.append(icon, copy, metrics);
     button.addEventListener('click', () => {
       selectedCard = card.id;
       routeList.querySelectorAll('.route-card').forEach(element => element.classList.toggle('selected', element === button));
@@ -189,6 +201,7 @@
   function drawLines(newIds = []) {
     const area = byId('route-area').getBoundingClientRect();
     const router = document.querySelector('.router-emblem').getBoundingClientRect();
+    const tall = hud.dataset.layout === 'tall';
     const origin = router.top + router.height / 2 - area.top;
     animations.forEach(animation => animation.cancel());
     animations = [];
@@ -199,9 +212,12 @@
       const x = rectangle.left - area.left;
       const y = rectangle.top + rectangle.height / 2 - area.top;
       const path = document.createElementNS(namespace, 'path');
-      const state = [...card.classList].find(name => ['failed', 'cancelled', 'unknown'].includes(name)) || (card.dataset.current === 'true' ? '' : 'inactive');
-      path.setAttribute('d', `M2 ${origin}C${Math.max(14, x * .55)} ${origin} ${Math.max(14, x * .35)} ${y} ${x - 2} ${y}`);
+      const state = [...card.classList].find(name => ['running', 'waiting', 'failed', 'cancelled', 'unknown'].includes(name)) || (card.dataset.current === 'true' ? '' : 'inactive');
+      path.setAttribute('d', tall
+        ? `M12 0V${Math.max(0, y - 16)}Q12 ${y} ${x - 2} ${y}`
+        : `M2 ${origin}C${Math.max(14, x * .55)} ${origin} ${Math.max(14, x * .35)} ${y} ${x - 2} ${y}`);
       path.setAttribute('class', `branch ${state}`);
+      path.style.animationDelay = `${-(performance.now() % 1000)}ms`;
       lineLayer.append(path);
       if (newIds.includes(card.dataset.cardId) && !reduced.matches && !document.hidden) {
         animations.push(path.animate([{ opacity: .3, strokeWidth: 2 }, { opacity: 1, strokeWidth: 3, offset: .4 }, { opacity: .86, strokeWidth: 2 }], { duration: 320 }));
@@ -243,7 +259,11 @@
   async function start() {
     selector.addEventListener('change', () => { selectedCard = null; renderedIds.clear(); render(false); });
     routeList.addEventListener('scroll', () => requestDraw(), { passive: true });
-    new ResizeObserver(() => requestDraw()).observe(byId('route-area'));
+    new ResizeObserver(() => {
+      hud.dataset.layout = innerWidth / innerHeight < 1.25 || innerWidth < 680 ? 'tall' : 'wide';
+      requestDraw();
+    }).observe(hud);
+    reduced.addEventListener('change', () => requestDraw());
     document.addEventListener('visibilitychange', () => { if (!document.hidden) render(false); });
     if (!window.__TAURI__) {
       text('watch-label', '界面预览 · 等待演示数据');
@@ -265,6 +285,14 @@
         pin.title = actual ? '置顶已开启' : '置顶已关闭';
       } catch (error) { reportError(error); }
       finally { pin.disabled = false; }
+    });
+    document.querySelectorAll('[data-resize]').forEach(handle => {
+      handle.addEventListener('pointerdown', event => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        window.__TAURI__.webviewWindow.getCurrentWebviewWindow()
+          .startResizeDragging(handle.dataset.resize).catch(reportError);
+      });
     });
     byId('hide-window').addEventListener('click', () => window.__TAURI__.webviewWindow.getCurrentWebviewWindow().hide().catch(reportError));
     byId('drag-region').addEventListener('pointerdown', event => {

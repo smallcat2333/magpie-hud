@@ -26,7 +26,7 @@ pub struct WindowPlacement {
 pub struct AppConfig {
     /// 为空时使用当前用户主目录下的默认 usage.jsonl。
     pub usage_jsonl_path: String,
-    /// 仅供界面显示，不用于发起网络连接。
+    /// 本机 Magpie 网关地址，用于显示和只读实时路由；仅允许回环 HTTP。
     pub magpie_host: String,
     /// 上次正常退出前的窗口位置；首次运行为空。
     pub window: Option<WindowPlacement>,
