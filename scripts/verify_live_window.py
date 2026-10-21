@@ -151,7 +151,17 @@ def main():
         assert client, 'WebView2 not ready'
         assert acrylic_enabled(process.pid), 'Windows 11 DWM acrylic backdrop not enabled'
         client.wait("document.querySelector('.route-card.running .session-title')?.textContent === 'HUD / 实时会话'")
-        client.wait("document.querySelector('.quota-window strong')?.textContent === '余 62%' && document.getElementById('daily-cost').textContent === '$0.42'")
+        client.wait("document.querySelector('.quota-track')?.getAttribute('aria-valuenow') === '38' && document.getElementById('daily-cost').textContent === '$0.42'")
+        assert client.evaluate("[...document.querySelectorAll('.quota-item')].every(item => item.children.length === 2)")
+        assert client.evaluate("document.querySelector('.quota-window strong').textContent") == '38%'
+        assert client.evaluate("Math.abs(document.querySelector('.quota-fill').getBoundingClientRect().width / document.querySelector('.quota-track').getBoundingClientRect().width - .38) < .02")
+        assert client.evaluate("document.querySelector('.route-card.running .state-tag').textContent") == ''
+        assert client.evaluate("document.querySelector('.request-spinner circle').getAttribute('r')") == '7'
+        client.wait("getComputedStyle(document.querySelector('.request-spinner')).animationName === 'request-spin'")
+        rotation = client.evaluate("getComputedStyle(document.querySelector('.request-spinner')).transform")
+        time.sleep(.15)
+        assert client.evaluate("getComputedStyle(document.querySelector('.request-spinner')).transform") != rotation
+        assert client.evaluate("new Set(['daily-tokens','daily-cost','daily-speed'].map(id=>getComputedStyle(document.getElementById(id)).color)).size") == 3
         assert client.evaluate("document.querySelector('h1').textContent") == 'Magpie HUD'
         assert client.evaluate("getComputedStyle(document.getElementById('hud')).backgroundColor") == 'rgba(23, 25, 30, 0.5)'
         assert client.evaluate("document.querySelector('.effort').dataset.level") == 'high'
@@ -167,6 +177,7 @@ def main():
         assert client.evaluate("getComputedStyle(document.querySelector('.branch.running')).strokeDashoffset") != offset
         command(client, 'Emulation.setEmulatedMedia', {'features': [{'name': 'prefers-reduced-motion', 'value': 'reduce'}]})
         client.wait("document.querySelector('.branch.running') && getComputedStyle(document.querySelector('.branch.running')).animationName === 'none'")
+        assert client.evaluate("getComputedStyle(document.querySelector('.request-spinner')).animationName") == 'none'
         command(client, 'Emulation.setEmulatedMedia', {'features': []})
         assert client.evaluate("document.getElementById('request-count').textContent") == '0 次请求'
         wide = screenshot(client, 'hud-live-wide.png')
@@ -194,6 +205,7 @@ def main():
         append(path, record(1, 'test@example.com', model='grok-4.7-build-fast@500k', provider='grok', route_id=100))
         client.wait("!document.querySelector('.route-card.running') && document.querySelector('.card-tokens')?.textContent==='1.0k Token'")
         assert client.evaluate("document.querySelector('.card-tps').textContent") == '50.0 TPS'
+        assert client.evaluate("document.querySelectorAll('.request-spinner').length") == 0
         assert client.evaluate("document.querySelectorAll('.note-row').length") == 2
         client.evaluate("window.__TAURI__.webviewWindow.getCurrentWebviewWindow().setSize(new window.__TAURI__.dpi.LogicalSize(1120,400))")
         client.wait("innerWidth===1120 && document.getElementById('hud').dataset.layout==='wide'")
@@ -203,6 +215,7 @@ def main():
         server.server_close()
         client.wait("document.getElementById('watch-label').textContent.includes('实时连接中断')", timeout=8)
         assert client.evaluate("document.querySelector('.card-tps').textContent") == '50.0 TPS'
+        assert client.evaluate("document.querySelectorAll('.request-spinner').length") == 0
         client.evaluate("window.__TAURI__.webviewWindow.getCurrentWebviewWindow().setSize(new window.__TAURI__.dpi.LogicalSize(420,760))")
         client.wait("innerWidth===420 && innerHeight===760")
         client.evaluate('setTimeout(()=>window.__TAURI__.webviewWindow.getCurrentWebviewWindow().close(),50)')
@@ -227,7 +240,7 @@ def main():
             time.sleep(.1)
         assert client, 'restarted WebView2 not ready'
         client.wait("innerWidth===420 && innerHeight===760 && document.getElementById('hud')?.dataset.layout==='tall'")
-        print(json.dumps({'passed': True, 'checks': ['native-acrylic', 'quota-windows', 'global-and-session-cost', 'title-and-half-opacity', 'source-stacking-and-icons', 'effort-color', 'active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall]}, ensure_ascii=False))
+        print(json.dumps({'passed': True, 'checks': ['two-line-usage-bars', 'dashed-spinner-rotation', 'statistic-colors', 'native-acrylic', 'quota-windows', 'global-and-session-cost', 'title-and-half-opacity', 'source-stacking-and-icons', 'effort-color', 'active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall]}, ensure_ascii=False))
     finally:
         if client:
             try:
