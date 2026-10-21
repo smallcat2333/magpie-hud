@@ -27,6 +27,7 @@ pub struct LiveRoute {
     #[serde(default)]
     pub session: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub provider: String,
     #[serde(default)]
     pub done: bool,
@@ -42,6 +43,11 @@ pub struct LiveRoute {
 #[derive(Clone, Default, Deserialize)]
 pub struct Candidate {
     pub id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
     #[serde(default)]
     pub who: String,
 }
@@ -75,6 +81,7 @@ pub struct Active {
     #[serde(default)]
     pub model: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub provider: String,
     pub started: String,
     pub ms: u64,
@@ -136,13 +143,14 @@ impl LiveState {
                 "upstream" if !waiting => "请求中 · 等待或接收上游流",
                 _ => "路由处理中",
             };
-            let account = attempt.and_then(|a| route?.order.as_deref().unwrap_or_default().iter().find(|c| c.id == a.id))
-                .map(|c| c.who.as_str()).filter(|s| !s.is_empty()).unwrap_or("正在选择账号");
+            let candidate = attempt.and_then(|attempt| selected_candidate(route?, attempt));
+            let account = candidate.map(|c| c.who.as_str()).filter(|s| !s.is_empty())
+                .unwrap_or("正在选择账号");
             let model = attempt.map(|a| a.model.as_str()).filter(|s| !s.is_empty())
                 .unwrap_or("正在选择模型");
             let effort = attempt.map(|a| a.effort.as_str()).filter(|s| !s.is_empty())
                 .unwrap_or("强度待确定");
-            let provider = route.map(|r| r.provider.as_str()).unwrap_or(&active.provider);
+            let provider = candidate.map(|c| c.provider.as_str()).filter(|s| !s.is_empty()).unwrap_or("");
             let label = self.name(session_id);
             let note = Note { time: time.clone(), kind: "进行中".into(),
                 text: format!("{label} · {account} ({model}) · {effort} · {detail} · {:.1}s", active.ms as f64 / 1000.0) };
@@ -198,6 +206,19 @@ impl LiveState {
     fn name(&self, id: &str) -> String {
         self.names.get(id).cloned().unwrap_or_else(|| if id.is_empty() { "未标记会话".into() } else { "未命名会话".into() })
     }
+}
+
+/// 尝试 ID 可能被同账号的不同模型复用；优先匹配模型，歧义时不认领账号。
+fn selected_candidate<'a>(route: &'a LiveRoute, attempt: &Attempt) -> Option<&'a Candidate> {
+    let candidates: Vec<_> = route.order.as_deref().unwrap_or_default().iter()
+        .filter(|candidate| candidate.id == attempt.id).collect();
+    let exact: Vec<_> = candidates.iter().copied()
+        .filter(|candidate| !attempt.model.is_empty() && candidate.model == attempt.model).collect();
+    if exact.len() == 1 { return Some(exact[0]); }
+    if exact.is_empty() && candidates.len() == 1 && candidates[0].model.is_empty() {
+        return Some(candidates[0]);
+    }
+    None
 }
 
 /// 来源文案与日志口径一致。
@@ -378,5 +399,15 @@ mod tests {
         assert_eq!(names["id"].1, "");
         assert!(gateway_url("127.0.0.1:3425").is_ok());
         assert!(gateway_url("example.com:3425").is_err());
+        let route = LiveRoute { provider: "grok".into(), order: Some(vec![
+            Candidate { id: "grok".into(), provider: "grok".into(), model: "grok-test".into(), who: "grok@example.com".into() },
+            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6.1".into(), who: "gpt@example.com".into() },
+            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6".into(), who: "other@example.com".into() },
+        ]), ..Default::default() };
+        let selected = selected_candidate(&route, &Attempt { id: "codex".into(), model: "gpt-6.1".into(), ..Default::default() });
+        assert_eq!(selected.map(|c| (c.provider.as_str(), c.who.as_str())), Some(("codex", "gpt@example.com")));
+        assert!(selected_candidate(&route, &Attempt { id: "codex".into(), ..Default::default() }).is_none());
+        let legacy = LiveRoute { order: Some(vec![Candidate { id: "grok".into(), who: "grok@example.com".into(), ..Default::default() }]), ..Default::default() };
+        assert!(selected_candidate(&legacy, &Attempt { id: "grok".into(), model: "grok-test".into(), ..Default::default() }).is_some());
     }
 }

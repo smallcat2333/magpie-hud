@@ -91,7 +91,7 @@ def main():
         client.wait("document.querySelectorAll('.route-card.failed').length === 1")
         assert client.evaluate("document.getElementById('line1-kind').textContent") == "失败"
         assert client.evaluate("document.querySelector('.failed .state-symbol').textContent") == 'x'
-        assert client.evaluate("document.querySelector('.failed .state-text').textContent") == 'temporary upstream failure'
+        assert client.evaluate("document.querySelector('.failed .state-text').textContent") == '失败'
         assert client.evaluate("getComputedStyle(document.querySelector('.failed .state-tag')).color") == 'rgb(237, 145, 155)'
         append_started = time.perf_counter()
         append(path, record(2, "success@example.com", credits=2.5))

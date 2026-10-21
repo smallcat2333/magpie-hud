@@ -53,14 +53,16 @@
     return null;
   }
 
-  /** 展示统一为完成、运行、异常三类；保留真实错误与排队详情。 */
+  /** 展示统一为完成、运行、异常三类；异常类别按取消、失败、未知区分。 */
   function statusInfo(card) {
     switch (card.state) {
       case 'running':
       case 'waiting': return ['', '运行中', 'running'];
       case 'success':
       case 'recovered': return ['√', '已完成', 'success'];
-      default: return ['x', card.error?.trim() || card.detail?.trim() || '状态未知', 'error'];
+      case 'cancelled': return ['x', '已取消', 'error'];
+      case 'failed': return ['x', '失败', 'error'];
+      default: return ['x', '状态未知', 'error'];
     }
   }
 
@@ -188,7 +190,7 @@
     text('cost-coverage', stats.cost == null ? (stats.unpricedRequests ? `${stats.unpricedRequests} 条未定价` : '等待 Magpie 费用') : `${stats.pricedRequests} 条已定价${stats.unpricedRequests ? ` · ${stats.unpricedRequests} 条未定价` : ''}${snapshot.costError ? ' · 旧读数' : ''}`);
     byId('cost-metric').title = `${stats.cost == null ? '未定价' : `$${stats.cost.toFixed(2)} USD`}\n${snapshot.costError || 'Magpie 按模型价格计算的当日美元等价费用，沿用 Magpie 用量页口径（含内部路由）；订阅账号的金额是使用量估值，未定价请求不计入。'}`;
     text('daily-speed', stats.tokensPerSecond === null ? '—' : stats.tokensPerSecond.toFixed(1));
-    byId('speed-metric').title = `当日加权输出速度 = Σ输出 Token / Σ(总耗时 − 首字耗时)；${stats.speedSamples} 条有效记录，不包含等待首字的时间。`;
+    byId('speed-metric').title = `最近 10 个会话加权输出速度 = Σ输出 Token / Σ(总耗时 − 首字耗时)；${stats.speedSamples} 条有效记录，不包含等待首字的时间。选中单个会话时只显示该会话。`;
     text('stats-scope', scope);
   }
 
@@ -257,7 +259,8 @@
     }
     const orderKey = entries.map(entry => `${entry.key}|${entry.index}`).join('\n');
     if (!forceOrder && quotaRenderKey && orderKey !== quotaRenderKey) {
-      entries.sort((a, b) => quotaRenderKey.indexOf(`${a.key}|${a.index}`) - quotaRenderKey.indexOf(`${b.key}|${b.index}`));
+      const ranks = new Map(quotaRenderKey.split('\n').map((key, index) => [key, index]));
+      entries.sort((a, b) => (ranks.get(`${a.key}|${a.index}`) ?? Infinity) - (ranks.get(`${b.key}|${b.index}`) ?? Infinity));
     } else quotaRenderKey = orderKey;
     const next = new Map(entries.map(entry => [`${entry.key}|${entry.index}`, entry]));
     for (const [key, view] of quotaViews) {
@@ -269,7 +272,9 @@
       const view = quotaViews.get(itemKey) || createQuotaItem(entry);
       quotaViews.set(itemKey, view);
       updateQuotaItem(view, entry);
-      if (view.item.previousElementSibling !== previous) list.insertBefore(view.item, previous?.nextElementSibling || list.firstChild);
+      if (view.item.parentElement !== list || view.item.previousElementSibling !== previous) {
+        list.insertBefore(view.item, previous ? previous.nextSibling : list.firstChild);
+      }
       previous = view.item;
     }
     let empty = list.querySelector('.quota-empty');
@@ -313,14 +318,26 @@
     return { item, account, reset, label, track, fill, value };
   }
 
+  /** 重置倒计时使用两级单位；不足一分钟时不显示负数或虚假的零分钟。 */
+  function resetRemaining(resetTime, now = Date.now()) {
+    if (!resetTime) return '—';
+    const remaining = resetTime.getTime() - now;
+    if (remaining <= 0) return '已到期';
+    const minutes = Math.floor(remaining / 60_000);
+    if (minutes >= 1440) return `${Math.floor(minutes / 1440)}d${Math.floor(minutes % 1440 / 60)}h`;
+    if (minutes >= 60) return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
+    return minutes ? `${minutes}m` : '<1m';
+  }
+
   /** 更新同一额度项的数值和提示，不改变其在列表中的位置。 */
   function updateQuotaItem(view, { card, models, quota, span, windowName }) {
     view.item.dataset.stale = String(Boolean(snapshot.quotaError || quota.error));
     view.account.textContent = shortAccount(card.account);
     view.account.title = card.account;
     const resetTime = span?.resetsAt && !Number.isNaN(Date.parse(span.resetsAt)) ? new Date(span.resetsAt) : null;
-    view.reset.textContent = resetTime ? resetTime.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '—';
+    view.reset.textContent = resetRemaining(resetTime);
     view.reset.dateTime = resetTime ? span.resetsAt : '';
+    view.reset.title = resetTime ? `${resetTime.toLocaleString('zh-CN', { hour12: false })} 重置` : '重置时间未提供';
     view.label.textContent = windowName;
     const used = span && !span.unlimited ? (Number.isFinite(span.used) ? span.used : Number.isFinite(span.remaining) ? 100 - span.remaining : null) : null;
     const percent = used === null ? null : Math.min(100, Math.max(0, used));
@@ -337,7 +354,7 @@
     } else view.fill.style.width = '0';
     view.track.parentElement.dataset.low = String(percent !== null && percent >= 90);
     const read = quota.readAt || quota.asOf;
-    view.item.title = [card.account, [...models].join(' · '), [span?.family || span?.pool, windowName, summary].filter(Boolean).join(' · '), resetTime ? `${view.reset.textContent} 重置` : '重置时间未提供', read ? `读数 ${read}` : '', snapshot.quotaError || quota.error || ''].filter(Boolean).join('\n');
+    view.item.title = [card.account, [...models].join(' · '), [span?.family || span?.pool, windowName, summary].filter(Boolean).join(' · '), view.reset.title, read ? `读数 ${read}` : '', snapshot.quotaError || quota.error || ''].filter(Boolean).join('\n');
     view.item.setAttribute('aria-label', view.item.title.replaceAll('\n', '，'));
   }
 
@@ -383,23 +400,33 @@
 
   /** 用实际路由块位置画贝塞尔分支，列表滚动和窗口大小变化后重新对齐。 */
   function drawLines(newIds = []) {
-    const area = byId('route-area').getBoundingClientRect();
+    const layer = lineLayer.getBoundingClientRect();
     const router = document.querySelector('.router-emblem').getBoundingClientRect();
+    const area = byId('route-area').getBoundingClientRect();
     const tall = hud.dataset.layout === 'tall';
-    const origin = router.top + router.height / 2 - area.top;
+    const startX = (tall ? router.left + router.width / 2 : router.right) - layer.left;
+    const origin = (tall ? router.bottom : router.top + router.height / 2) - layer.top;
+    const trunkX = area.left - layer.left + 12;
+    const bendY = Math.max(origin + 6, area.top - layer.top - 6);
     animations.forEach(animation => animation.cancel());
     animations = [];
     lineLayer.replaceChildren();
-    lineLayer.setAttribute('viewBox', `0 0 ${area.width} ${area.height}`);
+    lineLayer.setAttribute('viewBox', `0 0 ${layer.width} ${layer.height}`);
     routeList.querySelectorAll('.route-card').forEach(card => {
       const rectangle = card.getBoundingClientRect();
-      const x = rectangle.left - area.left;
-      const y = rectangle.top + rectangle.height / 2 - area.top;
+      const x = rectangle.left - layer.left;
+      const y = rectangle.top + rectangle.height / 2 - layer.top;
       const path = document.createElementNS(namespace, 'path');
       const state = [...card.classList].find(name => ['running', 'waiting', 'failed', 'cancelled', 'unknown'].includes(name)) || (card.dataset.current === 'true' ? '' : 'inactive');
       path.setAttribute('d', tall
-        ? `M12 0V${Math.max(0, y - 16)}Q12 ${y} ${x - 2} ${y}`
-        : `M2 ${origin}C${Math.max(14, x * .55)} ${origin} ${Math.max(14, x * .35)} ${y} ${x - 2} ${y}`);
+        ? `M${startX} ${origin}V${bendY}H${trunkX}V${Math.max(bendY, y - 16)}Q${trunkX} ${y} ${x} ${y}`
+        : `M${startX} ${origin}C${startX + Math.max(18, (x - startX) * .45)} ${origin} ${startX + Math.max(18, (x - startX) * .25)} ${y} ${x} ${y}`);
+      if (state === 'running') {
+        const base = document.createElementNS(namespace, 'path');
+        base.setAttribute('d', path.getAttribute('d'));
+        base.setAttribute('class', 'branch-base');
+        lineLayer.append(base);
+      }
       path.setAttribute('class', `branch ${state}`);
       path.style.animationDelay = `${-(performance.now() % 1000)}ms`;
       lineLayer.append(path);
@@ -443,9 +470,7 @@
   async function start() {
     selector.addEventListener('change', () => { selectedCard = null; renderedIds.clear(); quotaOrderTimer = clearTimeout(quotaOrderTimer); render(false); });
     routeList.addEventListener('scroll', () => requestDraw(), { passive: true });
-    new ResizeObserver(() => {
-      render(false);
-    }).observe(hud);
+    new ResizeObserver(() => render(false)).observe(hud);
     reduced.addEventListener('change', () => requestDraw());
     document.addEventListener('visibilitychange', () => { if (!document.hidden) render(false); });
     if (!window.__TAURI__) {

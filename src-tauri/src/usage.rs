@@ -458,6 +458,19 @@ impl UsageLedger {
             });
         }
         sessions.sort_by(|a, b| b.latest_sequence.cmp(&a.latest_sequence).then(a.id.cmp(&b.id)));
+        // 全局 TPS 只看最近 10 个会话，不把当天更早会话的速度混入。
+        daily.output_tokens = 0;
+        daily.generation_ms = 0.0;
+        daily.speed_samples = 0;
+        daily.tokens_per_second = None;
+        for session in sessions.iter().take(10) {
+            daily.output_tokens += session.daily.output_tokens;
+            daily.generation_ms += session.daily.generation_ms;
+            daily.speed_samples += session.daily.speed_samples;
+        }
+        if daily.generation_ms > 0.0 {
+            daily.tokens_per_second = Some(daily.output_tokens as f64 * 1000.0 / daily.generation_ms);
+        }
         let mut notes = sessions
             .first()
             .map(|s| s.notes.clone())
@@ -546,6 +559,22 @@ mod tests {
                 .date_naive(),
         )
     }
+    /// 全局速度只纳入最近 10 个会话；第 11 个更早会话不影响结果。
+    #[test]
+    fn global_speed_uses_ten_latest_sessions() {
+        let mut ledger = ledger();
+        for id in 1..=11 {
+            let mut value = fixture(id, &format!("session-{id:02}"), 200);
+            value["out"] = json!(if id == 1 { 1000 } else { 100 });
+            ledger.ingest(value.to_string().as_bytes());
+        }
+        let view = ledger.snapshot("h", "ready", None);
+        assert_eq!(view.sessions.len(), 11);
+        assert_eq!(view.daily.speed_samples, 10);
+        assert_eq!(view.daily.tokens_per_second, Some(50.0));
+        assert_eq!(view.sessions[10].daily.tokens_per_second, Some(500.0));
+    }
+
     /// 检查当日分组、重复跳过、路由分类器排除和加权速度。
     #[test]
     fn aggregates_sessions_without_double_counting() {

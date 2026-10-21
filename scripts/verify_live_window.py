@@ -122,7 +122,7 @@ def main():
     started = datetime.datetime.now().astimezone().isoformat()
     active = {'id': 1, 'route': 100, 'session': 'session-alpha', 'agent': 'claude-desktop', 'model': 'group/smart-split', 'provider': 'grok', 'phase': 'upstream', 'started': started, 'ms': 1200}
     route = {'id': 100, 'session': 'session-alpha', 'provider': 'grok', 'done': False,
-             'order': [{'id': 'grok', 'who': 'very.long.account.name@example-company.com'}],
+             'order': [{'id': 'grok', 'provider': 'grok', 'model': 'grok-4.7-build-fast@500k', 'who': 'very.long.account.name@example-company.com'}],
              'tries': [{'id': 'grok', 'model': 'grok-4.7-build-fast@500k', 'effort': 'high', 'done': False}]}
     Gateway.state = {'seq': 1, 'pid': 1000, 'ids': [100], 'routes': [route], 'active': [active], 'started': started, 'quota_reads': 0, 'quota_used': 38, 'quota_times': []}
     server = ThreadingHTTPServer(('127.0.0.1', 0), Gateway)
@@ -167,7 +167,7 @@ def main():
         time.sleep(.15)
         assert client.evaluate("getComputedStyle(document.querySelector('.request-spinner')).transform") != rotation
         assert client.evaluate("new Set(['daily-tokens','daily-cost','daily-speed'].map(id=>getComputedStyle(document.getElementById(id)).color)).size") == 3
-        assert client.evaluate("document.querySelector('h1').textContent") == 'Magpie HUD'
+        assert client.evaluate("document.querySelector('h1').textContent.trim()") == 'Magpie HUD V.0.0.4(2026/10/21)'
         assert client.evaluate("getComputedStyle(document.getElementById('hud')).backgroundColor") == 'rgba(23, 25, 30, 0.5)'
         assert client.evaluate("document.querySelector('.effort').dataset.level") == 'high'
         assert client.evaluate("document.getElementById('hud').dataset.sources") == 'compact'

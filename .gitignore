@@ -5,3 +5,8 @@
 /.codegraph/
 /CMakeUserPresets.json
 *.user
+/.codex_tmp/
+/.playwright-mcp/
+/.claude/launch.json
+__pycache__/
+*.py[cod]
