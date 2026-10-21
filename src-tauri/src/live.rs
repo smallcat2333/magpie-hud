@@ -37,9 +37,6 @@ pub struct LiveRoute {
     pub order: Option<Vec<Candidate>>,
     #[serde(default)]
     pub tries: Option<Vec<Attempt>>,
-    /// 完成用量；进行中为 None。仅用于判断无会话请求是否已产生输出。
-    #[serde(default)]
-    pub usage: Option<Vec<LiveUsage>>,
 }
 
 /// 路由候选的账号归属，仅按尝试 id 精确匹配。
@@ -65,13 +62,6 @@ pub struct Attempt {
     pub effort: String,
     #[serde(default)]
     pub done: bool,
-}
-
-/// 只取输出量；不保存 prompt、响应正文或密钥。
-#[derive(Clone, Default, Deserialize)]
-pub struct LiveUsage {
-    #[serde(default)]
-    pub out: u64,
 }
 
 /// concurrency 完整快照，空列表表示当前没有请求。
@@ -146,11 +136,8 @@ impl LiveState {
             } else {
                 &active.session
             };
-            // 无会话身份且输出不超过 200 Token 的请求是开新会话时的辅助调用，不单独占卡；
-            // 输出量未知时也不猜测，等完成日志按同一边界判断。
-            if session_id.is_empty()
-                && route.is_none_or(|r| r.usage.as_deref().unwrap_or_default().iter().all(|u| u.out <= 200))
-            {
+            // 没有会话身份的请求无法正确归属，实时阶段也不显示。
+            if session_id.is_empty() {
                 continue;
             }
             let started = DateTime::parse_from_rfc3339(&active.started).ok();
@@ -433,23 +420,18 @@ mod tests {
         assert!(finished.sessions.is_empty());
     }
 
-    /// 无会话身份且尚无超过 200 Token 输出的活跃请求不单独占卡；
-    /// 一旦该请求产出超过 200 Token，仍以“未标记会话”显示。
+    /// 没有会话身份的活跃请求不显示，不论实时输出量大小。
     #[test]
-    fn skips_sessionless_active_request_until_it_produces_output() {
+    fn skips_every_sessionless_active_request() {
         let now = Local::now();
         let mut live = LiveState::default();
         live.activity.active.push(Active { id: 1, session: String::new(), agent: "claude-desktop".into(),
             started: now.to_rfc3339(), phase: "upstream".into(), route: 10, ..Active::default() });
-        live.routes.insert(10, LiveRoute { id: 10, usage: Some(vec![LiveUsage { out: 25 }]), ..LiveRoute::default() });
+        live.routes.insert(10, LiveRoute { id: 10, ..LiveRoute::default() });
         let ledger = UsageLedger::new(now.date_naive());
         let mut view = ledger.snapshot("127.0.0.1:3425", "ready", None);
         live.apply(&mut view);
         assert!(view.sessions.is_empty());
-        live.routes.get_mut(&10).unwrap().usage = Some(vec![LiveUsage { out: 201 }]);
-        live.apply(&mut view);
-        assert_eq!(view.sessions.len(), 1);
-        assert_eq!(view.sessions[0].label, "未标记会话");
     }
 
     /// 只引用同一会话最近完成的一轮；并发卡片共用上轮值，不累计到本轮。

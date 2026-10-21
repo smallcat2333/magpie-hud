@@ -272,10 +272,8 @@ impl UsageLedger {
         if value.get("kind").and_then(Value::as_str) == Some("routing") {
             return;
         }
-        // 按用户规则过滤无会话身份的极短输出；缺输出量时保持未知，不猜成零。
-        if string(&value, "session").unwrap_or("").is_empty()
-            && value.get("out").and_then(Value::as_u64).is_some_and(|out| out <= 200)
-        {
+        // 无会话身份的记录无法准确归属会话，因此不进入账本与 HUD。
+        if string(&value, "session").unwrap_or("").is_empty() {
             return;
         }
         let timestamp =
@@ -623,39 +621,43 @@ mod tests {
         assert_eq!(view.sessions[0].routes[0].state, "cancelled");
         assert!(!view.sessions[0].notes[0].text.contains("完成"));
     }
-    /// 缺费用和生成时间保持未知；无 session 的记录明确归入未标记组。
+    /// 缺费用和生成时间保持未知；无 session 的记录彻底排除，保留已标记的短记录。
     #[test]
     fn missing_fields_and_out_of_order_records_remain_truthful() {
         let mut ledger = ledger();
-        let mut latest = fixture(3, "", 200);
-        latest.as_object_mut().unwrap().remove("ttft_ms");
-        latest["out"] = json!(201);
-        let mut failed = fixture(1, "", 503);
-        failed["out"] = json!(201);
-        ledger.ingest(failed.to_string().as_bytes());
-        ledger.ingest(latest.to_string().as_bytes());
+        let mut anonymous = fixture(1, "", 200);
+        anonymous.as_object_mut().unwrap().remove("ttft_ms");
+        anonymous["out"] = json!(531);
+        ledger.ingest(anonymous.to_string().as_bytes());
+        assert!(ledger.snapshot("h", "ready", None).sessions.is_empty());
+
+        let mut identified = fixture(2, "alpha", 200);
+        identified.as_object_mut().unwrap().remove("ttft_ms");
+        ledger.ingest(fixture(3, "alpha", 503).to_string().as_bytes());
+        ledger.ingest(identified.to_string().as_bytes());
         let view = ledger.snapshot("h", "ready", None);
-        assert_eq!(view.sessions[0].label, "未标记会话");
+        assert_eq!(view.sessions[0].label, "未命名会话");
         assert_eq!(view.sessions[0].routes[0].state, "recovered");
         assert_eq!(view.daily.credits, None);
         assert_eq!(view.daily.tokens_per_second, None);
         assert_eq!(view.daily.requests, 2);
     }
 
-    /// 无会话身份且输出不超过 200 Token 的记录是开新会话的辅助调用，不单独成卡也不计入当日统计；
-    /// 有会话身份的短输出照常保留。
+    /// 所有无会话身份的记录都过滤，不受输出量影响；有身份短记录照常统计。
     #[test]
-    fn drops_sessionless_short_output_but_keeps_identified_sessions() {
+    fn drops_all_sessionless_records_and_keeps_identified_short_output() {
         let mut ledger = ledger();
         ledger.ingest(fixture(1, "", 200).to_string().as_bytes());
         let mut long = fixture(2, "", 200);
-        long["out"] = json!(201);
+        long["out"] = json!(531);
         ledger.ingest(long.to_string().as_bytes());
-        ledger.ingest(fixture(3, "alpha", 200).to_string().as_bytes());
+        let mut identified = fixture(3, "alpha", 200);
+        identified["out"] = json!(18);
+        ledger.ingest(identified.to_string().as_bytes());
         let view = ledger.snapshot("h", "ready", None);
-        assert_eq!(view.sessions.len(), 2);
-        assert_eq!(view.sessions.iter().filter(|session| session.id.is_empty()).count(), 1);
-        assert_eq!(view.daily.requests, 2);
+        assert_eq!(view.sessions.len(), 1);
+        assert_eq!(view.sessions[0].id, "alpha");
+        assert_eq!(view.daily.requests, 1);
     }
 
     /// 较旧失败账号仍可作为对照，但不会凭空创建冷却秒数。
