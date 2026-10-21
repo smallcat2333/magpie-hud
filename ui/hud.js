@@ -252,6 +252,7 @@
         const account = document.createElement('span');
         account.className = 'quota-account';
         account.textContent = shortAccount(card.account);
+        account.title = card.account;
         const reset = document.createElement('time');
         reset.className = 'quota-reset';
         const resetTime = span?.resetsAt && !Number.isNaN(Date.parse(span.resetsAt)) ? new Date(span.resetsAt) : null;

@@ -35,7 +35,7 @@ class Gateway(BaseHTTPRequestHandler):
             elif self.path == '/v1/magpie/concurrency':
                 data = {'active': self.state['active']}
             elif self.path == '/v1/magpie/quotas?kept=1':
-                data = {'object': 'list', 'data': [{'provider': 'grok', 'name': 'grok', 'user': 'test@example.com', 'kind': 'subscription', 'readAt': self.state['started'], 'windows': [{'name': '5 hours', 'remaining': 62, 'used': 38, 'resetsAt': self.state['started']}, {'name': '7 days', 'remaining': 21, 'used': 79}]}]}
+                data = {'object': 'list', 'data': [{'provider': 'grok', 'name': 'grok', 'user': 'very.long.account.name@example-company.com', 'kind': 'subscription', 'readAt': self.state['started'], 'windows': [{'name': '5 hours', 'remaining': 62, 'used': 38, 'resetsAt': self.state['started']}, {'name': '7 days', 'remaining': 21, 'used': 79}]}]}
             elif self.path == '/v1/magpie/usage?period=today':
                 data = {'since': self.state['started'], 'calls': 2, 'cost': 0.42, 'unpriced': 1, 'sessions': [{'id': 'session-alpha', 'calls': 1, 'cost': .12, 'unpriced': 0}]}
             else:
@@ -119,7 +119,7 @@ def main():
     started = datetime.datetime.now().astimezone().isoformat()
     active = {'id': 1, 'route': 100, 'session': 'session-alpha', 'agent': 'claude-desktop', 'model': 'group/smart-split', 'provider': 'grok', 'phase': 'upstream', 'started': started, 'ms': 1200}
     route = {'id': 100, 'session': 'session-alpha', 'provider': 'grok', 'done': False,
-             'order': [{'id': 'grok', 'who': 'test@example.com'}],
+             'order': [{'id': 'grok', 'who': 'very.long.account.name@example-company.com'}],
              'tries': [{'id': 'grok', 'model': 'grok-4.7-build-fast@500k', 'effort': 'high', 'done': False}]}
     Gateway.state = {'seq': 1, 'pid': 1000, 'ids': [100], 'routes': [route], 'active': [active], 'started': started}
     server = ThreadingHTTPServer(('127.0.0.1', 0), Gateway)
@@ -187,6 +187,9 @@ def main():
         client.evaluate("window.__TAURI__.webviewWindow.getCurrentWebviewWindow().setSize(new window.__TAURI__.dpi.LogicalSize(692,364))")
         client.wait("innerWidth===692 && innerHeight===364")
         assert client.evaluate("document.getElementById('cost-metric').getBoundingClientRect().right <= document.querySelector('.sidebar').getBoundingClientRect().right && document.documentElement.scrollWidth <= innerWidth")
+        assert client.evaluate("document.querySelector('.sidebar').scrollWidth <= document.querySelector('.sidebar').clientWidth && getComputedStyle(document.querySelector('.sidebar')).scrollbarWidth === 'none'")
+        assert client.evaluate("document.querySelector('.quota-account').scrollWidth > document.querySelector('.quota-account').clientWidth && document.querySelector('.quota-reset').getBoundingClientRect().right < document.querySelector('.sidebar').getBoundingClientRect().right")
+        assert client.evaluate("document.querySelector('.quota-account').title") == 'very.long.account.name@example-company.com'
         short = screenshot(client, 'hud-short.png')
         client.evaluate("window.__TAURI__.webviewWindow.getCurrentWebviewWindow().setSize(new window.__TAURI__.dpi.LogicalSize(420,760))")
         client.wait("innerWidth===420 && document.getElementById('hud').dataset.layout==='tall'")
@@ -209,7 +212,7 @@ def main():
             route['tries'][0]['done'] = True
             Gateway.state['seq'] = 2
             Gateway.state['active'] = []
-        append(path, record(1, 'test@example.com', model='grok-4.7-build-fast@500k', provider='grok', route_id=100))
+        append(path, record(1, 'very.long.account.name@example-company.com', model='grok-4.7-build-fast@500k', provider='grok', route_id=100))
         client.wait("!document.querySelector('.route-card.running') && document.querySelector('.card-tokens')?.textContent==='1.0k Token'")
         assert client.evaluate("document.querySelector('.card-tps').textContent") == '50.0 TPS'
         assert client.evaluate("document.querySelectorAll('.request-spinner').length") == 0
@@ -249,7 +252,7 @@ def main():
             time.sleep(.1)
         assert client, 'restarted WebView2 not ready'
         client.wait("innerWidth===420 && innerHeight===760 && document.getElementById('hud')?.dataset.layout==='tall'")
-        print(json.dumps({'passed': True, 'checks': ['short-window-stats-and-one-line-log', 'two-line-usage-bars', 'dashed-spinner-rotation', 'statistic-colors', 'native-acrylic', 'quota-windows', 'global-and-session-cost', 'title-and-half-opacity', 'source-stacking-and-icons', 'effort-color', 'active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall, short]}, ensure_ascii=False))
+        print(json.dumps({'passed': True, 'checks': ['sidebar-no-scrollbars-long-account', 'short-window-stats-and-one-line-log', 'two-line-usage-bars', 'dashed-spinner-rotation', 'statistic-colors', 'native-acrylic', 'quota-windows', 'global-and-session-cost', 'title-and-half-opacity', 'source-stacking-and-icons', 'effort-color', 'active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall, short]}, ensure_ascii=False))
     finally:
         if client:
             try:
