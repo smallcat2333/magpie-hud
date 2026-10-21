@@ -231,7 +231,7 @@
     hud.dataset.sources = groups.size <= 2 ? 'compact' : 'multiple';
   }
 
-  /** 按当前会话选择决定额度展示项；同一分钟内保持上次排序，只更新数值。 */
+  /** 按当前会话选择决定额度展示项；“最近会话”汇总当天全部会话。 */
   function renderQuotas(sessions, forceOrder) {
     const list = byId('quota-list');
     const scroll = list.scrollTop;
@@ -377,7 +377,7 @@
     text('session-count', session ? session.label : `${snapshot.sessions.length} 个会话 · 显示 ${sessions.length} 个`);
     byId('source-node').title = sessions.map(item => `${item.agent}\n${item.request}`).join('\n');
     renderStats(session ? session.daily : snapshot.daily, session ? session.label : '全部会话');
-    renderQuotas(sessions, forceQuotaOrder);
+    renderQuotas(session ? [session] : snapshot.sessions, forceQuotaOrder);
     const fragment = document.createDocumentFragment();
     const newIds = [];
     const currentIds = new Set();
