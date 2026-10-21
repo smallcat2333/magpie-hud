@@ -158,16 +158,19 @@ def main():
         assert client.evaluate("[...document.querySelectorAll('.quota-item')].every(item => item.children.length === 2)")
         assert client.evaluate("document.querySelector('.quota-window strong').textContent") == '38%'
         assert client.evaluate("Math.abs(document.querySelector('.quota-fill').getBoundingClientRect().width / document.querySelector('.quota-track').getBoundingClientRect().width - .38) < .02")
-        assert client.evaluate("document.querySelector('.route-card.running .state-tag').textContent") == '运行中'
+        assert client.evaluate("document.querySelector('.route-card.running .state-tag').textContent") == '运行'
         assert client.evaluate("getComputedStyle(document.querySelector('.route-card.running .state-tag')).color") == 'rgb(156, 207, 255)'
-        assert client.evaluate("[...document.querySelector('.card-bottom').children].map(element=>element.className)") == ['card-model', 'divider', 'card-account', 'effort']
+        assert client.evaluate("[...document.querySelector('.card-bottom').children].map(element=>element.className)") == ['card-model', 'divider', 'card-account']
         assert client.evaluate("document.querySelector('.request-spinner circle').getAttribute('r')") == '7'
         client.wait("getComputedStyle(document.querySelector('.request-spinner')).animationName === 'request-spin'")
         rotation = client.evaluate("getComputedStyle(document.querySelector('.request-spinner')).transform")
         time.sleep(.15)
         assert client.evaluate("getComputedStyle(document.querySelector('.request-spinner')).transform") != rotation
         assert client.evaluate("new Set(['daily-tokens','daily-cost','daily-speed'].map(id=>getComputedStyle(document.getElementById(id)).color)).size") == 3
-        assert client.evaluate("document.querySelector('h1').textContent.trim()") == 'Magpie HUD V.0.0.4(2026/10/21)'
+        version = json.loads((ROOT / 'src-tauri/tauri.conf.json').read_text(encoding='utf-8'))['version']
+        assert client.evaluate("document.getElementById('app-version').textContent") == f'V.{version}(2026/10/21)'
+        assert client.evaluate("document.querySelectorAll('.source-request').length") == 0
+        assert client.evaluate("document.querySelector('.source-icon img').getBoundingClientRect().width") == 34
         assert client.evaluate("getComputedStyle(document.getElementById('hud')).backgroundColor") == 'rgba(23, 25, 30, 0.5)'
         assert client.evaluate("document.querySelector('.effort').dataset.level") == 'high'
         assert client.evaluate("document.getElementById('hud').dataset.sources") == 'compact'
@@ -176,7 +179,8 @@ def main():
         client.wait("document.querySelector('.quota-account')?.textContent.includes('very.')")
         client.evaluate("(() => { const s=document.getElementById('session-select'); s.value='*'; s.dispatchEvent(new Event('change')); })()")
         client.wait("document.querySelector('.quota-account')?.textContent.includes('very.')")
-        assert client.evaluate("document.querySelector('.card-tokens').textContent") == '待统计 Token'
+        assert client.evaluate("document.querySelector('.card-tokens').textContent") == '-- TOK'
+        assert client.evaluate("document.querySelector('.card-tps').textContent") == '-- TPS'
         client.wait("document.querySelector('.branch.running') && getComputedStyle(document.querySelector('.branch.running')).animationName === 'route-stream'")
         offset = client.evaluate("getComputedStyle(document.querySelector('.branch.running')).strokeDashoffset")
         time.sleep(.15)
@@ -187,7 +191,7 @@ def main():
         command(client, 'Emulation.setEmulatedMedia', {'features': []})
         with Gateway.lock:
             active['phase'] = 'slot'
-        client.wait("document.querySelector('.route-card.waiting .state-tag')?.textContent === '运行中'")
+        client.wait("document.querySelector('.route-card.waiting .state-tag')?.textContent === '运行'")
         assert client.evaluate("document.querySelector('.route-card.waiting .request-spinner') !== null")
         with Gateway.lock:
             active['phase'] = 'upstream'
@@ -233,13 +237,13 @@ def main():
             Gateway.state['seq'] = 2
             Gateway.state['active'] = []
         append(path, record(1, 'very.long.account.name@example-company.com', model='grok-4.7-build-fast@500k', provider='grok', route_id=100))
-        client.wait("!document.querySelector('.route-card.running') && document.querySelector('.card-tokens')?.textContent==='1.0k Token'")
+        client.wait("!document.querySelector('.route-card.running') && document.querySelector('.card-tokens')?.textContent==='1k TOK'")
         client.wait("document.querySelector('.quota-track')?.getAttribute('aria-valuenow') === '45'", timeout=8)
         with Gateway.lock:
             assert Gateway.state['quota_reads'] == 3, 'completion must refresh quota cache once'
         assert client.evaluate("document.querySelector('.card-tps').textContent") == '50.0 TPS'
         assert client.evaluate("document.querySelectorAll('.request-spinner').length") == 0
-        assert client.evaluate("document.querySelector('.state-tag').textContent") == '√已完成'
+        assert client.evaluate("document.querySelector('.state-tag').textContent") == '√完成'
         assert client.evaluate("getComputedStyle(document.querySelector('.state-tag')).color") == 'rgb(141, 215, 176)'
         assert client.evaluate("document.querySelectorAll('.note-row').length") == 2
         assert client.evaluate("[...document.querySelectorAll('.note-row')].filter(row => getComputedStyle(row).display !== 'none').length") == 2
@@ -253,7 +257,7 @@ def main():
         client.wait("document.getElementById('watch-label').textContent.includes('实时连接中断')", timeout=8)
         assert client.evaluate("document.querySelector('.card-tps').textContent") == '50.0 TPS'
         assert client.evaluate("document.querySelectorAll('.request-spinner').length") == 0
-        assert client.evaluate("document.querySelector('.state-tag').textContent") == '√已完成'
+        assert client.evaluate("document.querySelector('.state-tag').textContent") == '√完成'
         assert client.evaluate("getComputedStyle(document.querySelector('.state-tag')).color") == 'rgb(141, 215, 176)'
         client.evaluate("window.__TAURI__.webviewWindow.getCurrentWebviewWindow().setSize(new window.__TAURI__.dpi.LogicalSize(420,760))")
         client.wait("innerWidth===420 && innerHeight===760")

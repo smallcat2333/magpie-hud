@@ -2,6 +2,7 @@
 /dist/
 /rust/target/
 /src-tauri/target/
+/src-tauri/target-v008/
 /.codegraph/
 /CMakeUserPresets.json
 *.user

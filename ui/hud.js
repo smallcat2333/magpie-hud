@@ -27,10 +27,11 @@
 
   /** 大数仅用于可读展示，精确值由统计块的 title 提供。 */
   function compact(value) {
-    if (value >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
-    if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
-    if (value >= 1e3) return `${(value / 1e3).toFixed(1)}k`;
-    return Number(value).toLocaleString('zh-CN');
+    const number = Math.round(Number(value));
+    if (number >= 1e9) return `${Math.round(number / 1e9)}B`;
+    if (number >= 1e6) return `${Math.round(number / 1e6)}M`;
+    if (number >= 1e3) return `${Math.round(number / 1e3)}k`;
+    return number.toLocaleString('zh-CN');
   }
 
   /** 缩略账号本地部分，完整账号留在可访问名称和提示中。 */
@@ -44,12 +45,13 @@
   /** 按实际模型族选择随应用打包的图标，未知模型显示中性符号。 */
   function modelIcon(model) {
     const name = model.toLowerCase();
-    if (/gpt|codex|o[134](?:-|$)/.test(name)) return 'openai';
-    if (/claude|sonnet|opus|haiku|fable/.test(name)) return 'anthropic';
+    if (name.includes('codex')) return 'codex-color';
+    if (/gpt|o[134](?:-|$)/.test(name)) return 'openai';
+    if (/claude|sonnet|opus|haiku|fable/.test(name)) return 'claude-color';
     if (name.includes('grok')) return 'grok';
-    if (name.includes('gemini')) return 'gemini';
-    if (name.includes('deepseek')) return 'deepseek';
-    if (/glm|zhipu/.test(name)) return 'zhipu';
+    if (name.includes('gemini')) return 'gemini-color';
+    if (name.includes('deepseek')) return 'deepseek-color';
+    if (/glm|zhipu/.test(name)) return 'zhipu-color';
     return null;
   }
 
@@ -57,12 +59,12 @@
   function statusInfo(card) {
     switch (card.state) {
       case 'running':
-      case 'waiting': return ['', '运行中', 'running'];
+      case 'waiting': return ['', '运行', 'running'];
       case 'success':
-      case 'recovered': return ['√', '已完成', 'success'];
-      case 'cancelled': return ['x', '已取消', 'error'];
-      case 'failed': return ['x', '失败', 'error'];
-      default: return ['x', '状态未知', 'error'];
+      case 'recovered': return ['√', '完成', 'success'];
+      case 'cancelled': return ['x', '取消', 'error'];
+      case 'failed':
+      default: return ['x', '错误', 'error'];
     }
   }
 
@@ -81,12 +83,30 @@
     button.setAttribute('aria-label', tooltip.replaceAll('\n', '，'));
     const icon = document.createElement('span');
     icon.className = 'model-icon';
-    const family = modelIcon(card.model);
+    const selecting = ['running', 'waiting'].includes(card.state) && card.account === '正在选择账号';
+    const family = selecting ? null : modelIcon(card.model);
     if (family) {
       const image = document.createElement('img');
       image.src = `icons/${family}.svg`;
-      image.alt = family;
+      image.alt = family.replace('-color', '');
       icon.append(image);
+    } else if (selecting || ['running', 'waiting'].includes(card.state) && (!card.model || /^(正在选择账号|正在选择模型|正在选路|模型待定)$/.test(card.model))) {
+      icon.title = '正在选路';
+      const routing = document.createElementNS(namespace, 'svg');
+      routing.setAttribute('class', 'routing-icon');
+      routing.setAttribute('viewBox', '0 0 24 24');
+      routing.setAttribute('aria-hidden', 'true');
+      const path = document.createElementNS(namespace, 'path');
+      path.setAttribute('d', 'M5 12h4c4 0 2-7 6-7h3M9 12h9M9 12c4 0 2 7 6 7h3');
+      routing.append(path);
+      for (const [cx, cy] of [[4, 12], [19, 5], [19, 12], [19, 19]]) {
+        const node = document.createElementNS(namespace, 'circle');
+        node.setAttribute('cx', cx);
+        node.setAttribute('cy', cy);
+        node.setAttribute('r', '1.5');
+        routing.append(node);
+      }
+      icon.append(routing);
     } else {
       const fallback = document.createElement('span');
       fallback.className = 'fallback';
@@ -128,34 +148,42 @@
     stateText.className = 'state-text';
     stateText.textContent = state;
     tag.append(stateText);
-    top.append(account, tag);
+    top.append(account);
     const bottom = document.createElement('span');
     bottom.className = 'card-bottom';
     const label = document.createElement('span');
     label.className = 'card-account';
-    label.textContent = shortAccount(card.account);
+    label.textContent = /^(正在选择账号|账号未提供)$/.test(card.account) ? '待定' : shortAccount(card.account);
+    label.title = card.account;
     const separator = document.createElement('span');
     separator.className = 'divider';
     separator.textContent = '·';
     const model = document.createElement('span');
     model.className = 'card-model';
-    model.textContent = card.model;
+    model.textContent = /^(正在选择账号|正在选择模型|模型待定)$/.test(card.model) ? '正在选路' : card.model;
+    model.title = card.model;
     const effort = document.createElement('span');
     effort.className = 'effort';
-    effort.textContent = card.effort;
+    effort.textContent = /^(强度待确定|强度未提供|待定)$/.test(card.effort) ? '待定' : card.effort;
     const intensity = card.effort.toLowerCase();
     if (['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(intensity)) effort.dataset.level = intensity;
-    bottom.append(model, separator, label, effort);
-    copy.append(top, bottom);
+    bottom.append(model, separator, label);
+    copy.append(top, tag, bottom, effort);
     const metrics = document.createElement('span');
     metrics.className = 'card-metrics';
+    const tps = card.tokensPerSecond;
+    const hasSpeed = Number.isFinite(tps) && tps >= 0;
+    if (hasSpeed) metrics.dataset.speed = tps < 30 ? 'red' : tps < 60 ? 'yellow' : tps < 120 ? 'blue' : tps < 200 ? 'green' : 'purple';
     const tokens = document.createElement('span');
     tokens.className = 'card-tokens';
-    tokens.textContent = card.tokens == null ? '待统计 Token' : `${compact(card.tokens)} Token`;
+    const previous = Boolean(card.metricsArePrevious);
+    tokens.textContent = card.tokens == null ? '-- TOK' : `${compact(card.tokens)} TOK`;
     const speed = document.createElement('span');
     speed.className = 'card-tps';
-    speed.textContent = card.tokensPerSecond == null ? '— TPS' : `${card.tokensPerSecond.toFixed(1)} TPS`;
-    metrics.title = '本次请求 Token = 输入 + 输出 + 缓存读取；TPS = 输出 / (总耗时 − 首字耗时)。进行中尚无精确用量时等待最终记录。';
+    speed.textContent = hasSpeed ? `${tps.toFixed(1)} TPS` : '-- TPS';
+    metrics.title = [card.tokens == null ? '' : `${Number(card.tokens).toLocaleString('zh-CN')} Token`, previous
+      ? '进行中请求尚无精确用量；这里显示该会话上一轮已完成请求。Token = 输入 + 输出 + 缓存读取；TPS = 输出 / (总耗时 − 首字耗时)。'
+      : '本次请求 Token = 输入 + 输出 + 缓存读取；TPS = 输出 / (总耗时 − 首字耗时)。暂无上轮记录时，进行中等待最终用量。'].filter(Boolean).join('\n');
     metrics.append(tokens, speed);
     button.append(icon, copy, metrics);
     button.addEventListener('click', () => {
@@ -196,21 +224,17 @@
 
   /** 来源按真实 Agent 合并，最多两个时与 Magpie 纵向排列，给会话留出宽度。 */
   function renderSources(sessions) {
-    const groups = new Map();
-    sessions.forEach(item => {
-      if (!groups.has(item.agent)) groups.set(item.agent, new Set());
-      groups.get(item.agent).add(item.request);
-    });
+    const agents = new Set(sessions.map(item => item.agent));
     const list = byId('source-list');
     list.replaceChildren();
-    for (const [agent, requests] of groups) {
+    for (const agent of agents) {
       const entry = document.createElement('div');
       entry.className = 'source-entry';
       const heading = document.createElement('div');
       heading.className = 'source-heading';
       const icon = document.createElement('span');
       icon.className = 'source-icon';
-      const family = /claude/i.test(agent) ? 'claude' : modelIcon(agent);
+      const family = /claude[\s-]*code/i.test(agent) ? 'claudecode-color' : /claude/i.test(agent) ? 'claude-color' : modelIcon(agent);
       if (family) {
         const image = document.createElement('img');
         image.src = `icons/${family}.svg`;
@@ -219,16 +243,13 @@
       } else icon.textContent = '↗';
       const name = document.createElement('strong');
       name.textContent = agent;
+      name.title = agent;
       heading.append(icon, name);
-      const request = document.createElement('span');
-      request.className = 'source-request';
-      request.textContent = [...requests].join(' · ');
-      request.title = request.textContent;
-      entry.append(heading, request);
+      entry.append(heading);
       list.append(entry);
     }
-    if (!groups.size) list.textContent = '等待请求';
-    hud.dataset.sources = groups.size <= 2 ? 'compact' : 'multiple';
+    if (!agents.size) list.textContent = '等待请求';
+    hud.dataset.sources = agents.size <= 2 ? 'compact' : 'multiple';
   }
 
   /** 按当前会话选择决定额度展示项；“最近会话”汇总当天全部会话。 */
@@ -251,7 +272,8 @@
       const quota = candidates[0];
       const read = quota.readAt || quota.asOf;
       if (read && !Number.isNaN(Date.parse(read))) readings.push(new Date(read));
-      const windows = quota.windows.length ? quota.windows : [null];
+      const shortest = quota.windows.length ? quota.windows.reduce((best, span) => windowRank(span) < windowRank(best) ? span : best) : null;
+      const windows = [shortest];
       windows.forEach((span, index) => {
         const windowName = span?.name === '5 hours' ? '5h' : ['7 days', 'Weekly'].includes(span?.name) ? '周' : span?.name || '额度';
         entries.push({ key, index, card, models, quota, span, windowName });
@@ -288,6 +310,21 @@
     text('quota-freshness', quotaFailed ? '旧读数' : '');
     byId('quota-freshness').title = snapshot.quotaError || (readings.length ? `最近读数 ${new Date(Math.min(...readings)).toLocaleString('zh-CN')}` : '暂无额度读数');
     list.scrollTop = scroll;
+  }
+
+  /** 同一账号只展示最短窗口；无法识别时排在已知窗口之后。 */
+  function windowRank(span) {
+    const name = (span?.name || '').trim().toLowerCase();
+    if (/^(weekly|week|周|每周)$/.test(name)) return 7 * 1440;
+    if (/^(daily|day|日|每天)$/.test(name)) return 1440;
+    if (/^(monthly|month|月|每月)$/.test(name)) return 30 * 1440;
+    const match = name.match(/(\d+(?:\.\d+)?)\s*(minutes?|mins?|m|分钟|hours?|hrs?|h|小时|days?|d|天|weeks?|w|周|months?|月)\b/i)
+      || name.match(/(\d+(?:\.\d+)?)\s*(分钟|小时|天|周|月)/);
+    if (!match) return Infinity;
+    const unit = match[2];
+    const scale = /^(months?|月)$/.test(unit) ? 43200 : /^(weeks?|w|周)$/.test(unit) ? 10080
+      : /^(days?|d|天)$/.test(unit) ? 1440 : /^(hours?|hrs?|h|小时)$/.test(unit) ? 60 : 1;
+    return Number(match[1]) * scale;
   }
 
   /** 只创建稳定元素，不在每次快照中重排。 */
@@ -365,8 +402,10 @@
     hud.dataset.layout = innerWidth / innerHeight < 1.25 || innerWidth < 680 ? 'tall' : 'wide';
     if (!snapshot) return;
     const session = snapshot.sessions.find(item => item.id === selector.value);
-    const sessions = session ? [session] : snapshot.sessions.filter(item => item.routes.some(card => ['running', 'waiting'].includes(card.state)));
-    if (!session) sessions.push(...snapshot.sessions.filter(item => !sessions.includes(item)).slice(0, Math.max(0, 3 - sessions.length)));
+    const active = snapshot.sessions.filter(item => item.routes.some(card => ['running', 'waiting'].includes(card.state)));
+    const recent = snapshot.sessions.filter(item => !active.includes(item));
+    const chooseSessions = () => session ? [session] : [...active, ...recent.slice(0, Math.max(0, visibleSessionCapacity() - active.length))];
+    let sessions = chooseSessions();
     const oldScroll = routeList.scrollTop;
     hud.dataset.state = snapshot.state;
     text('watch-label', snapshot.watchLabel);
@@ -374,10 +413,14 @@
     text('router-host', snapshot.magpieHost);
     renderSources(sessions);
     if (hud.dataset.sources === 'multiple' && innerWidth < 980) hud.dataset.layout = 'tall';
-    text('session-count', session ? session.label : `${snapshot.sessions.length} 个会话 · 显示 ${sessions.length} 个`);
-    byId('source-node').title = sessions.map(item => `${item.agent}\n${item.request}`).join('\n');
     renderStats(session ? session.daily : snapshot.daily, session ? session.label : '全部会话');
     renderQuotas(session ? [session] : snapshot.sessions, forceQuotaOrder);
+    if (hud.dataset.layout === 'tall') {
+      sessions = chooseSessions();
+      renderSources(sessions);
+    }
+    text('session-count', session ? session.label : `${snapshot.sessions.length}会话, 显示${sessions.length}个`);
+    byId('source-node').title = [...new Set(sessions.map(item => item.agent))].join('\n');
     const fragment = document.createDocumentFragment();
     const newIds = [];
     const currentIds = new Set();
@@ -396,6 +439,19 @@
     else { selectedCard = null; renderNotes(session ? session.notes : snapshot.notes); }
     renderedIds = currentIds;
     requestDraw(animate ? newIds : []);
+  }
+
+  /** 至少显示三个会话；窗口更高时按卡片高度增加，活跃会话始终全部保留。 */
+  function visibleSessionCapacity() {
+    const content = document.querySelector('.content');
+    const style = getComputedStyle(content);
+    let available = content.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+    const tall = hud.dataset.layout === 'tall';
+    if (tall) {
+      available -= document.querySelector('.sidebar').offsetHeight + parseFloat(style.rowGap)
+        + document.querySelector('.transit').offsetHeight + parseFloat(getComputedStyle(document.querySelector('.routing')).rowGap);
+    }
+    return Math.max(3, Math.floor((available + 9) / (tall ? 105 : 77)));
   }
 
   /** 用实际路由块位置画贝塞尔分支，列表滚动和窗口大小变化后重新对齐。 */
@@ -417,7 +473,8 @@
       const x = rectangle.left - layer.left;
       const y = rectangle.top + rectangle.height / 2 - layer.top;
       const path = document.createElementNS(namespace, 'path');
-      const state = [...card.classList].find(name => ['running', 'waiting', 'failed', 'cancelled', 'unknown'].includes(name)) || (card.dataset.current === 'true' ? '' : 'inactive');
+      const state = card.classList.contains('waiting') ? 'running'
+        : [...card.classList].find(name => ['running', 'success', 'recovered', 'failed', 'cancelled', 'unknown'].includes(name)) || 'unknown';
       path.setAttribute('d', tall
         ? `M${startX} ${origin}V${bendY}H${trunkX}V${Math.max(bendY, y - 16)}Q${trunkX} ${y} ${x} ${y}`
         : `M${startX} ${origin}C${startX + Math.max(18, (x - startX) * .45)} ${origin} ${startX + Math.max(18, (x - startX) * .25)} ${y} ${x} ${y}`);
@@ -502,7 +559,24 @@
           .startResizeDragging(handle.dataset.resize).catch(reportError);
       });
     });
-    byId('hide-window').addEventListener('click', () => window.__TAURI__.webviewWindow.getCurrentWebviewWindow().hide().catch(reportError));
+    byId('hide-window').addEventListener('click', () => invoke('hide_window').catch(reportError));
+    byId('close-window').addEventListener('click', () => invoke('close_window').catch(reportError));
+    const menu = byId('window-menu');
+    const showMenu = event => {
+      event.preventDefault();
+      menu.hidden = false;
+      const bounds = menu.getBoundingClientRect();
+      menu.style.left = `${Math.max(8, Math.min(event.clientX, innerWidth - bounds.width - 8))}px`;
+      menu.style.top = `${Math.max(8, Math.min(event.clientY, innerHeight - bounds.height - 8))}px`;
+    };
+    document.addEventListener('contextmenu', event => { if (!event.target.closest('input,textarea,select')) showMenu(event); });
+    document.addEventListener('pointerdown', event => { if (!menu.contains(event.target)) menu.hidden = true; });
+    menu.addEventListener('click', async event => {
+      const action = event.target.closest('[data-window-action]')?.dataset.windowAction;
+      menu.hidden = true;
+      if (action === 'hide') await invoke('hide_window').catch(reportError);
+      if (action === 'reset') await invoke('reset_window_position').catch(reportError);
+    });
     byId('drag-region').addEventListener('pointerdown', event => {
       if (event.button === 0 && !event.target.closest('button,select,label')) window.__TAURI__.webviewWindow.getCurrentWebviewWindow().startDragging().catch(reportError);
     });

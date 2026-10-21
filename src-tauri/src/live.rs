@@ -37,6 +37,9 @@ pub struct LiveRoute {
     pub order: Option<Vec<Candidate>>,
     #[serde(default)]
     pub tries: Option<Vec<Attempt>>,
+    /// 完成用量；进行中为 None。仅用于判断无会话请求是否已产生输出。
+    #[serde(default)]
+    pub usage: Option<Vec<LiveUsage>>,
 }
 
 /// 路由候选的账号归属，仅按尝试 id 精确匹配。
@@ -62,6 +65,13 @@ pub struct Attempt {
     pub effort: String,
     #[serde(default)]
     pub done: bool,
+}
+
+/// 只取输出量；不保存 prompt、响应正文或密钥。
+#[derive(Clone, Default, Deserialize)]
+pub struct LiveUsage {
+    #[serde(default)]
+    pub out: u64,
 }
 
 /// concurrency 完整快照，空列表表示当前没有请求。
@@ -120,6 +130,12 @@ impl LiveState {
     /// 用活跃请求覆盖展示，不改账本中的次数、费用与当日 Token。
     pub fn apply(&self, view: &mut RouteSnapshot) {
         let mut active_sessions = HashSet::new();
+        // 在覆盖卡片前保存每个会话的最后一轮，供同会话并发请求共用。
+        let previous_metrics: HashMap<_, _> = view.sessions.iter().filter_map(|session| {
+            session.routes.iter().find(|card| card.current && card.tokens.is_some()
+                && !matches!(card.state.as_str(), "running" | "waiting"))
+                .map(|card| (session.id.clone(), (card.tokens, card.tokens_per_second)))
+        }).collect();
         for active in &self.activity.active {
             let route = self.routes.get(&active.route);
             if route.is_some_and(|r| r.done || r.kind == "routing") {
@@ -130,6 +146,13 @@ impl LiveState {
             } else {
                 &active.session
             };
+            // 无会话身份且输出不超过 200 Token 的请求是开新会话时的辅助调用，不单独占卡；
+            // 输出量未知时也不猜测，等完成日志按同一边界判断。
+            if session_id.is_empty()
+                && route.is_none_or(|r| r.usage.as_deref().unwrap_or_default().iter().all(|u| u.out <= 200))
+            {
+                continue;
+            }
             let started = DateTime::parse_from_rfc3339(&active.started).ok();
             let time = started.map(|t| t.with_timezone(&Local).format("%H:%M:%S").to_string())
                 .unwrap_or_else(|| "--:--:--".into());
@@ -149,18 +172,26 @@ impl LiveState {
             let model = attempt.map(|a| a.model.as_str()).filter(|s| !s.is_empty())
                 .unwrap_or("正在选择模型");
             let effort = attempt.map(|a| a.effort.as_str()).filter(|s| !s.is_empty())
-                .unwrap_or("强度待确定");
+                .unwrap_or("待定");
             let provider = candidate.map(|c| c.provider.as_str()).filter(|s| !s.is_empty()).unwrap_or("");
             let label = self.name(session_id);
             let note = Note { time: time.clone(), kind: "进行中".into(),
                 text: format!("{label} · {account} ({model}) · {effort} · {detail} · {:.1}s", active.ms as f64 / 1000.0) };
+            let previous = previous_metrics.get(session_id).copied();
             let second = Note { time: time.clone(), kind: "统计".into(),
-                text: "本次 Token / TPS 待上游提供最终用量；当日统计仅含已完成请求".into() };
+                text: if previous.is_some() {
+                    "卡片数值为该会话上轮已完成请求；本轮结束后更新，当日统计仅含已完成请求".into()
+                } else {
+                    "该会话暂无上轮记录，本次 Token / TPS 等待完成；当日统计仅含已完成请求".into()
+                } };
             let card = RouteCard {
                 id: format!("live-{}-{}", self.pid, active.id), session_id: session_id.into(),
                 session_label: label.clone(), account: account.into(), model: model.into(), provider: provider.into(),
                 effort: effort.into(), state: phase.into(), detail: detail.into(), error: None, time,
-                current: true, route_id: Some(active.route), tokens: None, tokens_per_second: None, note: note.clone(),
+                current: true, route_id: Some(active.route),
+                tokens: previous.and_then(|(tokens, _)| tokens),
+                tokens_per_second: previous.and_then(|(_, speed)| speed),
+                metrics_are_previous: previous.is_some(), note: note.clone(),
             };
             if let Some(session) = view.sessions.iter_mut().find(|s| s.id == session_id) {
                 if active_sessions.insert(session_id.to_owned()) {
@@ -208,17 +239,34 @@ impl LiveState {
     }
 }
 
-/// 尝试 ID 可能被同账号的不同模型复用；优先匹配模型，歧义时不认领账号。
+/// 尝试 ID 是失败后休息的键，不是独立账号键。当前登录账号的键是 provider，
+/// 同组里该账号的每个模型都会复用它；其余账号是 `provider@user`，多密钥是 `provider#key`。
+/// 模型能唯一对应时用该行。否则仅当 provider 与账号完全一致时认领；任一不同就不猜。
 fn selected_candidate<'a>(route: &'a LiveRoute, attempt: &Attempt) -> Option<&'a Candidate> {
+    if attempt.id.is_empty() { return None; }
     let candidates: Vec<_> = route.order.as_deref().unwrap_or_default().iter()
         .filter(|candidate| candidate.id == attempt.id).collect();
     let exact: Vec<_> = candidates.iter().copied()
         .filter(|candidate| !attempt.model.is_empty() && candidate.model == attempt.model).collect();
-    if exact.len() == 1 { return Some(exact[0]); }
-    if exact.is_empty() && candidates.len() == 1 && candidates[0].model.is_empty() {
-        return Some(candidates[0]);
+    let pool: Vec<_> = if exact.is_empty() {
+        if !attempt.model.is_empty() && candidates.iter().any(|candidate| !candidate.model.is_empty()) {
+            return None;
+        }
+        candidates
+    } else {
+        exact
+    };
+    let mut identity: Option<&Candidate> = None;
+    for candidate in pool {
+        if let Some(chosen) = identity {
+            if chosen.provider != candidate.provider || chosen.who != candidate.who { return None; }
+        } else if candidate.provider.is_empty() && candidate.who.is_empty() {
+            return None;
+        } else {
+            identity = Some(candidate);
+        }
     }
-    None
+    identity
 }
 
 /// 来源文案与日志口径一致。
@@ -377,11 +425,119 @@ mod tests {
         assert_eq!(view.sessions[0].label, "HUD / 实时会话");
         assert_eq!(view.sessions[0].routes[0].state, "running");
         assert_eq!(view.sessions[0].routes[0].tokens, None);
+        assert!(!view.sessions[0].routes[0].metrics_are_previous);
         assert_eq!(view.daily.requests, 0);
         live.activity.active.clear();
         let mut finished = ledger.snapshot("h", "ready", None);
         live.apply(&mut finished);
         assert!(finished.sessions.is_empty());
+    }
+
+    /// 无会话身份且尚无超过 200 Token 输出的活跃请求不单独占卡；
+    /// 一旦该请求产出超过 200 Token，仍以“未标记会话”显示。
+    #[test]
+    fn skips_sessionless_active_request_until_it_produces_output() {
+        let now = Local::now();
+        let mut live = LiveState::default();
+        live.activity.active.push(Active { id: 1, session: String::new(), agent: "claude-desktop".into(),
+            started: now.to_rfc3339(), phase: "upstream".into(), route: 10, ..Active::default() });
+        live.routes.insert(10, LiveRoute { id: 10, usage: Some(vec![LiveUsage { out: 25 }]), ..LiveRoute::default() });
+        let ledger = UsageLedger::new(now.date_naive());
+        let mut view = ledger.snapshot("127.0.0.1:3425", "ready", None);
+        live.apply(&mut view);
+        assert!(view.sessions.is_empty());
+        live.routes.get_mut(&10).unwrap().usage = Some(vec![LiveUsage { out: 201 }]);
+        live.apply(&mut view);
+        assert_eq!(view.sessions.len(), 1);
+        assert_eq!(view.sessions[0].label, "未标记会话");
+    }
+
+    /// 只引用同一会话最近完成的一轮；并发卡片共用上轮值，不累计到本轮。
+    #[test]
+    fn active_metrics_reference_previous_round_in_same_session() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        for (id, session, account, output) in [(1, "alpha", "old", 900), (2, "alpha", "latest", 100), (3, "beta", "other", 200)] {
+            let row = serde_json::json!({"route_id":id,"t":now.to_rfc3339(),"session":session,
+                "providerAccount":account,"provider":"codex","model":"gpt-test","status":200,
+                "in":100,"out":output,"cache_read":800,"ms":3000,"ttft_ms":1000});
+            ledger.ingest(row.to_string().as_bytes());
+        }
+        let baseline = ledger.snapshot("h", "ready", None);
+        let mut live = LiveState::default();
+        for (id, session) in [(10, "alpha"), (11, "alpha"), (12, "beta"), (13, "first-round")] {
+            live.activity.active.push(Active { id, session: session.into(), agent: "test".into(),
+                started: now.to_rfc3339(), phase: "upstream".into(), ..Default::default() });
+        }
+        let mut view = baseline.clone();
+        live.apply(&mut view);
+        for session in &view.sessions {
+            for card in &session.routes {
+                match session.id.as_str() {
+                    "alpha" => {
+                        assert_eq!(card.tokens, Some(1_000));
+                        assert_eq!(card.tokens_per_second, Some(50.0));
+                        assert!(card.metrics_are_previous);
+                    }
+                    "beta" => {
+                        assert_eq!(card.tokens, Some(1_100));
+                        assert_eq!(card.tokens_per_second, Some(100.0));
+                        assert!(card.metrics_are_previous);
+                    }
+                    _ => { assert_eq!(card.tokens, None); assert!(!card.metrics_are_previous); }
+                }
+                assert_eq!(card.state, "running");
+            }
+        }
+        assert_eq!(view.sessions.iter().find(|session| session.id == "alpha").unwrap().routes.len(), 2);
+        assert_eq!(view.daily, baseline.daily);
+        live.activity.active.clear();
+        let mut finished = baseline;
+        live.apply(&mut finished);
+        assert!(finished.sessions.iter().flat_map(|session| &session.routes).all(|card| !card.metrics_are_previous));
+    }
+
+    /// 同一账号、模型可在多个组成员中重复出现；重复行不构成账号歧义。
+    #[test]
+    fn selected_candidate_accepts_duplicate_model_rows_with_same_identity() {
+        let route = LiveRoute { order: Some(vec![
+            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into() },
+            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into() },
+        ]), ..Default::default() };
+        let selected = selected_candidate(&route, &Attempt {
+            id: "seat".into(), model: "model-a".into(), ..Default::default()
+        });
+        assert_eq!(selected.map(|candidate| (candidate.provider.as_str(), candidate.who.as_str())),
+            Some(("provider-a", "account-a")));
+    }
+
+    /// 尝试未提供模型时，仅从精确 ID 的所有候选一致的身份认领，不用请求模型推断。
+    #[test]
+    fn selected_candidate_accepts_missing_model_only_with_same_identity() {
+        let route = LiveRoute { order: Some(vec![
+            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into() },
+            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-b".into(), who: "account-a".into() },
+            Candidate { id: "other-seat".into(), provider: "provider-b".into(), model: "model-a".into(), who: "account-b".into() },
+        ]), ..Default::default() };
+        let selected = selected_candidate(&route, &Attempt { id: "seat".into(), ..Default::default() });
+        assert_eq!(selected.map(|candidate| (candidate.provider.as_str(), candidate.who.as_str())),
+            Some(("provider-a", "account-a")));
+    }
+
+    /// 同 ID、同模型但账号或供应商不同，模型已知与缺失时都必须拒绝认领。
+    #[test]
+    fn selected_candidate_rejects_conflicting_account_or_provider() {
+        for (provider, who) in [("provider-a", "account-b"), ("provider-b", "account-a")] {
+            let route = LiveRoute { order: Some(vec![
+                Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into() },
+                Candidate { id: "seat".into(), provider: provider.into(), model: "model-a".into(), who: who.into() },
+            ]), ..Default::default() };
+            for model in ["model-a", ""] {
+                assert!(selected_candidate(&route, &Attempt {
+                    id: "seat".into(), model: model.into(), ..Default::default()
+                }).is_none(), "conflicting identity must remain unknown, with model {model:?}");
+            }
+        }
     }
 
     /// 重启替换路由缓存；同级标题争议未知，当前身份优先历史身份。
@@ -409,5 +565,20 @@ mod tests {
         assert!(selected_candidate(&route, &Attempt { id: "codex".into(), ..Default::default() }).is_none());
         let legacy = LiveRoute { order: Some(vec![Candidate { id: "grok".into(), who: "grok@example.com".into(), ..Default::default() }]), ..Default::default() };
         assert!(selected_candidate(&legacy, &Attempt { id: "grok".into(), model: "grok-test".into(), ..Default::default() }).is_some());
+        // 当前登录账号的休息键是 provider，组内每个模型各有一行。
+        let shared = LiveRoute { order: Some(vec![
+            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6".into(), who: "one@example.com".into() },
+            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6.1".into(), who: "one@example.com".into() },
+            Candidate { id: "codex@two@example.com".into(), provider: "codex".into(), model: "gpt-6".into(), who: "two@example.com".into() },
+        ]), ..Default::default() };
+        let signed_in = selected_candidate(&shared, &Attempt { id: "codex".into(), model: "gpt-6.1".into(), ..Default::default() });
+        assert_eq!(signed_in.map(|c| (c.provider.as_str(), c.who.as_str())), Some(("codex", "one@example.com")));
+        // 模型不在计划里，或同一键对应不同账号时，保持选择中，不用请求模型补身份。
+        assert!(selected_candidate(&shared, &Attempt { id: "codex".into(), model: "gpt-other".into(), ..Default::default() }).is_none());
+        let conflict = LiveRoute { order: Some(vec![
+            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6".into(), who: "one@example.com".into() },
+            Candidate { id: "codex".into(), provider: "other".into(), model: "gpt-6".into(), who: "one@example.com".into() },
+        ]), ..Default::default() };
+        assert!(selected_candidate(&conflict, &Attempt { id: "codex".into(), model: "gpt-6".into(), ..Default::default() }).is_none());
     }
 }

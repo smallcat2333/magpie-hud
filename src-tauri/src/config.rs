@@ -28,7 +28,8 @@ pub struct AppConfig {
     pub usage_jsonl_path: String,
     /// 本机 Magpie 网关地址，用于显示和只读实时路由；仅允许回环 HTTP。
     pub magpie_host: String,
-    /// 上次正常退出前的窗口位置；首次运行为空。
+    /// 上次可见的正常窗口位置与尺寸；首次运行为空。
+    /// 只保存稳定矩形，不保存最小化哨兵坐标、零尺寸或隐藏态。
     pub window: Option<WindowPlacement>,
     /// 是否置顶，默认 true。
     pub always_on_top: bool,

@@ -4,21 +4,26 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Magpie HUD V.0.0.5(2026/10/21)</title>
+  <title>Magpie HUD V.0.0.15(2026/10/21)</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="hud.css?v=0.0.3">
-  <script src="hud.js?v=0.0.3" defer></script>
+  <link rel="stylesheet" href="hud.css?v=0.0.15">
+  <script src="hud.js?v=0.0.15" defer></script>
 </head>
 <body>
 <main class="hud" id="hud" data-state="waiting" data-sources="compact">
   <header class="window-bar" id="drag-region" data-tauri-drag-region>
     <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg>
-    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.0.0.5(2026/10/21)</span></h1><span class="brand-subtitle">路由监视</span>
+    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.0.0.15(2026/10/21)</span></h1><span class="brand-subtitle">路由监视</span>
     <span class="watch-state" id="watch-label" role="status">等待今日记录</span>
     <label class="scope-label" for="session-select">查看</label>
     <select id="session-select" aria-label="按会话查看路由"><option value="*">最近会话</option></select>
     <button id="pin" class="window-button" type="button" aria-label="置顶窗口" aria-pressed="true" title="置顶窗口"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3h6m-5 0v5l-3 3v1h10v-1l-3-3V3M10 12v5"/></svg></button>
-    <button id="hide-window" class="window-button" type="button" aria-label="隐藏到托盘" title="隐藏到托盘"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10h10"/></svg></button>
+    <button id="hide-window" class="window-button" type="button" aria-label="最小化到托盘" title="最小化到托盘"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10h10"/></svg></button>
+    <button id="close-window" class="window-button" type="button" aria-label="关闭程序" title="关闭程序"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8"/></svg></button>
+    <div id="window-menu" class="window-menu" hidden>
+      <button type="button" data-window-action="reset">初始化位置</button>
+      <button type="button" data-window-action="hide">隐藏到托盘</button>
+    </div>
   </header>
   <div class="content">
     <aside class="sidebar" aria-label="统计与用量">
@@ -41,13 +46,12 @@
       <div class="transit">
       <div class="source-node" tabindex="0" id="source-node">
         <span class="node-caption">请求来源</span>
-        <div id="source-list" class="source-list"><div class="source-entry"><div class="source-heading"><span class="source-icon"><img src="icons/claude.svg" alt=""></span><strong>等待请求</strong></div><span class="source-request">请求模型待记录</span></div></div>
-        <small id="session-count">0 个会话</small>
+        <div id="source-list" class="source-list"><div class="source-entry"><div class="source-heading"><span class="source-icon"><img src="icons/claude-color.svg" alt=""></span><strong>等待请求</strong></div></div></div>
       </div>
       <svg class="inbound" viewBox="0 0 48 100" preserveAspectRatio="none" aria-hidden="true"><path class="route-track" d="M2 60C22 60 26 42 46 42"/><path class="route-active" id="inbound-active" d="M2 60C22 60 26 42 46 42"/></svg>
       <div class="router-node" tabindex="0" aria-label="本机 Magpie 路由器">
         <div class="router-emblem"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg></div>
-        <strong>magpie</strong><span id="router-host">127.0.0.1:3425</span>
+        <strong>magpie</strong><small id="session-count">0会话</small><span id="router-host">127.0.0.1:3425</span>
       </div>
       </div>
       <div class="route-area" id="route-area">

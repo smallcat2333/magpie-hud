@@ -91,7 +91,7 @@ def main():
         client.wait("document.querySelectorAll('.route-card.failed').length === 1")
         assert client.evaluate("document.getElementById('line1-kind').textContent") == "失败"
         assert client.evaluate("document.querySelector('.failed .state-symbol').textContent") == 'x'
-        assert client.evaluate("document.querySelector('.failed .state-text').textContent") == '失败'
+        assert client.evaluate("document.querySelector('.failed .state-text').textContent") == '错误'
         assert client.evaluate("getComputedStyle(document.querySelector('.failed .state-tag')).color") == 'rgb(237, 145, 155)'
         append_started = time.perf_counter()
         append(path, record(2, "success@example.com", credits=2.5))
@@ -103,7 +103,7 @@ def main():
         client.wait("document.querySelectorAll('.route-card.recovered').length === 1")
         assert client.evaluate("document.querySelectorAll('.route-card.failed').length") == 0
         assert client.evaluate("document.querySelector('.recovered .state-symbol').textContent") == '√'
-        assert client.evaluate("document.querySelector('.recovered .state-text').textContent") == '已完成'
+        assert client.evaluate("document.querySelector('.recovered .state-text').textContent") == '完成'
         assert client.evaluate("getComputedStyle(document.querySelector('.recovered .state-tag')).color") == 'rgb(141, 215, 176)'
         append(path, record(4, "other@example.com", session="session-beta", model="grok-4.7-build-fast@500k", effort="high", tries=2))
         client.wait("document.getElementById('session-select').options.length === 3")
@@ -111,7 +111,7 @@ def main():
         assert client.evaluate("document.getElementById('daily-tokens').textContent") == "3K"
         assert client.evaluate("document.getElementById('stats-scope').textContent") == "未命名会话"
         assert client.evaluate("document.querySelectorAll('.note-row').length") == 2
-        assert client.evaluate("document.querySelector('.card-copy').children.length") == 2
+        assert client.evaluate("document.querySelector('.card-copy').children.length") == 4
         # 半行不渲染；补换行后才计入，重复触发不重复统计。
         partial = json.dumps(record(5, "other@example.com", session="session-beta"))
         with path.open("a", encoding="utf-8") as stream:
