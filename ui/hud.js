@@ -14,6 +14,9 @@
   let renderedIds = new Set();
   let animations = [];
   let frame = 0;
+  const quotaViews = new Map();
+  let quotaRenderKey = '';
+  let quotaOrderTimer = 0;
 
   /** 文本节点保留完整 title，显示受 CSS 单行省略约束。 */
   function text(id, value) {
@@ -226,92 +229,122 @@
     hud.dataset.sources = groups.size <= 2 ? 'compact' : 'multiple';
   }
 
-  /** 额度以 provider + 完整账号唯一匹配；无模型限定字段的窗口按账号共享展示。 */
-  function renderQuotas(sessions) {
+  /** 按当前会话选择决定额度展示项；同一分钟内保持上次排序，只更新数值。 */
+  function renderQuotas(sessions, forceOrder) {
     const list = byId('quota-list');
     const scroll = list.scrollTop;
-    list.replaceChildren();
     const accounts = new Map();
     sessions.flatMap(session => session.routes.slice(0, 4)).forEach(card => {
       const key = JSON.stringify([card.provider.toLowerCase(), card.account]);
       if (!accounts.has(key)) accounts.set(key, { card, models: new Set() });
       accounts.get(key).models.add(card.model);
     });
+    const entries = [];
     const readings = [];
-    for (const { card, models } of accounts.values()) {
+    for (const [key, { card, models }] of accounts) {
       const candidates = (snapshot.quotas || []).filter(quota =>
         quota.provider.toLowerCase() === card.provider.toLowerCase() &&
         (quota.user ? quota.user === card.account : quota.kind === 'balance' && quota.name === card.account));
-      const quota = candidates.length === 1 ? candidates[0] : null;
-      if (!quota) continue;
-      const read = quota?.readAt || quota?.asOf;
+      if (candidates.length !== 1) continue;
+      const quota = candidates[0];
+      const read = quota.readAt || quota.asOf;
       if (read && !Number.isNaN(Date.parse(read))) readings.push(new Date(read));
-      const windows = quota?.windows.length ? quota.windows : [null];
-      for (const span of windows) {
-        const item = document.createElement('div');
-        item.className = 'quota-item';
-        item.dataset.stale = String(Boolean(snapshot.quotaError || quota?.error));
+      const windows = quota.windows.length ? quota.windows : [null];
+      windows.forEach((span, index) => {
         const windowName = span?.name === '5 hours' ? '5h' : ['7 days', 'Weekly'].includes(span?.name) ? '周' : span?.name || '额度';
-        const header = document.createElement('div');
-        header.className = 'quota-meta';
-        const account = document.createElement('span');
-        account.className = 'quota-account';
-        account.textContent = shortAccount(card.account);
-        account.title = card.account;
-        const reset = document.createElement('time');
-        reset.className = 'quota-reset';
-        const resetTime = span?.resetsAt && !Number.isNaN(Date.parse(span.resetsAt)) ? new Date(span.resetsAt) : null;
-        reset.textContent = resetTime ? resetTime.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '—';
-        if (resetTime) reset.dateTime = span.resetsAt;
-        header.append(account, reset);
-        const row = document.createElement('div');
-        row.className = 'quota-window';
-        const label = document.createElement('span');
-        label.className = 'quota-period';
-        label.textContent = windowName;
-        const track = document.createElement('div');
-        track.className = 'quota-track';
-        track.setAttribute('role', 'progressbar');
-        track.setAttribute('aria-label', `${card.account} ${windowName} 已用额度`);
-        const used = span && !span.unlimited ? (Number.isFinite(span.used) ? span.used : Number.isFinite(span.remaining) ? 100 - span.remaining : null) : null;
-        const percent = used === null ? null : Math.min(100, Math.max(0, used));
-        const value = document.createElement('strong');
-        const summary = percent !== null ? `已用 ${percent.toFixed(0)}%` : span?.unlimited ? '不限量' : quota?.balance || '未提供';
-        value.textContent = percent !== null ? `${percent.toFixed(0)}%` : span?.unlimited ? '∞' : '—';
-        track.setAttribute('aria-valuetext', summary);
-        track.dataset.unknown = String(percent === null);
-        if (percent !== null) {
-          track.setAttribute('aria-valuemin', '0');
-          track.setAttribute('aria-valuemax', '100');
-          track.setAttribute('aria-valuenow', String(percent));
-          const fill = document.createElement('span');
-          fill.className = 'quota-fill';
-          fill.style.width = `${percent}%`;
-          track.append(fill);
-        }
-        row.dataset.low = String(percent !== null && percent >= 90);
-        row.append(label, track, value);
-        item.title = [card.account, [...models].join(' · '), [span?.family || span?.pool, windowName, summary].filter(Boolean).join(' · '), resetTime ? `${reset.textContent} 重置` : '重置时间未提供', read ? `读数 ${read}` : '', snapshot.quotaError || quota?.error || ''].filter(Boolean).join('\n');
-        item.tabIndex = 0;
-        item.setAttribute('aria-label', item.title.replaceAll('\n', '，'));
-        item.append(header, row);
-        list.append(item);
-      }
+        entries.push({ key, index, card, models, quota, span, windowName });
+      });
     }
-    if (!list.children.length) {
-      const empty = document.createElement('p');
+    const orderKey = entries.map(entry => `${entry.key}|${entry.index}`).join('\n');
+    if (!forceOrder && quotaRenderKey && orderKey !== quotaRenderKey) {
+      entries.sort((a, b) => quotaRenderKey.indexOf(`${a.key}|${a.index}`) - quotaRenderKey.indexOf(`${b.key}|${b.index}`));
+    } else quotaRenderKey = orderKey;
+    const next = new Map(entries.map(entry => [`${entry.key}|${entry.index}`, entry]));
+    for (const [key, view] of quotaViews) {
+      if (!next.has(key)) { view.item.remove(); quotaViews.delete(key); }
+    }
+    let previous = null;
+    for (const entry of entries) {
+      const itemKey = `${entry.key}|${entry.index}`;
+      const view = quotaViews.get(itemKey) || createQuotaItem(entry);
+      quotaViews.set(itemKey, view);
+      updateQuotaItem(view, entry);
+      if (view.item.previousElementSibling !== previous) list.insertBefore(view.item, previous?.nextElementSibling || list.firstChild);
+      previous = view.item;
+    }
+    let empty = list.querySelector('.quota-empty');
+    if (!entries.length && !empty) {
+      empty = document.createElement('p');
       empty.className = 'quota-empty';
       empty.textContent = '暂无额度';
       list.append(empty);
-    }
-    const quotaFailed = snapshot.quotaError || list.querySelector('[data-stale="true"]');
+    } else if (entries.length && empty) empty.remove();
+    const quotaFailed = snapshot.quotaError || [...quotaViews.values()].some(view => view.item.dataset.stale === 'true');
     text('quota-freshness', quotaFailed ? '旧读数' : '');
     byId('quota-freshness').title = snapshot.quotaError || (readings.length ? `最近读数 ${new Date(Math.min(...readings)).toLocaleString('zh-CN')}` : '暂无额度读数');
     list.scrollTop = scroll;
   }
 
+  /** 只创建稳定元素，不在每次快照中重排。 */
+  function createQuotaItem() {
+    const item = document.createElement('div');
+    item.className = 'quota-item';
+    item.tabIndex = 0;
+    const header = document.createElement('div');
+    header.className = 'quota-meta';
+    const account = document.createElement('span');
+    account.className = 'quota-account';
+    const reset = document.createElement('time');
+    reset.className = 'quota-reset';
+    header.append(account, reset);
+    const row = document.createElement('div');
+    row.className = 'quota-window';
+    const label = document.createElement('span');
+    label.className = 'quota-period';
+    const track = document.createElement('div');
+    track.className = 'quota-track';
+    track.setAttribute('role', 'progressbar');
+    const fill = document.createElement('span');
+    fill.className = 'quota-fill';
+    track.append(fill);
+    const value = document.createElement('strong');
+    row.append(label, track, value);
+    item.append(header, row);
+    return { item, account, reset, label, track, fill, value };
+  }
+
+  /** 更新同一额度项的数值和提示，不改变其在列表中的位置。 */
+  function updateQuotaItem(view, { card, models, quota, span, windowName }) {
+    view.item.dataset.stale = String(Boolean(snapshot.quotaError || quota.error));
+    view.account.textContent = shortAccount(card.account);
+    view.account.title = card.account;
+    const resetTime = span?.resetsAt && !Number.isNaN(Date.parse(span.resetsAt)) ? new Date(span.resetsAt) : null;
+    view.reset.textContent = resetTime ? resetTime.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '—';
+    view.reset.dateTime = resetTime ? span.resetsAt : '';
+    view.label.textContent = windowName;
+    const used = span && !span.unlimited ? (Number.isFinite(span.used) ? span.used : Number.isFinite(span.remaining) ? 100 - span.remaining : null) : null;
+    const percent = used === null ? null : Math.min(100, Math.max(0, used));
+    const summary = percent !== null ? `已用 ${percent.toFixed(0)}%` : span?.unlimited ? '不限量' : quota.balance || '未提供';
+    view.value.textContent = percent !== null ? `${percent.toFixed(0)}%` : span?.unlimited ? '∞' : '—';
+    view.track.setAttribute('aria-label', `${card.account} ${windowName} 已用额度`);
+    view.track.setAttribute('aria-valuetext', summary);
+    view.track.dataset.unknown = String(percent === null);
+    if (percent !== null) {
+      view.track.setAttribute('aria-valuemin', '0');
+      view.track.setAttribute('aria-valuemax', '100');
+      view.track.setAttribute('aria-valuenow', String(percent));
+      view.fill.style.width = `${percent}%`;
+    } else view.fill.style.width = '0';
+    view.track.parentElement.dataset.low = String(percent !== null && percent >= 90);
+    const read = quota.readAt || quota.asOf;
+    view.item.title = [card.account, [...models].join(' · '), [span?.family || span?.pool, windowName, summary].filter(Boolean).join(' · '), resetTime ? `${view.reset.textContent} 重置` : '重置时间未提供', read ? `读数 ${read}` : '', snapshot.quotaError || quota.error || ''].filter(Boolean).join('\n');
+    view.item.setAttribute('aria-label', view.item.title.replaceAll('\n', '，'));
+  }
+
   /** 根据当前会话选择生成分支和两行说明，保留滚动位置。 */
   function render(animate) {
+    const forceQuotaOrder = !quotaOrderTimer;
+    if (!quotaOrderTimer) quotaOrderTimer = setTimeout(() => { quotaOrderTimer = 0; render(false); }, 60_000);
     hud.dataset.layout = innerWidth / innerHeight < 1.25 || innerWidth < 680 ? 'tall' : 'wide';
     if (!snapshot) return;
     const session = snapshot.sessions.find(item => item.id === selector.value);
@@ -327,7 +360,7 @@
     text('session-count', session ? session.label : `${snapshot.sessions.length} 个会话 · 显示 ${sessions.length} 个`);
     byId('source-node').title = sessions.map(item => `${item.agent}\n${item.request}`).join('\n');
     renderStats(session ? session.daily : snapshot.daily, session ? session.label : '全部会话');
-    renderQuotas(sessions);
+    renderQuotas(sessions, forceQuotaOrder);
     const fragment = document.createDocumentFragment();
     const newIds = [];
     const currentIds = new Set();
@@ -408,7 +441,7 @@
 
   /** 先完成事件订阅，再拉取后端已缓存快照；只在 Tauri 环境访问原生 API。 */
   async function start() {
-    selector.addEventListener('change', () => { selectedCard = null; renderedIds.clear(); render(false); });
+    selector.addEventListener('change', () => { selectedCard = null; renderedIds.clear(); quotaOrderTimer = clearTimeout(quotaOrderTimer); render(false); });
     routeList.addEventListener('scroll', () => requestDraw(), { passive: true });
     new ResizeObserver(() => {
       render(false);

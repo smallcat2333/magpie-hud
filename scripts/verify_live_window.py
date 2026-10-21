@@ -173,8 +173,9 @@ def main():
         assert client.evaluate("document.getElementById('hud').dataset.sources") == 'compact'
         assert client.evaluate("document.querySelector('.source-node').getBoundingClientRect().bottom <= document.querySelector('.router-node').getBoundingClientRect().top")
         client.evaluate("(() => { const s=document.getElementById('session-select'); s.value='session-alpha'; s.dispatchEvent(new Event('change')); })()")
-        assert client.evaluate("document.getElementById('daily-cost').textContent") == '$0.12'
+        client.wait("document.querySelector('.quota-account')?.textContent.includes('very.')")
         client.evaluate("(() => { const s=document.getElementById('session-select'); s.value='*'; s.dispatchEvent(new Event('change')); })()")
+        client.wait("document.querySelector('.quota-account')?.textContent.includes('very.')")
         assert client.evaluate("document.querySelector('.card-tokens').textContent") == '待统计 Token'
         client.wait("document.querySelector('.branch.running') && getComputedStyle(document.querySelector('.branch.running')).animationName === 'route-stream'")
         offset = client.evaluate("getComputedStyle(document.querySelector('.branch.running')).strokeDashoffset")
