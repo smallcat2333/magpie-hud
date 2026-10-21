@@ -136,7 +136,7 @@
     effort.textContent = card.effort;
     const intensity = card.effort.toLowerCase();
     if (['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(intensity)) effort.dataset.level = intensity;
-    bottom.append(label, separator, model, effort);
+    bottom.append(model, separator, label, effort);
     copy.append(top, bottom);
     const metrics = document.createElement('span');
     metrics.className = 'card-metrics';
@@ -239,6 +239,7 @@
         quota.provider.toLowerCase() === card.provider.toLowerCase() &&
         (quota.user ? quota.user === card.account : quota.kind === 'balance' && quota.name === card.account));
       const quota = candidates.length === 1 ? candidates[0] : null;
+      if (!quota) continue;
       const read = quota?.readAt || quota?.asOf;
       if (read && !Number.isNaN(Date.parse(read))) readings.push(new Date(read));
       const windows = quota?.windows.length ? quota.windows : [null];
@@ -293,10 +294,10 @@
         list.append(item);
       }
     }
-    if (!accounts.size) {
+    if (!list.children.length) {
       const empty = document.createElement('p');
       empty.className = 'quota-empty';
-      empty.textContent = '等待当前会话的额度';
+      empty.textContent = '暂无额度';
       list.append(empty);
     }
     const quotaFailed = snapshot.quotaError || list.querySelector('[data-stale="true"]');

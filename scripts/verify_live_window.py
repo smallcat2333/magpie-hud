@@ -35,7 +35,10 @@ class Gateway(BaseHTTPRequestHandler):
             elif self.path == '/v1/magpie/concurrency':
                 data = {'active': self.state['active']}
             elif self.path == '/v1/magpie/quotas?kept=1':
-                data = {'object': 'list', 'data': [{'provider': 'grok', 'name': 'grok', 'user': 'very.long.account.name@example-company.com', 'kind': 'subscription', 'readAt': self.state['started'], 'windows': [{'name': '5 hours', 'remaining': 62, 'used': 38, 'resetsAt': self.state['started']}, {'name': '7 days', 'remaining': 21, 'used': 79}]}]}
+                self.state['quota_reads'] += 1
+                self.state['quota_times'].append(time.monotonic())
+                used = self.state['quota_used']
+                data = {'object': 'list', 'data': [{'provider': 'grok', 'name': 'grok', 'user': 'very.long.account.name@example-company.com', 'kind': 'subscription', 'readAt': self.state['started'], 'windows': [{'name': '5 hours', 'remaining': 100 - used, 'used': used, 'resetsAt': self.state['started']}, {'name': '7 days', 'remaining': 21, 'used': 79}]}]}
             elif self.path == '/v1/magpie/usage?period=today':
                 data = {'since': self.state['started'], 'calls': 2, 'cost': 0.42, 'unpriced': 1, 'sessions': [{'id': 'session-alpha', 'calls': 1, 'cost': .12, 'unpriced': 0}]}
             else:
@@ -121,7 +124,7 @@ def main():
     route = {'id': 100, 'session': 'session-alpha', 'provider': 'grok', 'done': False,
              'order': [{'id': 'grok', 'who': 'very.long.account.name@example-company.com'}],
              'tries': [{'id': 'grok', 'model': 'grok-4.7-build-fast@500k', 'effort': 'high', 'done': False}]}
-    Gateway.state = {'seq': 1, 'pid': 1000, 'ids': [100], 'routes': [route], 'active': [active], 'started': started}
+    Gateway.state = {'seq': 1, 'pid': 1000, 'ids': [100], 'routes': [route], 'active': [active], 'started': started, 'quota_reads': 0, 'quota_used': 38, 'quota_times': []}
     server = ThreadingHTTPServer(('127.0.0.1', 0), Gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -156,6 +159,7 @@ def main():
         assert client.evaluate("document.querySelector('.quota-window strong').textContent") == '38%'
         assert client.evaluate("Math.abs(document.querySelector('.quota-fill').getBoundingClientRect().width / document.querySelector('.quota-track').getBoundingClientRect().width - .38) < .02")
         assert client.evaluate("document.querySelector('.route-card.running .state-tag').textContent") == ''
+        assert client.evaluate("[...document.querySelector('.card-bottom').children].map(element=>element.className)") == ['card-model', 'divider', 'card-account', 'effort']
         assert client.evaluate("document.querySelector('.request-spinner circle').getAttribute('r')") == '7'
         client.wait("getComputedStyle(document.querySelector('.request-spinner')).animationName === 'request-spin'")
         rotation = client.evaluate("getComputedStyle(document.querySelector('.request-spinner')).transform")
@@ -208,12 +212,22 @@ def main():
         (title_dir / 'local_demo.json').write_text(json.dumps({'sessionId': 'local_demo', 'cliSessionId': 'session-alpha', 'title': 'HUD / 名称更新'}), encoding='utf-8')
         client.wait("document.querySelector('.session-title').textContent === 'HUD / 名称更新'")
         with Gateway.lock:
+            assert Gateway.state['quota_reads'] == 1, 'active updates must not repoll quotas'
+            Gateway.state['quota_used'] = 41
+        client.wait("document.querySelector('.quota-track')?.getAttribute('aria-valuenow') === '41'", timeout=65)
+        with Gateway.lock:
+            assert Gateway.state['quota_reads'] == 2
+            assert Gateway.state['quota_times'][1] - Gateway.state['quota_times'][0] >= 55, 'quota periodic refresh must be one minute'
+            Gateway.state['quota_used'] = 45
             route['done'] = True
             route['tries'][0]['done'] = True
             Gateway.state['seq'] = 2
             Gateway.state['active'] = []
         append(path, record(1, 'very.long.account.name@example-company.com', model='grok-4.7-build-fast@500k', provider='grok', route_id=100))
         client.wait("!document.querySelector('.route-card.running') && document.querySelector('.card-tokens')?.textContent==='1.0k Token'")
+        client.wait("document.querySelector('.quota-track')?.getAttribute('aria-valuenow') === '45'", timeout=8)
+        with Gateway.lock:
+            assert Gateway.state['quota_reads'] == 3, 'completion must refresh quota cache once'
         assert client.evaluate("document.querySelector('.card-tps').textContent") == '50.0 TPS'
         assert client.evaluate("document.querySelectorAll('.request-spinner').length") == 0
         assert client.evaluate("document.querySelectorAll('.note-row').length") == 2
@@ -252,7 +266,7 @@ def main():
             time.sleep(.1)
         assert client, 'restarted WebView2 not ready'
         client.wait("innerWidth===420 && innerHeight===760 && document.getElementById('hud')?.dataset.layout==='tall'")
-        print(json.dumps({'passed': True, 'checks': ['sidebar-no-scrollbars-long-account', 'short-window-stats-and-one-line-log', 'two-line-usage-bars', 'dashed-spinner-rotation', 'statistic-colors', 'native-acrylic', 'quota-windows', 'global-and-session-cost', 'title-and-half-opacity', 'source-stacking-and-icons', 'effort-color', 'active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall, short]}, ensure_ascii=False))
+        print(json.dumps({'passed': True, 'checks': ['model-before-account', 'minute-and-completion-quota-refresh', 'sidebar-no-scrollbars-long-account', 'short-window-stats-and-one-line-log', 'two-line-usage-bars', 'dashed-spinner-rotation', 'statistic-colors', 'native-acrylic', 'quota-windows', 'global-and-session-cost', 'title-and-half-opacity', 'source-stacking-and-icons', 'effort-color', 'active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall, short]}, ensure_ascii=False))
     finally:
         if client:
             try:

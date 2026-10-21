@@ -30,6 +30,7 @@ struct Runtime {
     cursor: LogCursor,
     live: live::LiveState,
     telemetry: telemetry::Telemetry,
+    quota_refresh: Option<std::sync::mpsc::SyncSender<()>>,
     snapshot: RouteSnapshot,
 }
 
@@ -49,6 +50,7 @@ impl Runtime {
             cursor: LogCursor::default(),
             live: live::LiveState::default(),
             telemetry: telemetry::Telemetry::default(),
+            quota_refresh: None,
             snapshot,
         };
         runtime.refresh(None);
@@ -68,6 +70,12 @@ impl Runtime {
             },
             self.config_error.clone().or(read_error).or(watcher_error),
         );
+        // 只有新完成记录才触发额度补刷；启动历史、活跃态和普通重绘不触发。
+        if snapshot.date == self.snapshot.date && snapshot.daily.requests > self.snapshot.daily.requests {
+            if let Some(sender) = &self.quota_refresh {
+                let _ = sender.try_send(());
+            }
+        }
         if snapshot.sessions.is_empty() {
             snapshot.notes[1].text = path.display().to_string();
         }
@@ -247,6 +255,8 @@ fn start_live(app: AppHandle) {
             return;
         }
     };
+    let (quota_sender, quota_receiver) = std::sync::mpsc::sync_channel(1);
+    shared.lock().expect("状态锁损坏").quota_refresh = Some(quota_sender);
     let trace_app = app.clone();
     let trace_shared = Arc::clone(&shared);
     let trace_base = base.clone();
@@ -285,7 +295,15 @@ fn start_live(app: AppHandle) {
                     let _ = quota_app.emit("route-update", snapshot);
                 }
             }
-            std::thread::sleep(Duration::from_secs(30).saturating_sub(started.elapsed()));
+            // 启动立即读取，之后每分钟刷新；完成事件合并两秒后补读缓存。
+            match quota_receiver.recv_timeout(Duration::from_secs(60).saturating_sub(started.elapsed())) {
+                Ok(()) => {
+                    std::thread::sleep(Duration::from_secs(2));
+                    while quota_receiver.try_recv().is_ok() {}
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
         }
     });
     let usage_app = app.clone();
