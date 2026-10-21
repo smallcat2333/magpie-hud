@@ -117,15 +117,14 @@ def command(client, method, params):
             return result.get("result", {})
 
 
-def screenshot(client, name):
-    """直接保存实际 WebView 截图，不生成或替换页面内容。"""
+def screenshot(client, scratch, name):
+    """把实际 WebView 截图只写入本次临时目录，不改项目文件。"""
     client.next_id += 1
     client.socket.send(json.dumps({"id": client.next_id, "method": "Page.captureScreenshot", "params": {"format": "png"}}))
     while True:
         result = json.loads(client.socket.recv())
         if result.get("id") == client.next_id:
-            path = ROOT / "docs/showcase" / name
-            path.parent.mkdir(parents=True, exist_ok=True)
+            path = scratch / name
             path.write_bytes(base64.b64decode(result["result"]["data"]))
             return str(path)
 
@@ -158,9 +157,9 @@ def reset_at(seconds):
     return (datetime.datetime.now().astimezone() + datetime.timedelta(seconds=seconds)).isoformat()
 
 
-def expected_reset(iso):
+def expected_reset(iso, now=None):
     """按产品规则从同一时刻计算两级倒计时，供 DOM 文本对照。"""
-    remaining = datetime.datetime.fromisoformat(iso).timestamp() - time.time()
+    remaining = datetime.datetime.fromisoformat(iso).timestamp() - (time.time() if now is None else now)
     if remaining <= 0:
         return "已到期"
     minutes = int(remaining // 60)
@@ -181,6 +180,7 @@ GEOMETRY = r"""
     return box.width > 0 && box.height > 0 && box.bottom > 0 && box.top < innerHeight && box.right > 0 && box.left < innerWidth;
   });
   const paths = [...document.querySelectorAll('#route-lines path.branch')];
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
   const point = (path, end) => {
     const length = path.getTotalLength();
     const local = path.getPointAtLength(end ? length : 0);
@@ -200,11 +200,12 @@ GEOMETRY = r"""
     tall,
     count: paths.length,
     visibleCards: cards.length,
+    reducedMotion: reduced,
     layer: {left: layer.left, top: layer.top, right: layer.right, bottom: layer.bottom},
-    paths: paths.slice(0, cards.length).map((path, index) => {
+    paths: paths.map((path, index) => {
       const start = point(path, false);
       const end = point(path, true);
-      const card = cards[index].getBoundingClientRect();
+      const card = cards[index]?.getBoundingClientRect();
       const expectedX = tall ? router.left + router.width / 2 : router.right;
       const expectedY = tall ? router.bottom : router.top + router.height / 2;
       const base = path.previousElementSibling;
@@ -213,8 +214,8 @@ GEOMETRY = r"""
       return {
         startDeltaX: start.x - expectedX,
         startDeltaY: start.y - expectedY,
-        endDeltaX: end.x - card.left,
-        endDeltaY: end.y - (card.top + card.height / 2),
+        endDeltaX: card ? end.x - card.left : null,
+        endDeltaY: card ? end.y - (card.top + card.height / 2) : null,
         outside: samples(path).some(sample => sample.x < layer.left - 1.5 || sample.x > layer.right + 1.5 || sample.y < layer.top - 1.5 || sample.y > layer.bottom + 1.5),
         running: path.classList.contains('running'),
         hasBase: path.classList.contains('running') && !!base?.classList.contains('branch-base') && base.getAttribute('d') === path.getAttribute('d'),
@@ -234,8 +235,8 @@ def check_geometry(client, label):
     time.sleep(.12)
     measured = client.evaluate(GEOMETRY)
     failures = []
-    if measured["count"] < 1:
-        failures.append(f"{label}: no branch")
+    if measured["count"] != measured["visibleCards"]:
+        failures.append(f"{label}: branches={measured['count']} visibleCards={measured['visibleCards']}")
     for index, path in enumerate(measured["paths"]):
         if abs(path["startDeltaX"]) > 1.5 or abs(path["startDeltaY"]) > 1.5:
             failures.append(f"{label} path{index} start {path['startDeltaX']:.2f},{path['startDeltaY']:.2f}")
@@ -247,7 +248,8 @@ def check_geometry(client, label):
             failures.append(f"{label} path{index} missing branch-base")
         if path["running"] and path["baseFill"] != "none":
             failures.append(f"{label} path{index} branch-base fill={path['baseFill']}")
-        if path["running"] and (path["dash"] in ("none", "0px", "") or path["animation"] != "route-stream"):
+        expected_animation = "none" if measured["reducedMotion"] else "route-stream"
+        if path["running"] and (path["dash"] in ("none", "0px", "") or path["animation"] != expected_animation):
             failures.append(f"{label} path{index} dash={path['dash']} animation={path['animation']}")
     return measured, failures
 
@@ -325,7 +327,7 @@ def main():
         "routes": [live_route(200, "session-grok", [{"id": "grok", "who": GROK_ACCOUNT, "provider": "grok", "model": GROK_MODEL}], [{"id": "grok", "model": GROK_MODEL, "effort": "high", "done": False}])],
         "active": [active_request(1, 200, "session-grok")],
         "started": started.isoformat(), "quota_reads": 0, "quota_times": [],
-        "quotas": [grok_quota, long_gpt, long_grok, extra_quota, soon_quota, expired_quota, missing_quota, gpt_quota],
+        "quotas": [grok_quota, gpt_quota, extra_quota, soon_quota, expired_quota, missing_quota],
     }
     server = ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -366,15 +368,15 @@ def main():
         stage("repeat-snapshot")
         with Gateway.lock:
             Gateway.state["seq"] = 2
-        client.wait("true", timeout=2)
-        time.sleep(.8)
+            Gateway.state["active"][0]["ms"] = 2400
+        client.wait("document.getElementById('line1-text')?.textContent.includes('2.4s')", timeout=8)
         repeated = quota_view(client)
         if repeated == initial and client.evaluate("document.querySelectorAll('.quota-item').length") == 1:
             checks.append("repeat-snapshot-stable")
         else:
             failures.append({"repeat-snapshot": repeated})
         stage("routed-gpt-and-completed-grok")
-        append(path, record(300, GROK_ACCOUNT, session="session-grok-done", model=GROK_MODEL, provider="grok", route_id=300))
+        append(path, record(300, GROK_ACCOUNT, session="session-grok-done", model=GROK_MODEL, provider="grok", route_id=300, t=datetime.datetime.now().astimezone().isoformat()))
         with Gateway.lock:
             Gateway.state["seq"] = 3
             Gateway.state["ids"] = [400]
@@ -383,6 +385,7 @@ def main():
                 {"id": CANDIDATE_ID, "who": GPT_ACCOUNT, "provider": "codex", "model": GPT_MODEL},
             ], [{"id": CANDIDATE_ID, "model": GPT_MODEL, "effort": "xhigh", "done": False}])]
             Gateway.state["active"] = [active_request(2, 400, "session-gpt")]
+            Gateway.state["quotas"] = [long_gpt, long_grok, extra_quota, soon_quota, expired_quota, missing_quota]
             Gateway.state["seq"] = 3
         client.wait("document.querySelectorAll('.quota-item').length===2", timeout=12)
         both = quota_view(client)
@@ -417,6 +420,7 @@ def main():
             Gateway.state["ids"] = []
             Gateway.state["routes"] = []
             Gateway.state["active"] = []
+            Gateway.state["quotas"] = [grok_quota]
             Gateway.state["seq"] = 4
         client.wait("document.querySelectorAll('.quota-item').length===1 && document.querySelector('.quota-account')?.title===" + json.dumps(GROK_ACCOUNT), timeout=8)
         single_order = quota_view(client)
@@ -427,12 +431,14 @@ def main():
                 {"id": CANDIDATE_ID, "who": GPT_ACCOUNT, "provider": "codex", "model": GPT_MODEL},
             ], [{"id": CANDIDATE_ID, "model": GPT_MODEL, "effort": "xhigh", "done": False}])]
             Gateway.state["active"] = [active_request(3, 400, "session-gpt")]
+            Gateway.state["quotas"] = [gpt_quota, grok_quota]
             Gateway.state["seq"] = 5
         started_order = time.monotonic()
         client.wait("document.querySelectorAll('.quota-item').length===2", timeout=8)
         elapsed = time.monotonic() - started_order
         ordered = quota_view(client)
-        if elapsed < 55 and [item["account"] for item in single_order] == [GROK_ACCOUNT] and [item["account"] for item in ordered] == [GROK_ACCOUNT, GPT_ACCOUNT]:
+        expected_order = [item["account"] for item in restored]
+        if elapsed < 55 and [item["account"] for item in single_order] == [GROK_ACCOUNT] and [item["account"] for item in ordered] == expected_order:
             checks.append("stable-order-without-minute-wait")
         else:
             failures.append({"order": {"elapsed": elapsed, "single": single_order, "ordered": ordered}})
@@ -449,17 +455,17 @@ def main():
                 live_route(503, "session-missing", [{"id": "missing", "who": "missing.time@example.com", "provider": "grok", "model": GROK_MODEL}], [{"id": "missing", "model": GROK_MODEL, "effort": "low", "done": False}]),
             ]
             Gateway.state["active"] = [active_request(21, 501, "session-soon"), active_request(22, 502, "session-expired"), active_request(23, 503, "session-missing")]
+            Gateway.state["quotas"] = [long_grok, soon_quota, expired_quota, missing_quota]
             Gateway.state["seq"] = 6
-        client.wait("document.querySelectorAll('.quota-item').length===3", timeout=8)
+        client.wait("document.querySelectorAll('.quota-item').length===3 && document.querySelector('.quota-account')?.title==='soon.reset@example.com'", timeout=8)
+        observed_at = time.time()
         durations = {item["account"]: item for item in quota_view(client)}
         select_session(client, "session-grok-done")
         client.wait("document.querySelectorAll('.quota-item').length===1 && document.querySelector('.quota-account')?.title===" + json.dumps(GROK_ACCOUNT), timeout=8)
         durations.update({item["account"]: item for item in quota_view(client)})
-        durations[GPT_ACCOUNT] = next(item for item in both if item["account"] == GPT_ACCOUNT)
         expected = {
-            GPT_ACCOUNT: (resets["hour"], expected_reset(resets["hour"])),
-            GROK_ACCOUNT: (resets["day"], expected_reset(resets["day"])),
-            "soon.reset@example.com": (resets["soon"], expected_reset(resets["soon"])),
+            GROK_ACCOUNT: (resets["day"], expected_reset(resets["day"], observed_at)),
+            "soon.reset@example.com": (resets["soon"], expected_reset(resets["soon"], observed_at)),
             "expired.reset@example.com": (resets["expired"], "已到期"),
             "missing.time@example.com": ("", "—"),
         }
@@ -498,7 +504,7 @@ def main():
             geometry[label] = measured
             failures.extend(geometry_failures)
             if label in ("wide", "tall") and not geometry_failures:
-                screenshots[label] = screenshot(client, f"hud-quota-connections-{label}.png")
+                screenshots[label] = screenshot(client, scratch, f"hud-quota-connections-{label}.png")
         if not any(str(item).startswith(("wide", "normal", "tall", "narrow")) for item in failures):
             checks.append("route-geometry")
         report = {"passed": not failures, "checks": checks, "failures": failures, "screenshots": screenshots, "scratch": str(scratch)}
