@@ -158,7 +158,8 @@ def main():
         assert client.evaluate("[...document.querySelectorAll('.quota-item')].every(item => item.children.length === 2)")
         assert client.evaluate("document.querySelector('.quota-window strong').textContent") == '38%'
         assert client.evaluate("Math.abs(document.querySelector('.quota-fill').getBoundingClientRect().width / document.querySelector('.quota-track').getBoundingClientRect().width - .38) < .02")
-        assert client.evaluate("document.querySelector('.route-card.running .state-tag').textContent") == ''
+        assert client.evaluate("document.querySelector('.route-card.running .state-tag').textContent") == '运行中'
+        assert client.evaluate("getComputedStyle(document.querySelector('.route-card.running .state-tag')).color") == 'rgb(156, 207, 255)'
         assert client.evaluate("[...document.querySelector('.card-bottom').children].map(element=>element.className)") == ['card-model', 'divider', 'card-account', 'effort']
         assert client.evaluate("document.querySelector('.request-spinner circle').getAttribute('r')") == '7'
         client.wait("getComputedStyle(document.querySelector('.request-spinner')).animationName === 'request-spin'")
@@ -183,6 +184,13 @@ def main():
         client.wait("document.querySelector('.branch.running') && getComputedStyle(document.querySelector('.branch.running')).animationName === 'none'")
         assert client.evaluate("getComputedStyle(document.querySelector('.request-spinner')).animationName") == 'none'
         command(client, 'Emulation.setEmulatedMedia', {'features': []})
+        with Gateway.lock:
+            active['phase'] = 'slot'
+        client.wait("document.querySelector('.route-card.waiting .state-tag')?.textContent === '运行中'")
+        assert client.evaluate("document.querySelector('.route-card.waiting .request-spinner') !== null")
+        with Gateway.lock:
+            active['phase'] = 'upstream'
+        client.wait("document.querySelector('.route-card.running .request-spinner') !== null")
         assert client.evaluate("document.getElementById('request-count').textContent") == '0 次请求'
         wide = screenshot(client, 'hud-live-wide.png')
         assert client.evaluate("document.querySelector('.route-notes').getBoundingClientRect().height") == 28
@@ -230,6 +238,8 @@ def main():
             assert Gateway.state['quota_reads'] == 3, 'completion must refresh quota cache once'
         assert client.evaluate("document.querySelector('.card-tps').textContent") == '50.0 TPS'
         assert client.evaluate("document.querySelectorAll('.request-spinner').length") == 0
+        assert client.evaluate("document.querySelector('.state-tag').textContent") == '√已完成'
+        assert client.evaluate("getComputedStyle(document.querySelector('.state-tag')).color") == 'rgb(141, 215, 176)'
         assert client.evaluate("document.querySelectorAll('.note-row').length") == 2
         assert client.evaluate("[...document.querySelectorAll('.note-row')].filter(row => getComputedStyle(row).display !== 'none').length") == 2
         assert client.evaluate("document.querySelector('.route-notes').getBoundingClientRect().height") == 76
@@ -242,6 +252,8 @@ def main():
         client.wait("document.getElementById('watch-label').textContent.includes('实时连接中断')", timeout=8)
         assert client.evaluate("document.querySelector('.card-tps').textContent") == '50.0 TPS'
         assert client.evaluate("document.querySelectorAll('.request-spinner').length") == 0
+        assert client.evaluate("document.querySelector('.state-tag').textContent") == '√已完成'
+        assert client.evaluate("getComputedStyle(document.querySelector('.state-tag')).color") == 'rgb(141, 215, 176)'
         client.evaluate("window.__TAURI__.webviewWindow.getCurrentWebviewWindow().setSize(new window.__TAURI__.dpi.LogicalSize(420,760))")
         client.wait("innerWidth===420 && innerHeight===760")
         client.evaluate('setTimeout(()=>window.__TAURI__.webviewWindow.getCurrentWebviewWindow().close(),50)')
@@ -266,7 +278,7 @@ def main():
             time.sleep(.1)
         assert client, 'restarted WebView2 not ready'
         client.wait("innerWidth===420 && innerHeight===760 && document.getElementById('hud')?.dataset.layout==='tall'")
-        print(json.dumps({'passed': True, 'checks': ['model-before-account', 'minute-and-completion-quota-refresh', 'sidebar-no-scrollbars-long-account', 'short-window-stats-and-one-line-log', 'two-line-usage-bars', 'dashed-spinner-rotation', 'statistic-colors', 'native-acrylic', 'quota-windows', 'global-and-session-cost', 'title-and-half-opacity', 'source-stacking-and-icons', 'effort-color', 'active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall, short]}, ensure_ascii=False))
+        print(json.dumps({'passed': True, 'checks': ['unified-success-running-error-status', 'model-before-account', 'minute-and-completion-quota-refresh', 'sidebar-no-scrollbars-long-account', 'short-window-stats-and-one-line-log', 'two-line-usage-bars', 'dashed-spinner-rotation', 'statistic-colors', 'native-acrylic', 'quota-windows', 'global-and-session-cost', 'title-and-half-opacity', 'source-stacking-and-icons', 'effort-color', 'active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall, short]}, ensure_ascii=False))
     finally:
         if client:
             try:

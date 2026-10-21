@@ -50,16 +50,14 @@
     return null;
   }
 
-  /** 状态文字与符号一起展示，失败/取消不依赖颜色区分。 */
+  /** 展示统一为完成、运行、异常三类；保留真实错误与排队详情。 */
   function statusInfo(card) {
     switch (card.state) {
-      case 'running': return ['↻', '请求中'];
-      case 'waiting': return ['…', '等待中'];
-      case 'recovered': return ['✓', card.detail.startsWith('重试') ? '重试成功' : '已恢复']; // taste-skill-ignore: 请求结果符号与文字共同表达状态
-      case 'failed': return ['!', '失败'];
-      case 'cancelled': return ['−', '已取消'];
-      case 'unknown': return ['?', '状态未知'];
-      default: return ['✓', '已完成']; // taste-skill-ignore: 请求完成符号，不是装饰图标
+      case 'running':
+      case 'waiting': return ['', '运行中', 'running'];
+      case 'success':
+      case 'recovered': return ['√', '已完成', 'success'];
+      default: return ['x', card.error?.trim() || card.detail?.trim() || '状态未知', 'error'];
     }
   }
 
@@ -71,7 +69,8 @@
     button.dataset.cardId = card.id;
     button.dataset.current = String(card.current);
     button.setAttribute('role', 'listitem');
-    const [symbol, state] = statusInfo(card);
+    const [symbol, state, status] = statusInfo(card);
+    button.dataset.status = status;
     const tooltip = `${card.account}\n${session.label}: ${session.id || '日志未提供会话 ID'}\n${card.model} · ${card.effort}\n${card.time} · ${card.detail}${card.error ? `\n${card.error}` : ''}`;
     button.title = tooltip;
     button.setAttribute('aria-label', tooltip.replaceAll('\n', '，'));
@@ -99,9 +98,10 @@
     account.textContent = session.label;
     const tag = document.createElement('span');
     tag.className = 'state-tag';
+    tag.dataset.status = status;
     tag.setAttribute('aria-label', state);
-    tag.title = state;
-    if (card.state === 'running') {
+    tag.title = [state, card.detail].filter(Boolean).join('\n');
+    if (status === 'running') {
       const spinner = document.createElementNS(namespace, 'svg');
       spinner.setAttribute('class', 'request-spinner');
       spinner.setAttribute('viewBox', '0 0 20 20');
@@ -117,8 +117,12 @@
       const mark = document.createElement('span');
       mark.className = 'state-symbol';
       mark.textContent = symbol;
-      tag.append(mark, document.createTextNode(state));
+      tag.append(mark);
     }
+    const stateText = document.createElement('span');
+    stateText.className = 'state-text';
+    stateText.textContent = state;
+    tag.append(stateText);
     top.append(account, tag);
     const bottom = document.createElement('span');
     bottom.className = 'card-bottom';
