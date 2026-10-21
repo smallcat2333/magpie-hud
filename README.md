@@ -87,7 +87,9 @@ python scripts/verify_routing_window.py
 
 ## 变更记录
 
-当前程序版本是 `0.0.16`，标题同行显示为 `Magpie HUD V.0.0.16(2026/10/21)`。之后每个改动递增最后一位。
+当前程序版本是 `0.0.17`，标题同行显示为 `Magpie HUD V.0.0.17(2026/10/21)`。之后每个改动递增最后一位。
+
+2026-10-21 | 0.0.17 | 矮窗统计分隔竖线改为固定 10px 的细线，在 22px 统计行内垂直居中，消除字符竖线与数字的字形错位，保留三等分布局。
 
 2026-10-21 | 0.0.16 | 按 Magpie 供应商清单补齐本地图标：小米 MiMo、Qwen、Kimi、MiniMax、Mistral、StepFun、Groq、Ollama、OpenRouter、Copilot、Vertex、Bedrock、Azure、百度、腾讯云、华为云、火山引擎、豆包、Z.ai、Together、Fireworks、SiliconFlow、NVIDIA、ModelScope、Cline、OpenCode、Cloudflare、Workers AI、Nous、Antigravity、Gemini CLI、xAI、302.AI、AiHubMix、Command Code、Kilo、Cherry Studio、Fish Audio、百炼、混元。有彩色版用彩色，没有的单色固定为浅色。
 
