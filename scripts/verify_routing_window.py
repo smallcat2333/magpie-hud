@@ -92,7 +92,7 @@ def main():
         assert client.evaluate("document.getElementById('line1-kind').textContent") == "失败"
         append_started = time.perf_counter()
         append(path, record(2, "success@example.com", credits=2.5))
-        client.wait("document.querySelectorAll('.route-card').length === 2 && document.getElementById('daily-tokens').textContent === '2.0k'")
+        client.wait("document.querySelectorAll('.route-card').length === 2 && document.getElementById('daily-tokens').textContent === '2K'")
         elapsed = (time.perf_counter() - append_started) * 1000
         assert elapsed < 500, f"file-to-render {elapsed:.1f}ms exceeds 500ms"
         assert client.evaluate("document.getElementById('daily-cost').textContent") == "未定价"  # Credits 仍保留在账本，但不冒充美元费用。
@@ -102,7 +102,7 @@ def main():
         append(path, record(4, "other@example.com", session="session-beta", model="grok-4.7-build-fast@500k", effort="high", tries=2))
         client.wait("document.getElementById('session-select').options.length === 3")
         client.evaluate("(() => { const s=document.getElementById('session-select'); s.value='session-alpha'; s.dispatchEvent(new Event('change')); })()")
-        assert client.evaluate("document.getElementById('daily-tokens').textContent") == "3.0k"
+        assert client.evaluate("document.getElementById('daily-tokens').textContent") == "3K"
         assert client.evaluate("document.getElementById('stats-scope').textContent") == "未命名会话"
         assert client.evaluate("document.querySelectorAll('.note-row').length") == 2
         assert client.evaluate("document.querySelector('.card-copy').children.length") == 2

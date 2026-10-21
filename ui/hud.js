@@ -169,14 +169,17 @@
   /** 当日输出速度为 Σout / Σ(ms−ttft_ms)，不把输入或缓存读计为输出吞吐。 */
   function renderStats(stats, scope) {
     text('stats-date', snapshot.date.slice(5));
-    text('daily-tokens', compact(stats.tokens));
+    const short = innerHeight <= 420;
+    const tokens = short ? new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 0 }).format(stats.tokens) : compact(stats.tokens);
+    text('daily-tokens', tokens);
+    byId('hud').dataset.costStale = String(Boolean(snapshot.costError));
     text('request-count', `${stats.requests.toLocaleString('zh-CN')} 次请求`);
     byId('tokens-metric').title = `当日 Token ${stats.tokens.toLocaleString('zh-CN')}；输入 + 输出 + 缓存读取，不含 kind=routing 的内部分类调用`;
     text('cost-status', snapshot.costError ? '旧读数' : '');
-    text('daily-cost', stats.cost == null ? '未定价' : `$${stats.cost.toFixed(2)}`);
+    text('daily-cost', stats.cost == null ? '未定价' : `$${stats.cost.toFixed(short && stats.cost >= 100 ? 0 : 2)}`);
     text('cost-unit', stats.cost == null ? '' : 'USD');
     text('cost-coverage', stats.cost == null ? (stats.unpricedRequests ? `${stats.unpricedRequests} 条未定价` : '等待 Magpie 费用') : `${stats.pricedRequests} 条已定价${stats.unpricedRequests ? ` · ${stats.unpricedRequests} 条未定价` : ''}${snapshot.costError ? ' · 旧读数' : ''}`);
-    byId('cost-metric').title = snapshot.costError || 'Magpie 按模型价格计算的当日美元等价费用，沿用 Magpie 用量页口径（含内部路由）；订阅账号的金额是使用量估值，未定价请求不计入。';
+    byId('cost-metric').title = `${stats.cost == null ? '未定价' : `$${stats.cost.toFixed(2)} USD`}\n${snapshot.costError || 'Magpie 按模型价格计算的当日美元等价费用，沿用 Magpie 用量页口径（含内部路由）；订阅账号的金额是使用量估值，未定价请求不计入。'}`;
     text('daily-speed', stats.tokensPerSecond === null ? '—' : stats.tokensPerSecond.toFixed(1));
     byId('speed-metric').title = `当日加权输出速度 = Σ输出 Token / Σ(总耗时 − 首字耗时)；${stats.speedSamples} 条有效记录，不包含等待首字的时间。`;
     text('stats-scope', scope);

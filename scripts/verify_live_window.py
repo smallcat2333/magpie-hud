@@ -181,6 +181,13 @@ def main():
         command(client, 'Emulation.setEmulatedMedia', {'features': []})
         assert client.evaluate("document.getElementById('request-count').textContent") == '0 次请求'
         wide = screenshot(client, 'hud-live-wide.png')
+        assert client.evaluate("document.querySelector('.route-notes').getBoundingClientRect().height") == 28
+        assert client.evaluate("[...document.querySelectorAll('.note-row')].filter(row => getComputedStyle(row).display !== 'none').length") == 1
+        assert client.evaluate("[...document.querySelectorAll('.metric dd')].every(value => Math.abs(value.getBoundingClientRect().top - document.getElementById('daily-tokens').getBoundingClientRect().top) < 1)")
+        client.evaluate("window.__TAURI__.webviewWindow.getCurrentWebviewWindow().setSize(new window.__TAURI__.dpi.LogicalSize(692,364))")
+        client.wait("innerWidth===692 && innerHeight===364")
+        assert client.evaluate("document.getElementById('cost-metric').getBoundingClientRect().right <= document.querySelector('.sidebar').getBoundingClientRect().right && document.documentElement.scrollWidth <= innerWidth")
+        short = screenshot(client, 'hud-short.png')
         client.evaluate("window.__TAURI__.webviewWindow.getCurrentWebviewWindow().setSize(new window.__TAURI__.dpi.LogicalSize(420,760))")
         client.wait("innerWidth===420 && document.getElementById('hud').dataset.layout==='tall'")
         assert client.evaluate("document.documentElement.scrollWidth <= innerWidth")
@@ -207,6 +214,8 @@ def main():
         assert client.evaluate("document.querySelector('.card-tps').textContent") == '50.0 TPS'
         assert client.evaluate("document.querySelectorAll('.request-spinner').length") == 0
         assert client.evaluate("document.querySelectorAll('.note-row').length") == 2
+        assert client.evaluate("[...document.querySelectorAll('.note-row')].filter(row => getComputedStyle(row).display !== 'none').length") == 2
+        assert client.evaluate("document.querySelector('.route-notes').getBoundingClientRect().height") == 76
         client.evaluate("window.__TAURI__.webviewWindow.getCurrentWebviewWindow().setSize(new window.__TAURI__.dpi.LogicalSize(1120,400))")
         client.wait("innerWidth===1120 && document.getElementById('hud').dataset.layout==='wide'")
         assert client.evaluate("document.documentElement.scrollWidth <= innerWidth")
@@ -240,7 +249,7 @@ def main():
             time.sleep(.1)
         assert client, 'restarted WebView2 not ready'
         client.wait("innerWidth===420 && innerHeight===760 && document.getElementById('hud')?.dataset.layout==='tall'")
-        print(json.dumps({'passed': True, 'checks': ['two-line-usage-bars', 'dashed-spinner-rotation', 'statistic-colors', 'native-acrylic', 'quota-windows', 'global-and-session-cost', 'title-and-half-opacity', 'source-stacking-and-icons', 'effort-color', 'active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall]}, ensure_ascii=False))
+        print(json.dumps({'passed': True, 'checks': ['short-window-stats-and-one-line-log', 'two-line-usage-bars', 'dashed-spinner-rotation', 'statistic-colors', 'native-acrylic', 'quota-windows', 'global-and-session-cost', 'title-and-half-opacity', 'source-stacking-and-icons', 'effort-color', 'active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall, short]}, ensure_ascii=False))
     finally:
         if client:
             try:
