@@ -95,7 +95,7 @@ def main():
         client.wait("document.querySelectorAll('.route-card').length === 2 && document.getElementById('daily-tokens').textContent === '2.0k'")
         elapsed = (time.perf_counter() - append_started) * 1000
         assert elapsed < 500, f"file-to-render {elapsed:.1f}ms exceeds 500ms"
-        assert client.evaluate("document.getElementById('daily-cost').textContent") == "2.50"
+        assert client.evaluate("document.getElementById('daily-cost').textContent") == "未定价"  # Credits 仍保留在账本，但不冒充美元费用。
         append(path, record(3, "failed@example.com"))
         client.wait("document.querySelectorAll('.route-card.recovered').length === 1")
         assert client.evaluate("document.querySelectorAll('.route-card.failed').length") == 0

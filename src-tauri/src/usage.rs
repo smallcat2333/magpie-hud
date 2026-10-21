@@ -14,12 +14,18 @@ pub struct Note {
     pub text: String,
 }
 
-/// 当日统计。Credits 是日志记录的消耗单位，不等同货币；速度按有效生成时间加权。
+/// 当日统计。费用来自 Magpie 按模型价格算出的美元金额，不是日志里的 Credits；速度按有效生成时间加权。
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyStats {
     pub requests: u64,
     pub tokens: u64,
+    /// Magpie `/v1/magpie/usage?period=today` 的美元费用；未取到时为 None，不拿 Credits 代替。
+    pub cost: Option<f64>,
+    /// 已计入费用的请求数；与 unpriced 一起说明覆盖范围。
+    pub priced_requests: u64,
+    /// Magpie 明确未定价、因此没有计入 cost 的请求数。
+    pub unpriced_requests: u64,
     pub credits: Option<f64>,
     pub credited_requests: u64,
     pub output_tokens: u64,
@@ -200,6 +206,9 @@ pub struct RouteSnapshot {
     pub magpie_host: String,
     pub sessions: Vec<SessionView>,
     pub daily: DailyStats,
+    pub quotas: Vec<crate::telemetry::Quota>,
+    pub quota_error: Option<String>,
+    pub cost_error: Option<String>,
     pub notes: [Note; 2],
     pub error: Option<String>,
 }
@@ -494,6 +503,9 @@ impl UsageLedger {
             magpie_host: host.into(),
             sessions,
             daily,
+            quotas: Vec::new(),
+            quota_error: None,
+            cost_error: None,
             notes,
             error: error
                 .or_else(|| (self.malformed > 0).then(|| "日志中有无效行，已保留有效记录".into())),

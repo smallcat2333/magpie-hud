@@ -118,6 +118,8 @@
     const effort = document.createElement('span');
     effort.className = 'effort';
     effort.textContent = card.effort;
+    const intensity = card.effort.toLowerCase();
+    if (['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(intensity)) effort.dataset.level = intensity;
     bottom.append(label, separator, model, effort);
     copy.append(top, bottom);
     const metrics = document.createElement('span');
@@ -154,30 +156,152 @@
     text('daily-tokens', compact(stats.tokens));
     text('request-count', `${stats.requests.toLocaleString('zh-CN')} 次请求`);
     byId('tokens-metric').title = `当日 Token ${stats.tokens.toLocaleString('zh-CN')}；输入 + 输出 + 缓存读取，不含 kind=routing 的内部分类调用`;
-    text('daily-cost', stats.credits === null ? '未记录' : stats.credits.toFixed(2));
-    text('cost-unit', stats.credits === null ? '' : 'Credits');
-    text('cost-coverage', stats.creditedRequests ? `${stats.creditedRequests}/${stats.requests} 条有费用` : '日志无金额 / Credits');
-    byId('cost-metric').title = '只累计日志 credits，单位为 Credits，不是美元；缺少定价或金额时不能推算真实账单。仅覆盖带 credits 的记录。';
+    text('cost-status', snapshot.costError ? '旧读数' : '');
+    text('daily-cost', stats.cost == null ? '未定价' : `$${stats.cost.toFixed(2)}`);
+    text('cost-unit', stats.cost == null ? '' : 'USD');
+    text('cost-coverage', stats.cost == null ? (stats.unpricedRequests ? `${stats.unpricedRequests} 条未定价` : '等待 Magpie 费用') : `${stats.pricedRequests} 条已定价${stats.unpricedRequests ? ` · ${stats.unpricedRequests} 条未定价` : ''}${snapshot.costError ? ' · 旧读数' : ''}`);
+    byId('cost-metric').title = snapshot.costError || 'Magpie 按模型价格计算的当日美元等价费用，沿用 Magpie 用量页口径（含内部路由）；订阅账号的金额是使用量估值，未定价请求不计入。';
     text('daily-speed', stats.tokensPerSecond === null ? '—' : stats.tokensPerSecond.toFixed(1));
     byId('speed-metric').title = `当日加权输出速度 = Σ输出 Token / Σ(总耗时 − 首字耗时)；${stats.speedSamples} 条有效记录，不包含等待首字的时间。`;
     text('stats-scope', scope);
   }
 
+  /** 来源按真实 Agent 合并，最多两个时与 Magpie 纵向排列，给会话留出宽度。 */
+  function renderSources(sessions) {
+    const groups = new Map();
+    sessions.forEach(item => {
+      if (!groups.has(item.agent)) groups.set(item.agent, new Set());
+      groups.get(item.agent).add(item.request);
+    });
+    const list = byId('source-list');
+    list.replaceChildren();
+    for (const [agent, requests] of groups) {
+      const entry = document.createElement('div');
+      entry.className = 'source-entry';
+      const heading = document.createElement('div');
+      heading.className = 'source-heading';
+      const icon = document.createElement('span');
+      icon.className = 'source-icon';
+      const family = /claude/i.test(agent) ? 'claude' : modelIcon(agent);
+      if (family) {
+        const image = document.createElement('img');
+        image.src = `icons/${family}.svg`;
+        image.alt = '';
+        icon.append(image);
+      } else icon.textContent = '↗';
+      const name = document.createElement('strong');
+      name.textContent = agent;
+      heading.append(icon, name);
+      const request = document.createElement('span');
+      request.className = 'source-request';
+      request.textContent = [...requests].join(' · ');
+      request.title = request.textContent;
+      entry.append(heading, request);
+      list.append(entry);
+    }
+    if (!groups.size) list.textContent = '等待请求';
+    hud.dataset.sources = groups.size <= 2 ? 'compact' : 'multiple';
+  }
+
+  /** 额度以 provider + 完整账号唯一匹配；无模型限定字段的窗口按账号共享展示。 */
+  function renderQuotas(sessions) {
+    const list = byId('quota-list');
+    const scroll = list.scrollTop;
+    list.replaceChildren();
+    const accounts = new Map();
+    sessions.flatMap(session => session.routes.slice(0, 4)).forEach(card => {
+      const key = JSON.stringify([card.provider.toLowerCase(), card.account]);
+      if (!accounts.has(key)) accounts.set(key, { card, models: new Set() });
+      accounts.get(key).models.add(card.model);
+    });
+    const readings = [];
+    for (const { card, models } of accounts.values()) {
+      const candidates = (snapshot.quotas || []).filter(quota =>
+        quota.provider.toLowerCase() === card.provider.toLowerCase() &&
+        (quota.user ? quota.user === card.account : quota.kind === 'balance' && quota.name === card.account));
+      const quota = candidates.length === 1 ? candidates[0] : null;
+      const item = document.createElement('div');
+      item.className = 'quota-item';
+      const name = document.createElement('strong');
+      name.className = 'quota-name';
+      name.textContent = [...models].join(' · ');
+      name.title = name.textContent;
+      const account = document.createElement('span');
+      account.className = 'quota-account';
+      account.textContent = `${shortAccount(card.account)} · 账号额度`;
+      account.title = card.account;
+      item.append(name, account);
+      if (quota) {
+        const read = quota.readAt || quota.asOf;
+        if (read && !Number.isNaN(Date.parse(read))) readings.push(new Date(read));
+        for (const span of quota.windows || []) {
+          const row = document.createElement('div');
+          row.className = 'quota-window';
+          const label = document.createElement('span');
+          const windowName = span.name === '5 hours' ? '5h' : span.name === '7 days' || span.name === 'Weekly' ? '周' : span.name;
+          label.textContent = [span.family || span.pool, windowName].filter(Boolean).join(' · ');
+          const value = document.createElement('strong');
+          value.textContent = span.unlimited ? '不限量' : Number.isFinite(span.remaining) ? `余 ${span.remaining.toFixed(0)}%` : span.display || '未提供';
+          row.dataset.low = String(Number.isFinite(span.remaining) && span.remaining <= 10);
+          row.append(label, value);
+          item.append(row);
+          if (span.resetsAt && !Number.isNaN(Date.parse(span.resetsAt))) {
+            const reset = document.createElement('time');
+            reset.className = 'quota-reset';
+            reset.dateTime = span.resetsAt;
+            reset.textContent = `${new Date(span.resetsAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })} 重置`;
+            item.append(reset);
+          }
+        }
+        if (quota.balance) {
+          const balance = document.createElement('div');
+          balance.className = 'quota-window';
+          const label = document.createElement('span');
+          label.textContent = '余额';
+          const amount = document.createElement('strong');
+          amount.textContent = quota.balance;
+          balance.append(label, amount);
+          item.append(balance);
+        }
+      }
+      if (!quota || quota.error || (!quota.windows.length && !quota.balance)) {
+        const empty = document.createElement('p');
+        empty.className = quota?.error ? 'quota-error' : 'quota-empty';
+        empty.textContent = quota?.error || 'Magpie 未提供此账号额度';
+        item.append(empty);
+      }
+      list.append(item);
+    }
+    if (!accounts.size) {
+      const empty = document.createElement('p');
+      empty.className = 'quota-empty';
+      empty.textContent = '等待当前会话的额度';
+      list.append(empty);
+    }
+    const quotaFailed = snapshot.quotaError || [...list.querySelectorAll('.quota-error')].length > 0;
+    text('quota-freshness', quotaFailed ? '刷新失败 · 旧读数' : readings.length ? `${new Date(Math.min(...readings)).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' })} 读数` : '暂无读数');
+    byId('quota-freshness').title = snapshot.quotaError || '来自 Magpie 最近额度；窗口可能由多个模型共享，按账号展示。';
+    list.scrollTop = scroll;
+  }
+
   /** 根据当前会话选择生成分支和两行说明，保留滚动位置。 */
   function render(animate) {
+    hud.dataset.layout = innerWidth / innerHeight < 1.25 || innerWidth < 680 ? 'tall' : 'wide';
     if (!snapshot) return;
     const session = snapshot.sessions.find(item => item.id === selector.value);
-    const sessions = session ? [session] : snapshot.sessions.slice(0, 3);
+    const sessions = session ? [session] : snapshot.sessions.filter(item => item.routes.some(card => ['running', 'waiting'].includes(card.state)));
+    if (!session) sessions.push(...snapshot.sessions.filter(item => !sessions.includes(item)).slice(0, Math.max(0, 3 - sessions.length)));
     const oldScroll = routeList.scrollTop;
     hud.dataset.state = snapshot.state;
     text('watch-label', snapshot.watchLabel);
     byId('watch-label').title = snapshot.error || snapshot.watchLabel;
     text('router-host', snapshot.magpieHost);
-    text('agent-name', sessions[0]?.agent || '等待请求');
-    text('agent-request', sessions[0]?.request || '请求模型待记录');
-    text('session-count', session ? session.label : `${snapshot.sessions.length} 个会话 · 最近 ${sessions.length} 个`);
-    byId('source-node').title = sessions[0] ? `${sessions[0].agent}\n${sessions[0].request}` : '尚无今日记录';
+    renderSources(sessions);
+    if (hud.dataset.sources === 'multiple' && innerWidth < 980) hud.dataset.layout = 'tall';
+    text('session-count', session ? session.label : `${snapshot.sessions.length} 个会话 · 显示 ${sessions.length} 个`);
+    byId('source-node').title = sessions.map(item => `${item.agent}\n${item.request}`).join('\n');
     renderStats(session ? session.daily : snapshot.daily, session ? session.label : '全部会话');
+    renderQuotas(sessions);
     const fragment = document.createDocumentFragment();
     const newIds = [];
     const currentIds = new Set();
@@ -187,6 +311,7 @@
       if (!renderedIds.has(card.id)) newIds.push(card.id);
     }));
     routeList.replaceChildren(fragment);
+    routeList.hidden = sessions.length === 0;
     routeList.scrollTop = oldScroll;
     byId('empty-route').hidden = sessions.length > 0;
     byId('inbound-active').style.opacity = sessions.length ? '1' : '0';
@@ -231,7 +356,7 @@
     frame = requestAnimationFrame(() => drawLines(ids));
   }
 
-  /** 完整 ID 用于选择，显示短号；不会把两个前缀相同的会话合并。 */
+  /** 完整 ID 用于选择，显示会话名；不会把两个前缀相同的会话合并。 */
   function updateSelector(sessions) {
     const previous = selector.value;
     const options = [new Option('最近会话', '*')];
@@ -260,8 +385,7 @@
     selector.addEventListener('change', () => { selectedCard = null; renderedIds.clear(); render(false); });
     routeList.addEventListener('scroll', () => requestDraw(), { passive: true });
     new ResizeObserver(() => {
-      hud.dataset.layout = innerWidth / innerHeight < 1.25 || innerWidth < 680 ? 'tall' : 'wide';
-      requestDraw();
+      render(false);
     }).observe(hud);
     reduced.addEventListener('change', () => requestDraw());
     document.addEventListener('visibilitychange', () => { if (!document.hidden) render(false); });

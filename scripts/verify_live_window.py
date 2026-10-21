@@ -34,6 +34,10 @@ class Gateway(BaseHTTPRequestHandler):
                 data = {key: self.state[key] for key in ('seq', 'pid', 'ids', 'routes')}
             elif self.path == '/v1/magpie/concurrency':
                 data = {'active': self.state['active']}
+            elif self.path == '/v1/magpie/quotas?kept=1':
+                data = {'object': 'list', 'data': [{'provider': 'grok', 'name': 'grok', 'user': 'test@example.com', 'kind': 'subscription', 'readAt': self.state['started'], 'windows': [{'name': '5 hours', 'remaining': 62, 'used': 38, 'resetsAt': self.state['started']}, {'name': '7 days', 'remaining': 21, 'used': 79}]}]}
+            elif self.path == '/v1/magpie/usage?period=today':
+                data = {'since': self.state['started'], 'calls': 2, 'cost': 0.42, 'unpriced': 1, 'sessions': [{'id': 'session-alpha', 'calls': 1, 'cost': .12, 'unpriced': 0}]}
             else:
                 self.send_error(404)
                 return
@@ -79,6 +83,30 @@ def command(client, method, params):
             return result.get('result', {})
 
 
+def acrylic_enabled(pid):
+    """Windows 11 上读回 DWM backdrop type，确认原生磨砂已应用。"""
+    import ctypes
+    from ctypes import wintypes
+    windows = []
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @callback_type
+    def visit(hwnd, _data):
+        owner = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and ctypes.windll.user32.IsWindowVisible(hwnd):
+            windows.append(hwnd)
+        return True
+
+    ctypes.windll.user32.EnumWindows(visit, 0)
+    for hwnd in windows:
+        backdrop = ctypes.c_int()
+        result = ctypes.windll.dwmapi.DwmGetWindowAttribute(wintypes.HWND(hwnd), 38, ctypes.byref(backdrop), ctypes.sizeof(backdrop))
+        if result == 0 and backdrop.value == 3:
+            return True
+    return False
+
+
 def main():
     """启动隔离实例，通过真实 HTTP、IPC、原生尺寸和最终日志完成验收。"""
     scratch = Path(tempfile.mkdtemp(prefix='magpie-hud-live-'))
@@ -93,7 +121,7 @@ def main():
     route = {'id': 100, 'session': 'session-alpha', 'provider': 'grok', 'done': False,
              'order': [{'id': 'grok', 'who': 'test@example.com'}],
              'tries': [{'id': 'grok', 'model': 'grok-4.7-build-fast@500k', 'effort': 'high', 'done': False}]}
-    Gateway.state = {'seq': 1, 'pid': 1000, 'ids': [100], 'routes': [route], 'active': [active]}
+    Gateway.state = {'seq': 1, 'pid': 1000, 'ids': [100], 'routes': [route], 'active': [active], 'started': started}
     server = ThreadingHTTPServer(('127.0.0.1', 0), Gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -121,7 +149,17 @@ def main():
                 pass
             time.sleep(.1)
         assert client, 'WebView2 not ready'
+        assert acrylic_enabled(process.pid), 'Windows 11 DWM acrylic backdrop not enabled'
         client.wait("document.querySelector('.route-card.running .session-title')?.textContent === 'HUD / 实时会话'")
+        client.wait("document.querySelector('.quota-window strong')?.textContent === '余 62%' && document.getElementById('daily-cost').textContent === '$0.42'")
+        assert client.evaluate("document.querySelector('h1').textContent") == 'Magpie HUD'
+        assert client.evaluate("getComputedStyle(document.getElementById('hud')).backgroundColor") == 'rgba(23, 25, 30, 0.5)'
+        assert client.evaluate("document.querySelector('.effort').dataset.level") == 'high'
+        assert client.evaluate("document.getElementById('hud').dataset.sources") == 'compact'
+        assert client.evaluate("document.querySelector('.source-node').getBoundingClientRect().bottom <= document.querySelector('.router-node').getBoundingClientRect().top")
+        client.evaluate("(() => { const s=document.getElementById('session-select'); s.value='session-alpha'; s.dispatchEvent(new Event('change')); })()")
+        assert client.evaluate("document.getElementById('daily-cost').textContent") == '$0.12'
+        client.evaluate("(() => { const s=document.getElementById('session-select'); s.value='*'; s.dispatchEvent(new Event('change')); })()")
         assert client.evaluate("document.querySelector('.card-tokens').textContent") == '待统计 Token'
         client.wait("document.querySelector('.branch.running') && getComputedStyle(document.querySelector('.branch.running')).animationName === 'route-stream'")
         offset = client.evaluate("getComputedStyle(document.querySelector('.branch.running')).strokeDashoffset")
@@ -135,6 +173,7 @@ def main():
         client.evaluate("window.__TAURI__.webviewWindow.getCurrentWebviewWindow().setSize(new window.__TAURI__.dpi.LogicalSize(420,760))")
         client.wait("innerWidth===420 && document.getElementById('hud').dataset.layout==='tall'")
         assert client.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        assert client.evaluate("getComputedStyle(document.querySelector('.source-icon')).display !== 'none' && document.querySelector('.source-icon img').naturalWidth > 0 && document.querySelector('.router-emblem').getBoundingClientRect().width >= 54")
         tall = screenshot(client, 'hud-live-tall.png')
         client.evaluate("window.__TAURI__.webviewWindow.getCurrentWebviewWindow().setSize(new window.__TAURI__.dpi.LogicalSize(360,640))")
         client.wait("innerWidth===360 && document.getElementById('hud').dataset.layout==='tall'")
@@ -152,7 +191,7 @@ def main():
             route['tries'][0]['done'] = True
             Gateway.state['seq'] = 2
             Gateway.state['active'] = []
-        append(path, record(1, 'test@example.com', route_id=100))
+        append(path, record(1, 'test@example.com', model='grok-4.7-build-fast@500k', provider='grok', route_id=100))
         client.wait("!document.querySelector('.route-card.running') && document.querySelector('.card-tokens')?.textContent==='1.0k Token'")
         assert client.evaluate("document.querySelector('.card-tps').textContent") == '50.0 TPS'
         assert client.evaluate("document.querySelectorAll('.note-row').length") == 2
@@ -187,8 +226,8 @@ def main():
                 pass
             time.sleep(.1)
         assert client, 'restarted WebView2 not ready'
-        client.wait("innerWidth===420 && innerHeight===760 && document.getElementById('hud').dataset.layout==='tall'")
-        print(json.dumps({'passed': True, 'checks': ['active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall]}, ensure_ascii=False))
+        client.wait("innerWidth===420 && innerHeight===760 && document.getElementById('hud')?.dataset.layout==='tall'")
+        print(json.dumps({'passed': True, 'checks': ['native-acrylic', 'quota-windows', 'global-and-session-cost', 'title-and-half-opacity', 'source-stacking-and-icons', 'effort-color', 'active-before-completion', 'real-title-and-rename', 'animation-moves', 'reduced-motion', 'token-and-tps', 'native-wide-tall-resize', 'minimum-width-360', 'disconnect-stops-activity', 'restart-restores-size'], 'screenshots': [wide, tall]}, ensure_ascii=False))
     finally:
         if client:
             try:

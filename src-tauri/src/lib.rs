@@ -4,6 +4,7 @@ mod config;
 mod live;
 mod placement;
 mod tail;
+mod telemetry;
 mod usage;
 mod winmon;
 
@@ -28,6 +29,7 @@ struct Runtime {
     ledger: UsageLedger,
     cursor: LogCursor,
     live: live::LiveState,
+    telemetry: telemetry::Telemetry,
     snapshot: RouteSnapshot,
 }
 
@@ -46,6 +48,7 @@ impl Runtime {
             ledger,
             cursor: LogCursor::default(),
             live: live::LiveState::default(),
+            telemetry: telemetry::Telemetry::default(),
             snapshot,
         };
         runtime.refresh(None);
@@ -69,6 +72,7 @@ impl Runtime {
             snapshot.notes[1].text = path.display().to_string();
         }
         self.live.apply(&mut snapshot);
+        self.telemetry.apply(&mut snapshot);
         snapshot.revision = self.snapshot.revision;
         if snapshot == self.snapshot {
             return None;
@@ -138,7 +142,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let exit = tauri::menu::MenuItem::with_id(app, "exit", "退出", true, None::<&str>)?;
     let menu = tauri::menu::Menu::with_items(app, &[&show, &hide, &separator, &exit])?;
     tauri::tray::TrayIconBuilder::with_id("main")
-        .tooltip("MagpieHUD")
+        .tooltip("Magpie HUD")
         .menu(&menu)
         .icon(app.default_window_icon().expect("缺少应用图标").clone())
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -261,6 +265,48 @@ fn start_live(app: AppHandle) {
                 }
                 Err(_) => std::thread::sleep(Duration::from_secs(2)),
             }
+        }
+    });
+    let quota_app = app.clone();
+    let quota_shared = Arc::clone(&shared);
+    let quota_base = base.clone();
+    std::thread::spawn(move || {
+        let agent = live::client(Duration::from_secs(5));
+        loop {
+            let started = Instant::now();
+            let quotas = live::read_json::<telemetry::Quotas>(&agent, &format!("{quota_base}/v1/magpie/quotas?kept=1"));
+            {
+                let mut runtime = quota_shared.lock().expect("状态锁损坏");
+                match quotas {
+                    Ok(quotas) => runtime.telemetry.update_quotas(quotas.data),
+                    Err(error) => runtime.telemetry.quota_error = Some(error),
+                }
+                if let Some(snapshot) = runtime.refresh(None) {
+                    let _ = quota_app.emit("route-update", snapshot);
+                }
+            }
+            std::thread::sleep(Duration::from_secs(30).saturating_sub(started.elapsed()));
+        }
+    });
+    let usage_app = app.clone();
+    let usage_shared = Arc::clone(&shared);
+    let usage_base = base.clone();
+    std::thread::spawn(move || {
+        let agent = live::client(Duration::from_secs(5));
+        loop {
+            let started = Instant::now();
+            let usage = live::read_json::<telemetry::Usage>(&agent, &format!("{usage_base}/v1/magpie/usage?period=today"));
+            {
+                let mut runtime = usage_shared.lock().expect("状态锁损坏");
+                match usage {
+                    Ok(usage) => { runtime.telemetry.usage = Some(usage); runtime.telemetry.cost_error = None; }
+                    Err(error) => runtime.telemetry.cost_error = Some(error),
+                }
+                if let Some(snapshot) = runtime.refresh(None) {
+                    let _ = usage_app.emit("route-update", snapshot);
+                }
+            }
+            std::thread::sleep(Duration::from_secs(5).saturating_sub(started.elapsed()));
         }
     });
     std::thread::spawn(move || {

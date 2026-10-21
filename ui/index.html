@@ -4,16 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>MagpieHUD</title>
+  <title>Magpie HUD</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
   <link rel="stylesheet" href="hud.css">
   <script src="hud.js" defer></script>
 </head>
 <body>
-<main class="hud" id="hud" data-state="waiting">
+<main class="hud" id="hud" data-state="waiting" data-sources="compact">
   <header class="window-bar" id="drag-region" data-tauri-drag-region>
     <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg>
-    <h1 class="brand-name">magpie</h1><span class="brand-subtitle">路由监视</span>
+    <h1 class="brand-name">Magpie HUD</h1><span class="brand-subtitle">路由监视</span>
     <span class="watch-state" id="watch-label" role="status">等待今日记录</span>
     <label class="scope-label" for="session-select">查看</label>
     <select id="session-select" aria-label="按会话查看路由"><option value="*">最近会话</option></select>
@@ -21,20 +21,26 @@
     <button id="hide-window" class="window-button" type="button" aria-label="隐藏到托盘" title="隐藏到托盘"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10h10"/></svg></button>
   </header>
   <div class="content">
-    <aside class="daily" aria-label="当日统计">
+    <aside class="sidebar" aria-label="统计与用量">
+    <section class="daily" aria-label="当日统计">
       <div class="daily-heading"><strong>当日</strong><time id="stats-date">—</time></div>
       <dl>
         <div class="metric" id="tokens-metric" tabindex="0"><dt>Token</dt><dd id="daily-tokens">—</dd><small id="request-count">等待记录</small></div>
-        <div class="metric" id="cost-metric" tabindex="0"><dt>费用 <span id="cost-unit"></span></dt><dd id="daily-cost">未记录</dd><small id="cost-coverage">日志无费用数据</small></div>
+        <div class="metric" id="cost-metric" tabindex="0"><dt>费用估值 <span id="cost-unit"></span> <span id="cost-status" role="status"></span></dt><dd id="daily-cost">未定价</dd><small id="cost-coverage">等待 Magpie 费用</small></div>
         <div class="metric" id="speed-metric" tabindex="0"><dt>TPS <span>tok/s</span></dt><dd id="daily-speed">—</dd><small>当日加权输出速度</small></div>
       </dl>
       <span class="stats-scope" id="stats-scope">全部会话</span>
+    </section>
+    <section class="quota" aria-labelledby="quota-heading">
+      <div class="quota-heading"><h2 id="quota-heading">用量</h2><span id="quota-freshness">等待读取</span></div>
+      <div id="quota-list" class="quota-list"><p class="quota-empty">等待当前会话的额度</p></div>
+    </section>
     </aside>
     <section class="routing" aria-label="Agent 经 magpie 路由到会话账号">
+      <div class="transit">
       <div class="source-node" tabindex="0" id="source-node">
         <span class="node-caption">请求来源</span>
-        <div class="source-heading"><span class="source-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M5.6 18.4 18.4 5.6M8.6 3.7l6.8 16.6M3.7 8.6l16.6 6.8"/></svg></span><strong id="agent-name">等待请求</strong></div>
-        <span class="source-request" id="agent-request">请求模型待记录</span>
+        <div id="source-list" class="source-list"><div class="source-entry"><div class="source-heading"><span class="source-icon"><img src="icons/claude.svg" alt=""></span><strong>等待请求</strong></div><span class="source-request">请求模型待记录</span></div></div>
         <small id="session-count">0 个会话</small>
       </div>
       <svg class="inbound" viewBox="0 0 48 100" preserveAspectRatio="none" aria-hidden="true"><path class="route-track" d="M2 60C22 60 26 42 46 42"/><path class="route-active" id="inbound-active" d="M2 60C22 60 26 42 46 42"/></svg>
@@ -42,9 +48,10 @@
         <div class="router-emblem"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg></div>
         <strong>magpie</strong><span id="router-host">127.0.0.1:3425</span>
       </div>
+      </div>
       <div class="route-area" id="route-area">
         <svg id="route-lines" class="route-lines" aria-hidden="true"></svg>
-        <div class="routes" id="routes" role="list" aria-label="最近会话路由"></div>
+        <div class="routes" id="routes" role="list" aria-label="最近会话路由" hidden></div>
         <div class="empty-route" id="empty-route"><span class="empty-square">—</span><div><strong>尚无今日会话</strong><small>等待 Magpie 路由写入</small></div></div>
       </div>
     </section>
