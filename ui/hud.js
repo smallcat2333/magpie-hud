@@ -12,9 +12,10 @@
   let snapshot = null;
   let selectedCard = null;
   let renderedIds = new Set();
-  let animations = [];
   let frame = 0;
+  const branchViews = new Map();
   const quotaViews = new Map();
+  const subagentNumbers = new Map();
   let quotaRenderKey = '';
   let quotaOrderTimer = 0;
 
@@ -101,6 +102,7 @@
   /** 展示统一为完成、运行、异常三类；异常类别按取消、失败、未知区分。 */
   function statusInfo(card) {
     switch (card.state) {
+      case 'delegating': return ['', '子任务', 'delegating'];
       case 'running':
       case 'waiting': return ['', '运行', 'running'];
       case 'success':
@@ -231,10 +233,59 @@
     button.append(icon, copy, metrics);
     button.addEventListener('click', () => {
       selectedCard = card.id;
-      routeList.querySelectorAll('.route-card').forEach(element => element.classList.toggle('selected', element === button));
+      routeList.querySelectorAll('.route-card,.subagent-row').forEach(element => element.classList.toggle('selected', element === button));
       renderNotes([card.note, session.notes[1]]);
     });
     return button;
+  }
+
+  /** 只挂载有活跃模型请求的子 Agent，编号在所属会话内保持稳定。 */
+  function activeSubagents(session) {
+    return (session.subagents || []).filter(card => ['running', 'waiting'].includes(card.state));
+  }
+
+  function subagentName(card, session) {
+    const id = card.subagentId || card.id;
+    if (!subagentNumbers.has(session.id)) subagentNumbers.set(session.id, new Map());
+    const numbers = subagentNumbers.get(session.id);
+    if (!numbers.has(id)) numbers.set(id, numbers.size + 1);
+    const label = card.subagentLabel || '';
+    return label && !/^子\s*Agent(?:\s|$)/i.test(label) ? label : `子 Agent ${numbers.get(id)}`;
+  }
+
+  /** 主会话与子请求共用模型、状态及指标渲染，子项仅重新排列成一行。 */
+  function createSubagent(card, session) {
+    const button = createCard(card, session);
+    button.classList.add('subagent-row');
+    button.dataset.subagentId = card.subagentId || card.id;
+    const label = subagentName(card, session);
+    button.querySelector('.session-title').textContent = label;
+    button.title = `${label}\n子 Agent ID: ${card.subagentId || card.id}\n${button.title}`;
+    button.setAttribute('aria-label', button.title.replaceAll('\n', '，'));
+    const metrics = button.querySelector('.card-metrics');
+    metrics.title = metrics.title.replaceAll('该会话', '该子 Agent');
+    const copy = button.querySelector('.card-copy');
+    const name = copy.querySelector('.session-title');
+    const state = copy.querySelector('.state-tag');
+    const model = copy.querySelector('.card-model');
+    const account = copy.querySelector('.card-account');
+    const effort = copy.querySelector('.effort');
+    button.replaceChildren(button.querySelector('.model-icon'), name, model, state, effort, metrics);
+    button.title += `\n账号: ${account.title}`;
+    button.setAttribute('aria-label', button.title.replaceAll('\n', '，'));
+    return button;
+  }
+
+  /** 尚无主请求时仅提供会话锚点，不用子 Agent 的结果冒充主请求。 */
+  function parentAnchor(session) {
+    const note = session.notes[0];
+    return {
+      id: `parent-${session.id}`, sessionId: session.id, sessionLabel: session.label,
+      account: '账号未提供', model: '子 Agent 请求中', provider: '', effort: '待定',
+      state: 'delegating', detail: '主会话当前没有模型请求，下方为活跃子 Agent',
+      error: null, time: note.time, current: true, tokens: null, tokensPerSecond: null,
+      metricsArePrevious: false, note,
+    };
   }
 
   /** 下方两个固定槽同步更新，不追加历史行。 */
@@ -300,7 +351,7 @@
     const list = byId('quota-list');
     const scroll = list.scrollTop;
     const accounts = new Map();
-    sessions.flatMap(session => session.routes.slice(0, 4)).forEach(card => {
+    sessions.flatMap(session => [...(session.quotaRoutes || []), ...session.routes, ...(session.subagents || [])]).forEach(card => {
       const key = JSON.stringify([card.provider.toLowerCase(), card.account]);
       if (!accounts.has(key)) accounts.set(key, { card, models: new Set() });
       accounts.get(key).models.add(card.model);
@@ -444,9 +495,10 @@
     if (!quotaOrderTimer) quotaOrderTimer = setTimeout(() => { quotaOrderTimer = 0; render(false); }, 60_000);
     hud.dataset.layout = innerWidth / innerHeight < 1.25 || innerWidth < 680 ? 'tall' : 'wide';
     if (!snapshot) return;
-    const session = snapshot.sessions.find(item => item.id === selector.value);
-    const active = snapshot.sessions.filter(item => item.routes.some(card => ['running', 'waiting'].includes(card.state)));
-    const recent = snapshot.sessions.filter(item => !active.includes(item));
+    const visibleSessions = snapshot.sessions.filter(item => item.routes.length || activeSubagents(item).length);
+    const session = visibleSessions.find(item => item.id === selector.value);
+    const active = visibleSessions.filter(item => item.routes.some(card => ['running', 'waiting'].includes(card.state)) || activeSubagents(item).length);
+    const recent = visibleSessions.filter(item => !active.includes(item));
     const chooseSessions = () => session ? [session] : [...active, ...recent.slice(0, Math.max(0, visibleSessionCapacity() - active.length))];
     let sessions = chooseSessions();
     const oldScroll = routeList.scrollTop;
@@ -462,22 +514,39 @@
       sessions = chooseSessions();
       renderSources(sessions);
     }
-    text('session-count', session ? session.label : `${snapshot.sessions.length}会话, 显示${sessions.length}个`);
+    text('session-count', session ? session.label : `${visibleSessions.length}会话, 显示${sessions.length}个`);
     byId('source-node').title = [...new Set(sessions.map(item => item.agent))].join('\n');
     const fragment = document.createDocumentFragment();
     const newIds = [];
     const currentIds = new Set();
-    sessions.forEach(item => item.routes.slice(0, 4).forEach(card => {
-      fragment.append(createCard(card, item));
+    const rememberCard = card => {
       currentIds.add(card.id);
       if (!renderedIds.has(card.id)) newIds.push(card.id);
-    }));
+    };
+    sessions.forEach(item => {
+      const group = document.createElement('div');
+      group.className = 'session-group';
+      group.dataset.sessionId = item.id;
+      const children = activeSubagents(item);
+      const parents = item.routes.length ? item.routes.slice(0, 4) : [parentAnchor(item)];
+      parents.forEach(card => { group.append(createCard(card, item)); rememberCard(card); });
+      if (children.length) {
+        group.classList.add('has-subagents');
+        const list = document.createElement('div');
+        list.className = 'subagent-list';
+        list.setAttribute('role', 'group');
+        list.setAttribute('aria-label', `${item.label}的活跃子 Agent`);
+        children.forEach(card => { list.append(createSubagent(card, item)); rememberCard(card); });
+        group.append(list);
+      }
+      fragment.append(group);
+    });
     routeList.replaceChildren(fragment);
     routeList.hidden = sessions.length === 0;
     routeList.scrollTop = oldScroll;
     byId('empty-route').hidden = sessions.length > 0;
     byId('inbound-active').style.opacity = sessions.length ? '1' : '0';
-    const picked = sessions.flatMap(item => item.routes).find(card => card.id === selectedCard);
+    const picked = sessions.flatMap(item => [...item.routes, ...activeSubagents(item)]).find(card => card.id === selectedCard);
     if (picked) renderNotes([picked.note, sessions.find(item => item.id === picked.sessionId).notes[1]]);
     else { selectedCard = null; renderNotes(session ? session.notes : snapshot.notes); }
     renderedIds = currentIds;
@@ -507,33 +576,65 @@
     const origin = (tall ? router.bottom : router.top + router.height / 2) - layer.top;
     const trunkX = area.left - layer.left + 12;
     const bendY = Math.max(origin + 6, area.top - layer.top - 6);
-    animations.forEach(animation => animation.cancel());
-    animations = [];
-    lineLayer.replaceChildren();
+    const visibleIds = new Set();
     lineLayer.setAttribute('viewBox', `0 0 ${layer.width} ${layer.height}`);
+    let previousNode = null;
+    const place = node => {
+      const next = previousNode ? previousNode.nextSibling : lineLayer.firstChild;
+      if (next !== node) lineLayer.insertBefore(node, next);
+      previousNode = node;
+    };
     routeList.querySelectorAll('.route-card').forEach(card => {
       const rectangle = card.getBoundingClientRect();
       const x = rectangle.left - layer.left;
       const y = rectangle.top + rectangle.height / 2 - layer.top;
-      const path = document.createElementNS(namespace, 'path');
+      const id = card.dataset.cardId;
+      visibleIds.add(id);
+      let view = branchViews.get(id);
+      const isNew = !view;
+      if (!view) {
+        const path = document.createElementNS(namespace, 'path');
+        path.dataset.cardId = id;
+        view = { path, base: null, state: null };
+        branchViews.set(id, view);
+      }
+      const { path } = view;
       const state = card.classList.contains('waiting') ? 'running'
-        : [...card.classList].find(name => ['running', 'success', 'recovered', 'failed', 'cancelled', 'unknown'].includes(name)) || 'unknown';
-      path.setAttribute('d', tall
+        : [...card.classList].find(name => ['running', 'success', 'recovered', 'failed', 'cancelled', 'unknown', 'delegating'].includes(name)) || 'unknown';
+      const isChild = card.classList.contains('subagent-row');
+      if (isChild) {
+        const parent = card.closest('.session-group').querySelector('.route-card:not(.subagent-row)').getBoundingClientRect();
+        const stemX = x - 10;
+        path.setAttribute('d', `M${stemX} ${parent.bottom - layer.top}V${y - 5}Q${stemX} ${y} ${stemX + 5} ${y}H${x}`);
+      } else path.setAttribute('d', tall
         ? `M${startX} ${origin}V${bendY}H${trunkX}V${Math.max(bendY, y - 16)}Q${trunkX} ${y} ${x} ${y}`
         : `M${startX} ${origin}C${startX + Math.max(18, (x - startX) * .45)} ${origin} ${startX + Math.max(18, (x - startX) * .25)} ${y} ${x} ${y}`);
       if (state === 'running') {
-        const base = document.createElementNS(namespace, 'path');
-        base.setAttribute('d', path.getAttribute('d'));
-        base.setAttribute('class', 'branch-base');
-        lineLayer.append(base);
+        if (!view.base) {
+          view.base = document.createElementNS(namespace, 'path');
+          view.base.setAttribute('class', 'branch-base');
+        }
+        view.base.setAttribute('d', path.getAttribute('d'));
+        place(view.base);
+      } else if (view.base) {
+        view.base.remove();
+        view.base = null;
       }
-      path.setAttribute('class', `branch ${state}`);
-      path.style.animationDelay = `${-(performance.now() % 1000)}ms`;
-      lineLayer.append(path);
-      if (newIds.includes(card.dataset.cardId) && !reduced.matches && !document.hidden) {
-        animations.push(path.animate([{ opacity: .3, strokeWidth: 2 }, { opacity: 1, strokeWidth: 3, offset: .4 }, { opacity: .86, strokeWidth: 2 }], { duration: 320 }));
+      if (view.state !== state) {
+        path.setAttribute('class', `branch ${state}`);
+        view.state = state;
+      }
+      place(path);
+      if (isNew && newIds.includes(id) && !reduced.matches && !document.hidden) {
+        path.animate([{ opacity: .3, strokeWidth: 2 }, { opacity: 1, strokeWidth: 3, offset: .4 }, { opacity: .86, strokeWidth: 2 }], { duration: 320 });
       }
     });
+    for (const [id, view] of branchViews) {
+      if (visibleIds.has(id)) continue;
+      view.base?.remove();
+      view.path.remove();
+      branchViews.delete(id);
+    }
   }
 
   /** 在一帧中合并布局重算，避免多次 ResizeObserver 通知造成抖动。 */
@@ -544,9 +645,10 @@
 
   /** 完整 ID 用于选择，显示会话名；不会把两个前缀相同的会话合并。 */
   function updateSelector(sessions) {
+    sessions = sessions.filter(item => item.routes.length || activeSubagents(item).length);
     const previous = selector.value;
     const options = [new Option('最近会话', '*')];
-    sessions.forEach(session => options.push(new Option(`${session.label} · ${shortAccount(session.routes[0]?.account || '账号未提供')}`, session.id)));
+    sessions.forEach(session => options.push(new Option(`${session.label} · ${shortAccount(session.routes[0]?.account || activeSubagents(session)[0]?.account || '账号未提供')}`, session.id)));
     selector.replaceChildren(...options);
     selector.value = sessions.some(session => session.id === previous) ? previous : '*';
   }

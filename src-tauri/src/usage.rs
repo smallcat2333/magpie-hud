@@ -60,6 +60,8 @@ impl DailyStats {
 struct Record {
     identity: String,
     route_id: Option<i64>,
+    /// 子 Agent 身份。根会话请求为空；不读取正文，只用于归属与上轮指标。
+    subagent: String,
     timestamp_ms: i64,
     sequence: u64,
     time: String,
@@ -179,6 +181,12 @@ pub struct RouteCard {
     pub tokens_per_second: Option<f64>,
     #[serde(default)]
     pub metrics_are_previous: bool,
+    /// 子 Agent 请求身份。根会话请求为 None；前端用它挂到父会话下方。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
+    /// 不含正文的通用标签。缺省时前端用「子 Agent」加短 ID。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_label: Option<String>,
     pub note: Note,
 }
 
@@ -193,6 +201,15 @@ pub struct SessionView {
     pub agent: String,
     pub request: String,
     pub routes: Vec<RouteCard>,
+    /// 当前正在跑的子 Agent 请求。已完成的子请求不在这里，也不进 routes。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<RouteCard>,
+    /// 每个子 Agent 最近一次已完成记录，供进行中行引用上轮指标；不发给前端。
+    #[serde(skip)]
+    pub subagent_history: HashMap<String, RouteCard>,
+    /// 根请求与子请求按账号各留最新一条，供额度匹配。统计仍只来自 daily。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_routes: Vec<RouteCard>,
     pub notes: [Note; 2],
     pub daily: DailyStats,
 }
@@ -315,6 +332,7 @@ impl UsageLedger {
         self.records.push(Record {
             identity,
             route_id: value.get("route_id").and_then(Value::as_i64),
+            subagent: string(&value, "subagent").unwrap_or("").into(),
             timestamp_ms: timestamp.timestamp_millis(),
             sequence: self.records.len() as u64,
             time: local.format("%H:%M:%S").to_string(),
@@ -370,28 +388,29 @@ impl UsageLedger {
         let mut sessions = Vec::new();
         for (session, records) in grouped {
             // t 是请求开始时间；完成顺序以完整日志行的追加顺序为准。
-            let latest = *records.last().unwrap();
+            let latest = *records.iter().max_by_key(|record| record.sequence).unwrap();
+            let root_records: Vec<_> = records.iter().copied().filter(|record| record.subagent.is_empty()).collect();
+            let latest_root = root_records.iter().copied().max_by_key(|record| record.sequence);
             let label: String = if session.is_empty() {
                 "未标记会话".into()
             } else {
                 "未命名会话".into()
             };
-            let mut account_history: HashMap<&str, Vec<&Record>> = HashMap::new();
+            let mut account_history: HashMap<(String, &str), Vec<&Record>> = HashMap::new();
+            let mut child_history: HashMap<&str, Vec<&Record>> = HashMap::new();
             let mut stats = DailyStats::default();
             for record in &records {
                 stats.add(record);
-                account_history
-                    .entry(&record.account)
-                    .or_default()
-                    .push(record);
-            }
-            let mut routes = Vec::new();
-            for history in account_history.values() {
-                let record = *history.last().unwrap();
-                let current = record.identity == latest.identity;
-                if !current && record.outcome() != "failed" {
-                    continue;
+                let key = (record.provider.to_ascii_lowercase(), record.account.as_str());
+                account_history.entry(key).or_default().push(record);
+                if !record.subagent.is_empty() {
+                    child_history
+                        .entry(&record.subagent)
+                        .or_default()
+                        .push(record);
                 }
+            }
+            let card_for = |record: &Record, current: bool, history: &[&Record]| {
                 let recovered = record.success()
                     && history
                         .iter()
@@ -404,52 +423,106 @@ impl UsageLedger {
                 } else {
                     record.outcome()
                 };
-                routes.push((
-                    record.sequence,
-                    RouteCard {
-                        id: record.identity.clone(),
-                        session_id: session.into(),
-                        session_label: label.clone(),
-                        account: record.account.clone(),
-                        model: record.model.clone(),
-                        provider: record.provider.clone(),
-                        effort: record.effort.clone(),
-                        state: state.into(),
-                        detail: record.detail(recovered),
-                        error: record.error.clone(),
-                        time: record.time.clone(),
-                        current,
-                        route_id: record.route_id,
-                        tokens: Some(record.tokens),
-                        tokens_per_second: record.generation_ms.filter(|_| record.success())
-                            .map(|ms| record.output as f64 * 1000.0 / ms),
-                        metrics_are_previous: false,
-                        note: record.note(recovered),
-                    },
-                ));
+                RouteCard {
+                    id: record.identity.clone(),
+                    session_id: session.into(),
+                    session_label: label.clone(),
+                    account: record.account.clone(),
+                    model: record.model.clone(),
+                    provider: record.provider.clone(),
+                    effort: record.effort.clone(),
+                    state: state.into(),
+                    detail: record.detail(recovered),
+                    error: record.error.clone(),
+                    time: record.time.clone(),
+                    current,
+                    route_id: record.route_id,
+                    tokens: Some(record.tokens),
+                    tokens_per_second: record
+                        .generation_ms
+                        .filter(|_| record.success())
+                        .map(|ms| record.output as f64 * 1000.0 / ms),
+                    metrics_are_previous: false,
+                    subagent_id: (!record.subagent.is_empty()).then(|| record.subagent.clone()),
+                    subagent_label: (!record.subagent.is_empty()).then(|| child_label(&record.subagent)),
+                    note: record.note(recovered),
+                }
+            };
+            let mut routes = Vec::new();
+            if let Some(latest_root) = latest_root {
+                for history in account_history.values() {
+                    let Some(record) = history.iter().rev().find(|record| record.subagent.is_empty()) else {
+                        continue;
+                    };
+                    let current = record.identity == latest_root.identity;
+                    if !current && record.outcome() != "failed" {
+                        continue;
+                    }
+                    let history_refs: Vec<_> = history.iter().copied().filter(|item| item.subagent.is_empty()).collect();
+                    routes.push((record.sequence, card_for(record, current, &history_refs)));
+                }
             }
             routes.sort_by(|a, b| b.0.cmp(&a.0));
             let routes: Vec<_> = routes.into_iter().map(|(_, route)| route).collect();
-            let latest_card = routes.iter().find(|route| route.current).unwrap();
+            let mut subagent_history = HashMap::new();
+            for (child, history) in &child_history {
+                let record = *history.last().unwrap();
+                let history_refs: Vec<_> = history.iter().copied().collect();
+                subagent_history.insert((*child).to_owned(), card_for(record, false, &history_refs));
+            }
+            let mut quota_by_account: HashMap<(String, String), (u64, RouteCard)> = HashMap::new();
+            for record in &records {
+                let key = (record.provider.to_ascii_lowercase(), record.account.clone());
+                if quota_by_account.get(&key).is_some_and(|(sequence, _)| *sequence >= record.sequence) {
+                    continue;
+                }
+                let history = account_history.get(&(record.provider.to_ascii_lowercase(), record.account.as_str()));
+                let history_refs: Vec<_> = history.into_iter().flatten().copied()
+                    .filter(|item| item.subagent.is_empty() == record.subagent.is_empty())
+                    .collect();
+                quota_by_account.insert(key, (record.sequence, card_for(record, false, &history_refs)));
+            }
+            let mut quota_routes: Vec<_> = quota_by_account.into_values().collect();
+            quota_routes.sort_by(|a, b| b.0.cmp(&a.0));
+            let quota_routes: Vec<_> = quota_routes.into_iter().map(|(_, route)| route).collect();
+            let (anchor, anchor_card) = if let Some(latest_root) = latest_root {
+                let card = routes.iter().find(|route| route.current).expect("根请求当前卡片");
+                (latest_root, card.note.clone())
+            } else {
+                (
+                    latest,
+                    Note {
+                        time: latest.time.clone(),
+                        kind: "子 Agent".into(),
+                        text: "子 Agent 请求中".into(),
+                    },
+                )
+            };
             let second = if let Some(failed) = routes
                 .iter()
                 .find(|route| !route.current && route.state == "failed")
             {
                 failed.note.clone()
-            } else {
+            } else if latest_root.is_some() {
                 Note {
-                    time: latest.time.clone(),
+                    time: anchor.time.clone(),
                     kind: "会话".into(),
                     text: format!(
                         "{label} · {} · {} · {}",
-                        latest.model,
-                        latest.effort,
-                        if latest.tries > 1 {
-                            format!("尝试 {} 次；此前失败账号和冷却时长未记录", latest.tries)
+                        anchor.model,
+                        anchor.effort,
+                        if anchor.tries > 1 {
+                            format!("尝试 {} 次；此前失败账号和冷却时长未记录", anchor.tries)
                         } else {
                             "日志不包含其它账号的排除原因或恢复倒计时".into()
                         }
                     ),
+                }
+            } else {
+                Note {
+                    time: anchor.time.clone(),
+                    kind: "来源".into(),
+                    text: "该会话只有子 Agent 记录，父会话尚无已完成请求".into(),
                 }
             };
             sessions.push(SessionView {
@@ -457,10 +530,13 @@ impl UsageLedger {
                 label,
                 timestamp_ms: latest.timestamp_ms,
                 latest_sequence: latest.sequence,
-                agent: latest.agent.clone(),
-                request: latest.request.clone(),
-                notes: [latest_card.note.clone(), second],
+                agent: anchor.agent.clone(),
+                request: if latest_root.is_some() { anchor.request.clone() } else { String::new() },
+                notes: [anchor_card, second],
                 routes,
+                subagents: Vec::new(),
+                subagent_history,
+                quota_routes,
                 daily: stats,
             });
         }
@@ -533,7 +609,11 @@ impl UsageLedger {
     }
 }
 
-/// 取非空字符串；仅对外部字段做必要检查。
+/// 子 Agent 只给通用标签和短 ID，不展示会话正文。
+fn child_label(id: &str) -> String {
+    let short: String = id.chars().take(8).collect();
+    format!("子 Agent {short}")
+}
 fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value
         .get(key)
@@ -658,6 +738,58 @@ mod tests {
         assert_eq!(view.sessions.len(), 1);
         assert_eq!(view.sessions[0].id, "alpha");
         assert_eq!(view.daily.requests, 1);
+    }
+
+    /// 子 Agent 只计入会话与全局统计一次，不占据父会话的完成卡片。
+    #[test]
+    fn completed_children_stay_out_of_root_routes_and_count_once() {
+        let mut ledger = ledger();
+        ledger.ingest(fixture(1, "alpha", 200).to_string().as_bytes());
+        let mut child = fixture(2, "alpha", 200);
+        child["subagent"] = json!("agent-child-1");
+        child["providerAccount"] = json!("child@example.com");
+        child["out"] = json!(200);
+        ledger.ingest(child.to_string().as_bytes());
+        let mut only_child = fixture(3, "beta", 503);
+        only_child["subagent"] = json!("agent-only");
+        ledger.ingest(only_child.to_string().as_bytes());
+        let view = ledger.snapshot("h", "ready", None);
+        assert_eq!(view.daily.requests, 3);
+        let alpha = view.sessions.iter().find(|session| session.id == "alpha").unwrap();
+        assert_eq!(alpha.routes.len(), 1);
+        assert!(alpha.routes[0].subagent_id.is_none());
+        assert!(alpha.routes[0].current);
+        assert!(alpha.subagents.is_empty());
+        assert_eq!(alpha.subagent_history["agent-child-1"].tokens, Some(1_100));
+        assert_eq!(alpha.daily.requests, 2);
+        let accounts: Vec<_> = alpha.quota_routes.iter().map(|card| card.account.as_str()).collect();
+        assert!(accounts.contains(&"one@example.com") && accounts.contains(&"child@example.com"));
+        let mut same_name = fixture(4, "alpha", 200);
+        same_name["subagent"] = json!("agent-child-2");
+        same_name["provider"] = json!("other");
+        same_name["providerAccount"] = json!("one@example.com");
+        ledger.ingest(same_name.to_string().as_bytes());
+        let split = ledger.snapshot("h", "ready", None);
+        let alpha = split.sessions.iter().find(|session| session.id == "alpha").unwrap();
+        assert_eq!(alpha.quota_routes.iter().filter(|card| card.account == "one@example.com").count(), 2);
+        let mut other_root = fixture(5, "alpha", 200);
+        other_root["provider"] = json!("ProviderB");
+        other_root["providerAccount"] = json!("shared@example.com");
+        ledger.ingest(other_root.to_string().as_bytes());
+        let mut first_root = fixture(6, "alpha", 200);
+        first_root["provider"] = json!("providerA");
+        first_root["providerAccount"] = json!("shared@example.com");
+        ledger.ingest(first_root.to_string().as_bytes());
+        let roots = ledger.snapshot("h", "ready", None);
+        let shared: Vec<_> = roots.sessions.iter().find(|session| session.id == "alpha").unwrap()
+            .quota_routes.iter().filter(|card| card.account == "shared@example.com")
+            .map(|card| card.provider.to_ascii_lowercase()).collect();
+        assert!(shared.contains(&"providera".into()) && shared.contains(&"providerb".into()));
+        let beta = view.sessions.iter().find(|session| session.id == "beta").unwrap();
+        assert!(beta.routes.is_empty());
+        assert_eq!(beta.notes[0].text, "子 Agent 请求中");
+        assert_eq!(beta.quota_routes.len(), 1);
+        assert_eq!(beta.daily.requests, 1);
     }
 
     /// 较旧失败账号仍可作为对照，但不会凭空创建冷却秒数。

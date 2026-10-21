@@ -26,6 +26,9 @@ pub struct LiveRoute {
     pub id: i64,
     #[serde(default)]
     pub session: String,
+    /// 子 Agent 身份。与 usage.jsonl 的 subagent 相同；根请求没有该字段。
+    #[serde(default, rename = "subagentId")]
+    pub subagent_id: String,
     #[serde(default)]
     #[allow(dead_code)]
     pub provider: String,
@@ -120,19 +123,28 @@ impl LiveState {
     /// 用活跃请求覆盖展示，不改账本中的次数、费用与当日 Token。
     pub fn apply(&self, view: &mut RouteSnapshot) {
         let mut active_sessions = HashSet::new();
-        // 在覆盖卡片前保存每个会话的最后一轮，供同会话并发请求共用。
+        let mut child_sessions = HashSet::new();
+        // 根上轮只取根卡片；子 Agent 上轮按子 ID 单独保存，互不混用。
         let previous_metrics: HashMap<_, _> = view.sessions.iter().filter_map(|session| {
             session.routes.iter().find(|card| card.current && card.tokens.is_some()
                 && !matches!(card.state.as_str(), "running" | "waiting"))
                 .map(|card| (session.id.clone(), (card.tokens, card.tokens_per_second)))
+        }).collect();
+        let child_metrics: HashMap<_, _> = view.sessions.iter().flat_map(|session| {
+            session.subagent_history.iter().filter(|(_, card)| card.tokens.is_some())
+                .map(|(id, card)| ((session.id.clone(), id.clone()), (card.tokens, card.tokens_per_second)))
         }).collect();
         for active in &self.activity.active {
             let route = self.routes.get(&active.route);
             if route.is_some_and(|r| r.done || r.kind == "routing") {
                 continue;
             }
+            // 活跃请求只带 route id。没有对应路由时不猜测它属于父会话。
+            let Some(route) = route else { continue };
+            let child_id = route.subagent_id.trim();
+            let child = (!child_id.is_empty()).then_some(child_id);
             let session_id = if active.session.is_empty() {
-                route.map(|r| r.session.as_str()).unwrap_or("")
+                route.session.as_str()
             } else {
                 &active.session
             };
@@ -143,7 +155,7 @@ impl LiveState {
             let started = DateTime::parse_from_rfc3339(&active.started).ok();
             let time = started.map(|t| t.with_timezone(&Local).format("%H:%M:%S").to_string())
                 .unwrap_or_else(|| "--:--:--".into());
-            let attempt = route.and_then(|r| r.tries.as_deref().unwrap_or_default().last());
+            let attempt = route.tries.as_deref().unwrap_or_default().last();
             // 尝试已结束但外层请求还在交接时显示路由中，不冒充正在输出。
             let waiting = attempt.is_some_and(|a| a.done) || matches!(active.phase.as_str(), "slot" | "rpm");
             let phase = if waiting { "waiting" } else { "running" };
@@ -153,7 +165,7 @@ impl LiveState {
                 "upstream" if !waiting => "请求中 · 等待或接收上游流",
                 _ => "路由处理中",
             };
-            let candidate = attempt.and_then(|attempt| selected_candidate(route?, attempt));
+            let candidate = attempt.and_then(|attempt| selected_candidate(route, attempt));
             let account = candidate.map(|c| c.who.as_str()).filter(|s| !s.is_empty())
                 .unwrap_or("正在选择账号");
             let model = attempt.map(|a| a.model.as_str()).filter(|s| !s.is_empty())
@@ -164,9 +176,19 @@ impl LiveState {
             let label = self.name(session_id);
             let note = Note { time: time.clone(), kind: "进行中".into(),
                 text: format!("{label} · {account} ({model}) · {effort} · {detail} · {:.1}s", active.ms as f64 / 1000.0) };
-            let previous = previous_metrics.get(session_id).copied();
+            let previous = if let Some(child_id) = child {
+                child_metrics.get(&(session_id.to_owned(), child_id.to_owned())).copied()
+            } else {
+                previous_metrics.get(session_id).copied()
+            };
             let second = Note { time: time.clone(), kind: "统计".into(),
-                text: if previous.is_some() {
+                text: if child.is_some() {
+                    if previous.is_some() {
+                        "卡片数值为该子 Agent 上轮已完成请求；本轮结束后更新，当日统计仅含已完成请求".into()
+                    } else {
+                        "该子 Agent 暂无上轮记录，本次 Token / TPS 等待完成；当日统计仅含已完成请求".into()
+                    }
+                } else if previous.is_some() {
                     "卡片数值为该会话上轮已完成请求；本轮结束后更新，当日统计仅含已完成请求".into()
                 } else {
                     "该会话暂无上轮记录，本次 Token / TPS 等待完成；当日统计仅含已完成请求".into()
@@ -178,10 +200,30 @@ impl LiveState {
                 current: true, route_id: Some(active.route),
                 tokens: previous.and_then(|(tokens, _)| tokens),
                 tokens_per_second: previous.and_then(|(_, speed)| speed),
-                metrics_are_previous: previous.is_some(), note: note.clone(),
+                metrics_are_previous: previous.is_some(),
+                subagent_id: child.map(str::to_owned),
+                subagent_label: child.map(child_label),
+                note: note.clone(),
             };
+            if child.is_some() {
+                child_sessions.insert(session_id.to_owned());
+                if let Some(session) = view.sessions.iter_mut().find(|s| s.id == session_id) {
+                    if let Some(existing) = session.subagents.iter_mut().find(|item| item.subagent_id == card.subagent_id) {
+                        if card.route_id > existing.route_id { *existing = card; }
+                    } else {
+                        session.subagents.push(card);
+                    }
+                } else {
+                    view.sessions.push(SessionView { id: session_id.into(), label, timestamp_ms: started.map(|t| t.timestamp_millis()).unwrap_or(0),
+                        latest_sequence: 0, agent: display_agent(&active.agent), request: String::new(),
+                        routes: Vec::new(), subagents: vec![card], subagent_history: HashMap::new(), quota_routes: Vec::new(),
+                        notes: [note, second], daily: DailyStats::default() });
+                }
+                continue;
+            }
             if let Some(session) = view.sessions.iter_mut().find(|s| s.id == session_id) {
                 if active_sessions.insert(session_id.to_owned()) {
+                    // 父会话自己的进行中请求替换已完成根卡片，只留仍有失败依据的旧账号。
                     session.routes.retain(|c| c.state == "failed");
                     session.agent = display_agent(&active.agent);
                     session.request = active.model.clone();
@@ -192,7 +234,8 @@ impl LiveState {
                 active_sessions.insert(session_id.to_owned());
                 view.sessions.push(SessionView { id: session_id.into(), label, timestamp_ms: started.map(|t| t.timestamp_millis()).unwrap_or(0),
                     latest_sequence: 0, agent: display_agent(&active.agent), request: active.model.clone(),
-                    routes: vec![card], notes: [note, second], daily: DailyStats::default() });
+                    routes: vec![card], subagents: Vec::new(), subagent_history: HashMap::new(), quota_routes: Vec::new(),
+                    notes: [note, second], daily: DailyStats::default() });
             }
         }
         for session in &mut view.sessions {
@@ -203,15 +246,19 @@ impl LiveState {
             for card in &mut session.routes {
                 card.session_label = session.label.clone();
             }
+            for card in &mut session.subagents {
+                card.session_label = session.label.clone();
+            }
         }
         // 稳定排序保持原完成顺序，活跃会话始终优先可见。
-        view.sessions.sort_by_key(|s| !active_sessions.contains(&s.id));
+        view.sessions.sort_by_key(|s| !(active_sessions.contains(&s.id) || child_sessions.contains(&s.id)));
         if let Some(session) = view.sessions.first() {
             view.notes = session.notes.clone();
         }
-        if !active_sessions.is_empty() && view.state != "warning" {
+        let shown = active_sessions.union(&child_sessions).count();
+        if shown > 0 && view.state != "warning" {
             view.state = "ready".into();
-            view.watch_label = format!("{} 个会话请求中", active_sessions.len());
+            view.watch_label = format!("{shown} 个会话请求中");
         }
         if let Some(error) = &self.error {
             view.state = "warning".into();
@@ -259,6 +306,12 @@ fn selected_candidate<'a>(route: &'a LiveRoute, attempt: &Attempt) -> Option<&'a
 /// 来源文案与日志口径一致。
 fn display_agent(agent: &str) -> String {
     if agent == "claude-desktop" { "Claude Desktop".into() } else { agent.into() }
+}
+
+/// 子 Agent 只给通用标签和短 ID，不展示会话正文。
+fn child_label(id: &str) -> String {
+    let short: String = id.chars().take(8).collect();
+    format!("子 Agent {short}")
 }
 
 /// 实时接口仅允许回环 HTTP，避免读取配置地址时向远端发出请求。
@@ -406,6 +459,7 @@ mod tests {
         live.names.insert("alpha".into(), "HUD / 实时会话".into());
         live.activity.active.push(Active { id: 1, session: "alpha".into(), agent: "claude-desktop".into(),
             started: now.to_rfc3339(), phase: "upstream".into(), route: 10, ..Active::default() });
+        live.routes.insert(10, LiveRoute { id: 10, session: "alpha".into(), ..LiveRoute::default() });
         let ledger = UsageLedger::new(now.date_naive());
         let mut view = ledger.snapshot("127.0.0.1:3425", "ready", None);
         live.apply(&mut view);
@@ -448,8 +502,9 @@ mod tests {
         let baseline = ledger.snapshot("h", "ready", None);
         let mut live = LiveState::default();
         for (id, session) in [(10, "alpha"), (11, "alpha"), (12, "beta"), (13, "first-round")] {
+            live.routes.insert(id, LiveRoute { id, session: session.into(), ..LiveRoute::default() });
             live.activity.active.push(Active { id, session: session.into(), agent: "test".into(),
-                started: now.to_rfc3339(), phase: "upstream".into(), ..Default::default() });
+                started: now.to_rfc3339(), phase: "upstream".into(), route: id, ..Default::default() });
         }
         let mut view = baseline.clone();
         live.apply(&mut view);
@@ -477,6 +532,96 @@ mod tests {
         let mut finished = baseline;
         live.apply(&mut finished);
         assert!(finished.sessions.iter().flat_map(|session| &session.routes).all(|card| !card.metrics_are_previous));
+    }
+
+    /// 子请求挂在父会话下；缺路由先不显示，已完成根卡片不被子请求清掉。
+    #[test]
+    fn active_children_mount_without_replacing_completed_root() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        let root = serde_json::json!({"route_id":1,"t":now.to_rfc3339(),"session":"alpha",
+            "providerAccount":"root@example.com","provider":"codex","model":"gpt-root","status":200,
+            "in":100,"out":100,"cache_read":800,"ms":3000,"ttft_ms":1000});
+        let child = serde_json::json!({"route_id":2,"t":now.to_rfc3339(),"session":"alpha","subagent":"child-aaaaaaaa",
+            "providerAccount":"child@example.com","provider":"codex","model":"gpt-child","status":200,
+            "in":100,"out":200,"cache_read":800,"ms":3000,"ttft_ms":1000});
+        ledger.ingest(root.to_string().as_bytes());
+        ledger.ingest(child.to_string().as_bytes());
+        let baseline = ledger.snapshot("h", "ready", None);
+        let mut live = LiveState::default();
+        live.routes.insert(21, LiveRoute { id: 21, session: "alpha".into(), subagent_id: "child-aaaaaaaa".into(), ..Default::default() });
+        live.routes.insert(22, LiveRoute { id: 22, session: "alpha".into(), subagent_id: "child-bbbbbbbb".into(), ..Default::default() });
+        live.routes.insert(23, LiveRoute { id: 23, session: "alpha".into(), subagent_id: "child-aaaaaaaa".into(), ..Default::default() });
+        for (id, route) in [(101, 21), (102, 22), (103, 23), (104, 99)] {
+            live.activity.active.push(Active { id, session: "alpha".into(), agent: "test".into(),
+                started: now.to_rfc3339(), phase: "upstream".into(), route, ..Default::default() });
+        }
+        let mut view = baseline.clone();
+        live.apply(&mut view);
+        let session = view.sessions.iter().find(|session| session.id == "alpha").unwrap();
+        assert!(session.routes.iter().all(|card| !matches!(card.state.as_str(), "running" | "waiting")));
+        assert!(session.routes.iter().any(|card| card.current && card.subagent_id.is_none()));
+        assert_eq!(session.subagents.len(), 2);
+        let known = session.subagents.iter().find(|card| card.subagent_id.as_deref() == Some("child-aaaaaaaa")).unwrap();
+        assert_eq!(known.route_id, Some(23));
+        assert_eq!(known.tokens, Some(1_100));
+        assert!(known.metrics_are_previous);
+        assert_eq!(known.subagent_label.as_deref(), Some("子 Agent child-aa"));
+        let fresh = session.subagents.iter().find(|card| card.subagent_id.as_deref() == Some("child-bbbbbbbb")).unwrap();
+        assert_eq!(fresh.tokens, None);
+        assert!(!session.subagents.iter().any(|card| card.route_id == Some(99)));
+        assert_eq!(view.daily, baseline.daily);
+        assert_eq!(session.daily.requests, 2);
+    }
+
+    /// 只有子 Agent 时父会话不编造已完成根卡片。
+    #[test]
+    fn child_only_session_keeps_root_routes_empty() {
+        let now = Local::now();
+        let mut live = LiveState::default();
+        live.routes.insert(7, LiveRoute { id: 7, session: "solo".into(), subagent_id: "child-only".into(), ..Default::default() });
+        live.activity.active.push(Active { id: 1, session: "solo".into(), agent: "test".into(),
+            started: now.to_rfc3339(), phase: "upstream".into(), route: 7, ..Default::default() });
+        let mut view = UsageLedger::new(now.date_naive()).snapshot("h", "ready", None);
+        live.apply(&mut view);
+        assert!(view.sessions[0].routes.is_empty());
+        assert_eq!(view.sessions[0].subagents.len(), 1);
+        assert!(view.sessions[0].request.is_empty());
+    }
+
+    /// 只有父会话进行中时，已完成根卡片被替换，不和实时行重复。
+    #[test]
+    fn root_live_replaces_completed_root_without_duplicating() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        let root = serde_json::json!({"route_id":1,"t":now.to_rfc3339(),"session":"alpha",
+            "providerAccount":"root@example.com","provider":"codex","model":"gpt-root","status":200,
+            "in":100,"out":100,"cache_read":800,"ms":3000,"ttft_ms":1000});
+        let failed = serde_json::json!({"route_id":2,"t":now.to_rfc3339(),"session":"alpha",
+            "providerAccount":"old@example.com","provider":"codex","model":"gpt-root","status":503,
+            "in":100,"out":0,"ms":1000,"ttft_ms":100});
+        ledger.ingest(failed.to_string().as_bytes());
+        ledger.ingest(root.to_string().as_bytes());
+        let mut live = LiveState::default();
+        live.routes.insert(30, LiveRoute { id: 30, session: "alpha".into(), ..Default::default() });
+        live.activity.active.push(Active { id: 8, session: "alpha".into(), agent: "test".into(),
+            started: now.to_rfc3339(), phase: "upstream".into(), route: 30, ..Default::default() });
+        let mut view = ledger.snapshot("h", "ready", None);
+        live.apply(&mut view);
+        let routes = &view.sessions[0].routes;
+        assert_eq!(routes.iter().filter(|card| card.state == "running").count(), 1);
+        assert!(!routes.iter().any(|card| card.state == "success" || card.state == "recovered"));
+        assert!(routes.iter().any(|card| card.state == "failed"));
+        let running = routes.iter().find(|card| card.state == "running").unwrap();
+        assert_eq!(running.tokens, Some(1_000));
+        assert!(running.metrics_are_previous);
+        assert!(running.subagent_id.is_none());
+        live.routes.insert(40, LiveRoute { id: 40, session: "alpha".into(), subagent_id: "child-with-root".into(), ..Default::default() });
+        live.activity.active.push(Active { id: 9, session: "alpha".into(), agent: "test".into(),
+            started: now.to_rfc3339(), phase: "upstream".into(), route: 40, ..Default::default() });
+        live.apply(&mut view);
+        assert_eq!(view.sessions[0].subagents.len(), 1);
+        assert_eq!(view.watch_label, "1 个会话请求中");
     }
 
     /// 同一账号、模型可在多个组成员中重复出现；重复行不构成账号歧义。
