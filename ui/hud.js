@@ -45,14 +45,57 @@
   /** 按实际模型族选择随应用打包的图标，未知模型显示中性符号。 */
   function modelIcon(model) {
     const name = model.toLowerCase();
-    if (name.includes('codex')) return 'codex-color';
-    if (/gpt|o[134](?:-|$)/.test(name)) return 'openai';
-    if (/claude|sonnet|opus|haiku|fable/.test(name)) return 'claude-color';
-    if (name.includes('grok')) return 'grok';
-    if (name.includes('gemini')) return 'gemini-color';
-    if (name.includes('deepseek')) return 'deepseek-color';
-    if (/glm|zhipu/.test(name)) return 'zhipu-color';
-    return null;
+    const families = [
+      ['xiaomimimo', /mimo|xiaomi/],
+      ['siliconcloud-color', /silicon/],
+      ['modelscope-color', /modelscope/],
+      ['qwen-color', /qwen|qwq|qvq/],
+      ['kimi-color', /kimi|moonshot/],
+      ['minimax-color', /minimax/],
+      ['mistral-color', /mistral|mixtral|codestral|pixtral/],
+      ['stepfun-color', /stepfun|step-/],
+      ['groq', /groq/],
+      ['ollama', /ollama/],
+      ['openrouter-color', /openrouter/],
+      ['copilot-color', /copilot/],
+      ['vertexai-color', /vertex/],
+      ['bedrock-color', /bedrock/],
+      ['azure-color', /azure/],
+      ['baidu-color', /baidu|qianfan|文心|ernie/],
+      ['tencentcloud-color', /tencent|tcloud/],
+      ['hunyuan-color', /hunyuan|混元/],
+      ['huaweicloud-color', /huawei|盘古/],
+      ['volcengine-color', /volcengine|ark|火山/],
+      ['doubao-color', /doubao|豆包/],
+      ['zai', /\bzai\b/],
+      ['together-color', /together/],
+      ['fireworks-color', /fireworks/],
+      ['nvidia-color', /nvidia|nemotron/],
+      ['cline', /cline/],
+      ['opencode', /opencode/],
+      ['workersai-color', /workers/],
+      ['cloudflare-color', /cloudflare/],
+      ['nousresearch', /nous/],
+      ['antigravity-color', /antigravity/],
+      ['geminicli-color', /gemini-?cli/],
+      ['xai', /\bxai\b/],
+      ['ai302-color', /\b302\b/],
+      ['aihubmix-color', /aihubmix/],
+      ['commandcode', /commandcode/],
+      ['kilocode', /kilo/],
+      ['cherrystudio-color', /cherry/],
+      ['fishaudio', /fish|鱼/],
+      ['bailian-color', /bailian|百炼/],
+      ['codex-color', /codex/],
+      ['openai', /gpt|o[134](?:-|$)/],
+      ['claude-color', /claude|sonnet|opus|haiku|fable/],
+      ['grok', /grok/],
+      ['gemini-color', /gemini/],
+      ['deepseek-color', /deepseek/],
+      ['zhipu-color', /glm|zhipu|智谱/],
+    ];
+    const match = families.find(([, pattern]) => pattern.test(name));
+    return match ? match[0] : null;
   }
 
   /** 展示统一为完成、运行、异常三类；异常类别按取消、失败、未知区分。 */
