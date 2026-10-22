@@ -1,5 +1,6 @@
 //! Tauri 窗口、托盘与只读日志监视。单一运行状态缓存当日统计和会话，前端启动主动拉取快照。
 
+mod backdrop;
 mod config;
 mod hourly;
 mod live;
@@ -166,6 +167,7 @@ fn setup_window(app: &AppHandle) -> tauri::Result<()> {
         window.set_size(LogicalSize::new(width, height))?;
     }
     constrain_current(&window)?;
+    backdrop::apply(&window)?;
     window.show()?;
     window.unminimize()?;
     // 约束可能改变位置；显示后的稳定矩形才是下次启动应恢复的值。

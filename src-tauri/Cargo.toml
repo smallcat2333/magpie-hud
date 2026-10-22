@@ -19,4 +19,4 @@ tauri = { version = "2.11.3", features = ["tray-icon"] }
 notify = "8"
 ureq = { version = "3", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_LibraryLoader"] }

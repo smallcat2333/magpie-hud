@@ -806,7 +806,7 @@
 
   /** 先完成事件订阅，再拉取后端已缓存快照；只在 Tauri 环境访问原生 API。 */
   async function start() {
-    // 失焦时 Windows 把 Acrylic 换成纯灰，改由样式铺深色底；恢复焦点再交还模糊玻璃。
+    // 焦点仅记录交互状态，聚焦与失焦使用相同的半透明背景。
     const syncFocus = focused => { hud.dataset.focus = String(focused); };
     window.addEventListener('focus', () => syncFocus(true));
     window.addEventListener('blur', () => syncFocus(false));

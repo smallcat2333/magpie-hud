@@ -2,7 +2,7 @@
 
 使用 **Tauri 2 + 系统 WebView** 构建 Windows 独立悬浮窗。完成用量只读 Magpie 的 `usage.jsonl`，进行中状态只读本机网关 `/v1/magpie/trace` 与 `/v1/magpie/concurrency`；显示会话名称、流动路由及本次 Token/TPS，底部默认显示两行带本地时间的说明，高度不超过 420px 时收为 28px 单行。不修改 Magpie、不读取密钥、不集成进 rs_agent_router。
 
-**当前状态：支持自由缩放、横竖布局、实时路由、账号额度和费用估值。** 标题为 Magpie HUD，主背景 50% 不透明度配合 Windows Acrylic 磨砂，文字保持清晰。横窗来源不超过两个时与 Magpie 纵向排列；竖窗并排，保留来源图标并放大 Magpie。默认窗口 1120×400；拖动边缘/角落调整宽高，长宽比小于 1.25 或宽度小于 680px 时自动使用纵向布局；来源超过两个且宽度小于 980px 时也使用纵向布局。统计、来源与会话块随尺寸重排；高度不超过 420px 时，统计精简为 `Token | TPS | 费用`，日志收为 28px 单行，拉高后自动恢复。完整需求见 [SPEC](docs/spec/magpie-route-float-SPEC.md)，2026-10-20 的会话/统计增量见 [M2 档案](docs/feat/Feat_261019_2_分流图与托盘.md)。原始 [HTML 原型](docs/ui/magpie-hud.html) 保留为早期设计参考，实际程序使用 `ui/index.html`、`ui/hud.css` 和 `ui/hud.js`。
+**当前状态：支持自由缩放、横竖布局、实时路由、账号额度和费用估值。** 标题为 Magpie HUD，主背景 50% 不透明度配合 Windows 桌面合成 Acrylic 磨砂，聚焦和失焦保持相同底色，文字保持清晰。横窗来源不超过两个时与 Magpie 纵向排列；竖窗并排，保留来源图标并放大 Magpie。默认窗口 1120×400；拖动边缘/角落调整宽高，长宽比小于 1.25 或宽度小于 680px 时自动使用纵向布局；来源超过两个且宽度小于 980px 时也使用纵向布局。统计、来源与会话块随尺寸重排；高度不超过 420px 时，统计精简为 `Token | TPS | 费用`，日志收为 28px 单行，拉高后自动恢复。完整需求见 [SPEC](docs/spec/magpie-route-float-SPEC.md)，2026-10-20 的会话/统计增量见 [M2 档案](docs/feat/Feat_261019_2_分流图与托盘.md)。原始 [HTML 原型](docs/ui/magpie-hud.html) 保留为早期设计参考，实际程序使用 `ui/index.html`、`ui/hud.css` 和 `ui/hud.js`。
 
 ## 运行
 
