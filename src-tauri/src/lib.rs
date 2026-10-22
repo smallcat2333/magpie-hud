@@ -1,6 +1,7 @@
 //! Tauri 窗口、托盘与只读日志监视。单一运行状态缓存当日统计和会话，前端启动主动拉取快照。
 
 mod config;
+mod hourly;
 mod live;
 mod placement;
 mod tail;
@@ -368,7 +369,7 @@ fn start_live(app: AppHandle) {
             {
                 let mut runtime = usage_shared.lock().expect("状态锁损坏");
                 match usage {
-                    Ok(usage) => { runtime.telemetry.usage = Some(usage); runtime.telemetry.cost_error = None; }
+                    Ok(usage) => runtime.telemetry.update_usage(usage, &host),
                     Err(error) => runtime.telemetry.cost_error = Some(error),
                 }
                 if let Some(snapshot) = runtime.refresh(None) {
@@ -381,17 +382,29 @@ fn start_live(app: AppHandle) {
     std::thread::spawn(move || {
         let agent = live::client(Duration::from_secs(2));
         let mut titles = live::Titles::default();
+        let mut child_titles = live::ChildTitles::default();
         let mut names = std::collections::HashMap::new();
+        let mut child_labels = std::collections::HashMap::new();
         let mut last_titles = Instant::now() - Duration::from_secs(3);
+        let mut last_children = Instant::now() - Duration::from_secs(8);
         loop {
             if last_titles.elapsed() >= Duration::from_secs(2) {
                 names = titles.scan(&live::desktop_roots());
                 last_titles = Instant::now();
             }
+            if last_children.elapsed() >= Duration::from_secs(8) {
+                let wanted = {
+                    let runtime = shared.lock().expect("状态锁损坏");
+                    live::wanted_children(&runtime.snapshot)
+                };
+                child_labels = child_titles.scan(&wanted);
+                last_children = Instant::now();
+            }
             let result = live::read_json::<live::Activity>(&agent, &format!("{base}/v1/magpie/concurrency"));
             {
                 let mut runtime = shared.lock().expect("状态锁损坏");
                 runtime.live.names = names.clone();
+                runtime.live.child_labels = child_labels.clone();
                 match result {
                     Ok(activity) => { runtime.live.activity = activity; runtime.live.error = None; }
                     Err(error) => { runtime.live.activity = live::Activity::default(); runtime.live.error = Some(error); }

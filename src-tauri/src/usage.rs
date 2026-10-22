@@ -1,7 +1,7 @@
 //! 当日日志的会话聚合、真实请求状态与统计快照；不读取凭据或推测账号冷却时间。
 
-use chrono::{DateTime, Local, NaiveDate};
-use serde::Serialize;
+use chrono::{DateTime, Local, NaiveDate, Timelike};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -12,6 +12,17 @@ pub struct Note {
     pub time: String,
     pub kind: String,
     pub text: String,
+}
+
+/// 本地当日的一个小时段，金额未知与真实零值分别表达。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HourlyStats {
+    pub tokens: u64,
+    pub cost: Option<f64>,
+    /// 该小时只记录了部分观测区间，不能当作完整小时账单。
+    #[serde(default)]
+    pub cost_partial: bool,
 }
 
 /// 当日统计。费用来自 Magpie 按模型价格算出的美元金额，不是日志里的 Credits；速度按有效生成时间加权。
@@ -32,6 +43,17 @@ pub struct DailyStats {
     pub generation_ms: f64,
     pub speed_samples: u64,
     pub tokens_per_second: Option<f64>,
+    /// 已完成请求的缓存命中率，cache_read / (in + cache_read)，0 到 1。分母为 0 时未知。
+    pub cache_hit_rate: Option<f64>,
+    /// 加权分子与分母，仅用于聚合，不发给前端。
+    #[serde(skip)]
+    cache_read_tokens: u64,
+    #[serde(skip)]
+    cache_denominator_tokens: u64,
+    /// Magpie 费用除以已定价请求数。全部未定价、费用未知或没有已定价请求时为 None。
+    pub cost_per_call: Option<f64>,
+    /// 按本地请求开始时间分为 24 段，与当日 Token 采用同一口径。
+    pub hourly: [HourlyStats; 24],
 }
 
 impl DailyStats {
@@ -39,6 +61,13 @@ impl DailyStats {
     fn add(&mut self, record: &Record) {
         self.requests += 1;
         self.tokens += record.tokens;
+        self.hourly[record.hour].tokens = self.hourly[record.hour].tokens.saturating_add(record.tokens);
+        let denominator = record.input.saturating_add(record.cache_read);
+        if denominator > 0 {
+            self.cache_read_tokens = self.cache_read_tokens.saturating_add(record.cache_read);
+            self.cache_denominator_tokens = self.cache_denominator_tokens.saturating_add(denominator);
+            self.cache_hit_rate = Some(self.cache_read_tokens as f64 / self.cache_denominator_tokens as f64);
+        }
         if let Some(credits) = record.credits {
             self.credits = Some(self.credits.unwrap_or(0.0) + credits);
             self.credited_requests += 1;
@@ -63,6 +92,7 @@ struct Record {
     /// 子 Agent 身份。根会话请求为空；不读取正文，只用于归属与上轮指标。
     subagent: String,
     timestamp_ms: i64,
+    hour: usize,
     sequence: u64,
     time: String,
     session: String,
@@ -76,6 +106,8 @@ struct Record {
     error: Option<String>,
     tries: u64,
     tokens: u64,
+    input: u64,
+    cache_read: u64,
     output: u64,
     duration_ms: Option<f64>,
     ttft_ms: Option<f64>,
@@ -204,6 +236,9 @@ pub struct SessionView {
     /// 当前正在跑的子 Agent 请求。已完成的子请求不在这里，也不进 routes。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagents: Vec<RouteCard>,
+    /// 每个子 Agent 最近一次已完成请求行。前端只在当前选中会话里与进行中行按子 ID 合并。
+    #[serde(default, rename = "completedSubagents", skip_serializing_if = "Vec::is_empty")]
+    pub completed_subagents: Vec<RouteCard>,
     /// 每个子 Agent 最近一次已完成记录，供进行中行引用上轮指标；不发给前端。
     #[serde(skip)]
     pub subagent_history: HashMap<String, RouteCard>,
@@ -334,6 +369,7 @@ impl UsageLedger {
             route_id: value.get("route_id").and_then(Value::as_i64),
             subagent: string(&value, "subagent").unwrap_or("").into(),
             timestamp_ms: timestamp.timestamp_millis(),
+            hour: local.hour() as usize,
             sequence: self.records.len() as u64,
             time: local.format("%H:%M:%S").to_string(),
             session: string(&value, "session")
@@ -366,6 +402,8 @@ impl UsageLedger {
             tokens: number("in")
                 .saturating_add(number("out"))
                 .saturating_add(number("cache_read")),
+            input: number("in"),
+            cache_read: number("cache_read"),
             output: number("out"),
             duration_ms: duration,
             ttft_ms: finite_number(&value, "ttft_ms"),
@@ -444,18 +482,28 @@ impl UsageLedger {
                         .map(|ms| record.output as f64 * 1000.0 / ms),
                     metrics_are_previous: false,
                     subagent_id: (!record.subagent.is_empty()).then(|| record.subagent.clone()),
-                    subagent_label: (!record.subagent.is_empty()).then(|| child_label(&record.subagent)),
+                    subagent_label: (!record.subagent.is_empty()).then(|| crate::live::fallback_child_label(&record.subagent)),
                     note: record.note(recovered),
                 }
             };
             let mut routes = Vec::new();
             if let Some(latest_root) = latest_root {
+                // 较新以文件追加顺序为准。current 永远保留；非 current 只保留比最新成功根更晚的
+                // 失败/取消/未知根卡片，跨账号与供应商。子请求不参与；失败后成功会清掉更早留档。
+                let latest_success = root_records
+                    .iter()
+                    .filter(|record| record.success())
+                    .map(|record| record.sequence)
+                    .max();
                 for history in account_history.values() {
                     let Some(record) = history.iter().rev().find(|record| record.subagent.is_empty()) else {
                         continue;
                     };
                     let current = record.identity == latest_root.identity;
-                    if !current && record.outcome() != "failed" {
+                    let retained = current
+                        || (record.outcome() != "success"
+                            && latest_success.is_none_or(|sequence| record.sequence > sequence));
+                    if !retained {
                         continue;
                     }
                     let history_refs: Vec<_> = history.iter().copied().filter(|item| item.subagent.is_empty()).collect();
@@ -465,11 +513,16 @@ impl UsageLedger {
             routes.sort_by(|a, b| b.0.cmp(&a.0));
             let routes: Vec<_> = routes.into_iter().map(|(_, route)| route).collect();
             let mut subagent_history = HashMap::new();
+            let mut completed_subagents = Vec::new();
             for (child, history) in &child_history {
                 let record = *history.last().unwrap();
                 let history_refs: Vec<_> = history.iter().copied().collect();
-                subagent_history.insert((*child).to_owned(), card_for(record, false, &history_refs));
+                let card = card_for(record, false, &history_refs);
+                completed_subagents.push((record.sequence, card.clone()));
+                subagent_history.insert((*child).to_owned(), card);
             }
+            completed_subagents.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.id.cmp(&b.1.id)));
+            let completed_subagents: Vec<_> = completed_subagents.into_iter().map(|(_, card)| card).collect();
             let mut quota_by_account: HashMap<(String, String), (u64, RouteCard)> = HashMap::new();
             for record in &records {
                 let key = (record.provider.to_ascii_lowercase(), record.account.clone());
@@ -535,6 +588,7 @@ impl UsageLedger {
                 notes: [anchor_card, second],
                 routes,
                 subagents: Vec::new(),
+                completed_subagents,
                 subagent_history,
                 quota_routes,
                 daily: stats,
@@ -609,11 +663,7 @@ impl UsageLedger {
     }
 }
 
-/// 子 Agent 只给通用标签和短 ID，不展示会话正文。
-fn child_label(id: &str) -> String {
-    let short: String = id.chars().take(8).collect();
-    format!("子 Agent {short}")
-}
+/// 读取非空字符串字段；缺失和空值都保持未知。
 fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value
         .get(key)
@@ -646,6 +696,31 @@ mod tests {
                 .date_naive(),
         )
     }
+    /// 小时桶与日总量一致；同一条完成记录去重，子请求计入所属会话。
+    #[test]
+    fn hourly_tokens_follow_local_time_and_session_scope() {
+        let mut ledger = ledger();
+        let mut first = fixture(1, "one", 200);
+        let stamp = DateTime::parse_from_rfc3339(first["t"].as_str().unwrap()).unwrap().with_timezone(&Local);
+        let hour = stamp.hour() as usize;
+        first["cache_read"] = json!(100);
+        ledger.ingest(first.to_string().as_bytes());
+        ledger.ingest(first.to_string().as_bytes());
+        let mut child = fixture(2, "one", 200);
+        child["subagent"] = json!("child-one");
+        ledger.ingest(child.to_string().as_bytes());
+        ledger.ingest(fixture(3, "two", 200).to_string().as_bytes());
+        let view = ledger.snapshot("h", "ready", None);
+        assert_eq!(view.daily.hourly[hour].tokens, 2300);
+        assert_eq!(view.daily.hourly.iter().map(|bucket| bucket.tokens).sum::<u64>(), view.daily.tokens);
+        let one = view.sessions.iter().find(|session| session.id == "one").unwrap();
+        assert_eq!(one.daily.hourly[hour].tokens, 1300);
+        assert_eq!(view.daily.hourly.iter().filter(|bucket| bucket.tokens > 0).count(), 1);
+        assert!(view.daily.hourly.iter().all(|bucket| bucket.cost.is_none()));
+        ledger.change_day(ledger.day + chrono::Duration::days(1));
+        assert!(ledger.snapshot("h", "ready", None).daily.hourly.iter().all(|bucket| bucket.tokens == 0));
+    }
+
     /// 全局速度只纳入最近 10 个会话；第 11 个更早会话不影响结果。
     #[test]
     fn global_speed_uses_ten_latest_sessions() {
@@ -692,10 +767,9 @@ mod tests {
             "failed"
         );
         ledger.ingest(fixture(2, "alpha", 200).to_string().as_bytes());
-        assert_eq!(
-            ledger.snapshot("h", "ready", None).sessions[0].routes[0].state,
-            "recovered"
-        );
+        let recovered = ledger.snapshot("h", "ready", None);
+        assert_eq!(recovered.sessions[0].routes.len(), 1);
+        assert_eq!(recovered.sessions[0].routes[0].state, "recovered");
         ledger.ingest(fixture(3, "beta", 499).to_string().as_bytes());
         let view = ledger.snapshot("h", "ready", None);
         assert_eq!(view.sessions[0].routes[0].state, "cancelled");
@@ -764,6 +838,10 @@ mod tests {
         assert_eq!(alpha.daily.requests, 2);
         let accounts: Vec<_> = alpha.quota_routes.iter().map(|card| card.account.as_str()).collect();
         assert!(accounts.contains(&"one@example.com") && accounts.contains(&"child@example.com"));
+        assert_eq!(alpha.completed_subagents.len(), 1);
+        assert_eq!(alpha.completed_subagents[0].subagent_id.as_deref(), Some("agent-child-1"));
+        assert!(!alpha.completed_subagents[0].current);
+        assert_eq!(alpha.completed_subagents[0].subagent_label.as_deref(), Some("子 Agent agent-ch"));
         let mut same_name = fixture(4, "alpha", 200);
         same_name["subagent"] = json!("agent-child-2");
         same_name["provider"] = json!("other");
@@ -792,7 +870,132 @@ mod tests {
         assert_eq!(beta.daily.requests, 1);
     }
 
-    /// 较旧失败账号仍可作为对照，但不会凭空创建冷却秒数。
+    /// 每个子 Agent 只暴露最新完成行；缓存命中率按全部完成记录加权，分母为零保持未知。
+    #[test]
+    fn completed_children_are_unique_and_cache_rate_is_weighted() {
+        let mut ledger = ledger();
+        let mut first = fixture(1, "11111111-1111-1111-1111-111111111111", 200);
+        first["subagent"] = json!("child-one");
+        first["in"] = json!(100);
+        first["cache_read"] = json!(300);
+        ledger.ingest(first.to_string().as_bytes());
+        let mut newer = fixture(2, "11111111-1111-1111-1111-111111111111", 503);
+        newer["subagent"] = json!("child-one");
+        newer["in"] = json!(0);
+        newer["out"] = json!(0);
+        newer["cache_read"] = json!(0);
+        ledger.ingest(newer.to_string().as_bytes());
+        let mut other = fixture(3, "11111111-1111-1111-1111-111111111111", 200);
+        other["subagent"] = json!("child-two");
+        other["in"] = json!(100);
+        other["cache_read"] = json!(100);
+        ledger.ingest(other.to_string().as_bytes());
+        let view = ledger.snapshot("h", "ready", None);
+        let session = &view.sessions[0];
+        assert_eq!(session.completed_subagents.len(), 2);
+        assert_eq!(session.subagent_history.len(), 2);
+        let latest = session.completed_subagents.iter().find(|card| card.subagent_id.as_deref() == Some("child-one")).unwrap();
+        assert_eq!(latest.state, "failed");
+        assert_eq!(latest.tokens, Some(0));
+        assert_eq!(session.daily.requests, 3);
+        assert_eq!(session.daily.cache_hit_rate, Some(400.0 / 600.0));
+        assert_eq!(view.daily.cache_hit_rate, Some(400.0 / 600.0));
+        let empty = DailyStats::default();
+        assert_eq!(empty.cache_hit_rate, None);
+    }
+
+    /// 从未成功的会话仍保留各账号最新失败、取消和未知根卡片。
+    #[test]
+    fn never_successful_session_keeps_failed_cancelled_and_unknown_roots() {
+        let mut ledger = ledger();
+        ledger.ingest(fixture(1, "alpha", 503).to_string().as_bytes());
+        let mut cancelled = fixture(2, "alpha", 499);
+        cancelled["providerAccount"] = json!("cancel@example.com");
+        ledger.ingest(cancelled.to_string().as_bytes());
+        let mut unknown = fixture(3, "alpha", 200);
+        unknown["provider"] = json!("other");
+        unknown["providerAccount"] = json!("unknown@example.com");
+        unknown.as_object_mut().unwrap().remove("status");
+        ledger.ingest(unknown.to_string().as_bytes());
+        let mut child = fixture(4, "alpha", 200);
+        child["subagent"] = json!("child-only-success");
+        child["providerAccount"] = json!("child@example.com");
+        ledger.ingest(child.to_string().as_bytes());
+        let view = ledger.snapshot("h", "ready", None);
+        let routes = &view.sessions[0].routes;
+        assert_eq!(routes.len(), 3);
+        assert!(routes.iter().any(|card| card.state == "unknown" && card.current));
+        assert!(routes.iter().any(|card| card.state == "failed" && !card.current));
+        assert!(routes.iter().any(|card| card.state == "cancelled" && !card.current));
+        assert!(routes.iter().all(|card| card.subagent_id.is_none()));
+        assert_eq!(view.sessions[0].completed_subagents.len(), 1);
+    }
+
+    /// 较新成功根请求清掉同会话更早的失败根卡片，不跨会话；子请求成功不能清。
+    #[test]
+    fn newer_successful_root_clears_earlier_failed_roots_only_in_session() {
+        let mut ledger = ledger();
+        let mut earlier = fixture(1, "alpha", 200);
+        earlier["providerAccount"] = json!("early@example.com");
+        earlier["t"] = json!("2026-10-20T00:00:30+00:00");
+        ledger.ingest(earlier.to_string().as_bytes());
+        ledger.ingest(fixture(2, "alpha", 503).to_string().as_bytes());
+        let mut cancelled = fixture(3, "alpha", 499);
+        cancelled["providerAccount"] = json!("cancel@example.com");
+        ledger.ingest(cancelled.to_string().as_bytes());
+        let mut unknown = fixture(4, "alpha", 200);
+        unknown["provider"] = json!("other");
+        unknown["providerAccount"] = json!("unknown@example.com");
+        unknown.as_object_mut().unwrap().remove("status");
+        ledger.ingest(unknown.to_string().as_bytes());
+        let mut other_session = fixture(5, "beta", 503);
+        other_session["providerAccount"] = json!("stay@example.com");
+        ledger.ingest(other_session.to_string().as_bytes());
+        let held = ledger.snapshot("h", "ready", None);
+        let alpha = held.sessions.iter().find(|session| session.id == "alpha").unwrap();
+        assert_eq!(alpha.routes.len(), 3);
+        assert!(alpha.routes.iter().any(|card| card.state == "unknown" && card.current));
+        assert!(alpha.routes.iter().any(|card| card.state == "failed"));
+        assert!(alpha.routes.iter().any(|card| card.state == "cancelled"));
+        assert!(!alpha.routes.iter().any(|card| card.state == "success" || card.state == "recovered"));
+
+        let mut child = fixture(6, "alpha", 200);
+        child["subagent"] = json!("child-success");
+        child["providerAccount"] = json!("child@example.com");
+        ledger.ingest(child.to_string().as_bytes());
+        let after_child = ledger.snapshot("h", "ready", None);
+        let alpha = after_child.sessions.iter().find(|session| session.id == "alpha").unwrap();
+        assert_eq!(alpha.routes.len(), 3);
+        assert_eq!(alpha.completed_subagents.len(), 1);
+
+        let mut success = fixture(7, "alpha", 200);
+        success["providerAccount"] = json!("recovered@example.com");
+        // 开始时间早于失败行，完成顺序仍以文件追加为准。
+        success["t"] = json!("2026-10-20T00:00:00+00:00");
+        ledger.ingest(success.to_string().as_bytes());
+        let cleared = ledger.snapshot("h", "ready", None);
+        let alpha = cleared.sessions.iter().find(|session| session.id == "alpha").unwrap();
+        assert_eq!(alpha.routes.len(), 1);
+        assert_eq!(alpha.routes[0].account, "recovered@example.com");
+        assert!(alpha.routes[0].current);
+        assert!(matches!(alpha.routes[0].state.as_str(), "success" | "recovered"));
+        let beta = cleared.sessions.iter().find(|session| session.id == "beta").unwrap();
+        assert_eq!(beta.routes.len(), 1);
+        assert_eq!(beta.routes[0].state, "failed");
+
+        let mut later = fixture(8, "alpha", 503);
+        later["provider"] = json!("later");
+        later["providerAccount"] = json!("again@example.com");
+        ledger.ingest(later.to_string().as_bytes());
+        let after_later = ledger.snapshot("h", "ready", None);
+        let alpha = after_later.sessions.iter().find(|session| session.id == "alpha").unwrap();
+        assert_eq!(alpha.routes.len(), 1);
+        assert_eq!(alpha.routes[0].state, "failed");
+        assert!(alpha.routes[0].current);
+        assert_eq!(alpha.daily.requests, 7);
+    }
+
+    /// 较新成功根请求清掉更早失败对照；成功之后的失败仍留下，且不编造冷却秒数。
     #[test]
     fn keeps_failed_account_when_another_account_succeeds() {
         let mut ledger = ledger();
@@ -801,13 +1004,19 @@ mod tests {
         other["providerAccount"] = json!("another@example.com");
         other["tries"] = json!(2);
         ledger.ingest(other.to_string().as_bytes());
+        let cleared = ledger.snapshot("h", "ready", None);
+        assert_eq!(cleared.sessions[0].routes.len(), 1);
+        assert_eq!(cleared.sessions[0].routes[0].state, "recovered");
+        let mut later = fixture(3, "alpha", 503);
+        later["providerAccount"] = json!("later@example.com");
+        ledger.ingest(later.to_string().as_bytes());
         let view = ledger.snapshot("h", "ready", None);
         let routes = &view.sessions[0].routes;
-        assert_eq!(routes.len(), 2);
-        assert_eq!(routes[0].state, "recovered");
-        assert_eq!(routes[1].state, "failed");
-        assert!(routes[1].detail.contains("恢复时间未记录"));
-        assert_eq!(view.sessions[0].notes[1].kind, "失败");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].state, "failed");
+        assert!(routes[0].current);
+        assert!(routes[0].detail.contains("恢复时间未记录"));
+        assert_eq!(view.sessions[0].notes[1].kind, "会话");
     }
 
     /// 请求开始时间可逆序，最新与恢复必须按文件完成顺序判断。

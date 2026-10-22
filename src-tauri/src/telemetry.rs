@@ -40,16 +40,25 @@ pub struct Quotas {
 }
 
 /// 用量页包含内部路由调用；保留其费用口径，不从日志拼凑或推算模型单价。
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct Usage {
     pub since: String,
     pub calls: u64,
     pub cost: f64,
     #[serde(default)] pub unpriced: u64,
+    /// 全局小时费用；网关没有会话级序列，不能据此拆分会话。
+    #[serde(default, rename = "series")] pub hourly: Vec<HourlyCost>,
     #[serde(default)] pub sessions: Vec<SessionCost>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
+pub struct HourlyCost {
+    pub time: String,
+    pub cost: f64,
+    #[serde(default)] pub unpriced: u64,
+}
+
+#[derive(Clone, Default, Deserialize)]
 pub struct SessionCost {
     pub id: String,
     pub calls: u64,
@@ -64,9 +73,17 @@ pub struct Telemetry {
     pub quota_error: Option<String>,
     pub usage: Option<Usage>,
     pub cost_error: Option<String>,
+    hourly: crate::hourly::HourlyCosts,
 }
 
 impl Telemetry {
+    /// 全局小时费用直接取网关序列；会话序列不存在，只记录之后的真实累计增量。
+    pub fn update_usage(&mut self, usage: Usage, host: &str) {
+        self.hourly.observe(&usage, chrono::Local::now(), host);
+        self.cost_error = self.hourly.error.clone();
+        self.usage = Some(usage);
+    }
+
     /// 网关成功返回也可能有单个账号的供应商错误；留住该账号上次有效窗口。
     pub fn update_quotas(&mut self, mut next: Vec<Quota>) {
         for quota in &mut next {
@@ -98,6 +115,7 @@ impl Telemetry {
             return;
         }
         fill_cost(&mut view.daily, usage.calls, usage.cost, usage.unpriced);
+        self.hourly.apply(view, usage);
         for session in &mut view.sessions {
             let mut matches = usage.sessions.iter().filter(|cost| cost.id == session.id);
             if let Some(cost) = matches.next() {
@@ -112,9 +130,12 @@ impl Telemetry {
 fn fill_cost(stats: &mut crate::usage::DailyStats, calls: u64, cost: f64, unpriced: u64) {
     if cost.is_finite() && cost >= 0.0 && unpriced <= calls {
         // 所有请求未定价时 0 只是缺价格的结果，不能显示为真实零费用。
-        stats.cost = (calls == 0 || calls > unpriced).then_some(cost);
-        stats.priced_requests = calls - unpriced;
+        let priced = calls - unpriced;
+        stats.cost = (calls == 0 || priced > 0).then_some(cost);
+        stats.priced_requests = priced;
         stats.unpriced_requests = unpriced;
+        // 分母是网关已定价调用，包含日志排除的内部路由；不是 JSONL 完成行数。
+        stats.cost_per_call = (priced > 0).then_some(cost / priced as f64);
     }
 }
 
@@ -127,22 +148,29 @@ mod tests {
     fn cost_keeps_gateway_scope_and_cannot_leak_across_days() {
         let now = chrono::Local::now();
         let mut telemetry = Telemetry { usage: Some(Usage {
-            since: now.to_rfc3339(), calls: 5, cost: 1.25, unpriced: 2, sessions: vec![],
+            since: now.to_rfc3339(), calls: 5, cost: 1.25, unpriced: 2, hourly: vec![], sessions: vec![],
         }), ..Default::default() };
         let mut view = UsageLedger::new(now.date_naive()).snapshot("h", "ready", None);
         telemetry.apply(&mut view);
         assert_eq!(view.daily.cost, Some(1.25));
         assert_eq!(view.daily.priced_requests, 3);
+        assert_eq!(view.daily.cost_per_call, Some(1.25 / 3.0));
         assert_eq!(view.daily.requests, 0); // 费用覆盖不会改写完成账本
         view.date = (now.date_naive() + chrono::Duration::days(1)).to_string();
         view.daily.cost = None;
+        view.daily.cost_per_call = None;
         telemetry.apply(&mut view);
         assert_eq!(view.daily.cost, None);
+        assert_eq!(view.daily.cost_per_call, None);
         assert!(view.cost_error.is_some());
         telemetry.usage.as_mut().unwrap().unpriced = 5;
         view.date = now.date_naive().to_string();
         telemetry.apply(&mut view);
         assert_eq!(view.daily.cost, None);
+        assert_eq!(view.daily.cost_per_call, None);
+        telemetry.usage.as_mut().unwrap().unpriced = 9;
+        telemetry.apply(&mut view);
+        assert_eq!(view.daily.cost_per_call, None);
     }
 
     #[test]

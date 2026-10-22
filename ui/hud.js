@@ -16,6 +16,11 @@
   const branchViews = new Map();
   const quotaViews = new Map();
   const subagentNumbers = new Map();
+  const childPresence = new Map();
+  const childSessions = new Map();
+  let childPresenceDate = '';
+  const childGraceMs = 10_000;
+  let childGraceTimer = 0;
   let quotaRenderKey = '';
   let quotaOrderTimer = 0;
 
@@ -26,13 +31,14 @@
     element.title = value;
   }
 
-  /** 大数仅用于可读展示，精确值由统计块的 title 提供。 */
+  const compactFormat = new Intl.NumberFormat('en', {
+    notation: 'compact', minimumSignificantDigits: 3, maximumSignificantDigits: 3, useGrouping: false,
+  });
+
+  /** 数量缩写保留三位有效数字，千以下保持整数；精确值留在悬停说明。 */
   function compact(value) {
     const number = Math.round(Number(value));
-    if (number >= 1e9) return `${Math.round(number / 1e9)}B`;
-    if (number >= 1e6) return `${Math.round(number / 1e6)}M`;
-    if (number >= 1e3) return `${Math.round(number / 1e3)}k`;
-    return number.toLocaleString('zh-CN');
+    return number < 1000 ? String(number) : compactFormat.format(number).replace('K', 'k');
   }
 
   /** 缩略账号本地部分，完整账号留在可访问名称和提示中。 */
@@ -102,9 +108,10 @@
   /** 展示统一为完成、运行、异常三类；异常类别按取消、失败、未知区分。 */
   function statusInfo(card) {
     switch (card.state) {
+      case 'intermission': return ['', '间歇', 'intermission'];
       case 'delegating': return ['', '子任务', 'delegating'];
-      case 'running':
-      case 'waiting': return ['', '运行', 'running'];
+      case 'running': return ['', '运行', 'running'];
+      case 'waiting': return ['', '运行', 'waiting'];
       case 'success':
       case 'recovered': return ['√', '完成', 'success'];
       case 'cancelled': return ['x', '取消', 'error'];
@@ -171,7 +178,7 @@
     tag.dataset.status = status;
     tag.setAttribute('aria-label', state);
     tag.title = [state, card.detail].filter(Boolean).join('\n');
-    if (status === 'running') {
+    if (['running', 'waiting'].includes(status)) {
       const spinner = document.createElementNS(namespace, 'svg');
       spinner.setAttribute('class', 'request-spinner');
       spinner.setAttribute('viewBox', '0 0 20 20');
@@ -244,20 +251,114 @@
     return (session.subagents || []).filter(card => ['running', 'waiting'].includes(card.state));
   }
 
+  /** 活跃消失时开始十秒保留，重复快照不续期，新请求沿用同一子项位置。 */
+  function updateChildPresence(next) {
+    if (childPresenceDate !== next.date) {
+      childPresence.clear();
+      childSessions.clear();
+      childPresenceDate = next.date;
+    }
+    const sessions = new Set(next.sessions.map(session => session.id));
+    const now = performance.now();
+    for (const [id, entries] of childPresence) {
+      if (!sessions.has(id)) {
+        for (const entry of entries.values()) if (entry.goneAt === null) entry.goneAt = now;
+      }
+    }
+    for (const session of next.sessions) {
+      childSessions.set(session.id, session);
+      const entries = childPresence.get(session.id) || new Map();
+      const active = activeSubagents(session);
+      const ids = new Set(active.map(card => card.subagentId || card.id));
+      for (const [id, entry] of entries) {
+        if (!ids.has(id) && entry.goneAt === null) entry.goneAt = now;
+      }
+      for (const card of active) entries.set(card.subagentId || card.id, { card, goneAt: null });
+      if (entries.size) childPresence.set(session.id, entries);
+    }
+    expireChildPresence();
+  }
+
+  function expireChildPresence() {
+    clearTimeout(childGraceTimer);
+    const now = performance.now();
+    let remaining = Infinity;
+    for (const [session, entries] of childPresence) {
+      for (const [id, entry] of entries) {
+        if (entry.goneAt === null) continue;
+        const delay = entry.goneAt + childGraceMs - now;
+        if (delay <= 0) entries.delete(id);
+        else remaining = Math.min(remaining, delay);
+      }
+      if (!entries.size) childPresence.delete(session);
+    }
+    for (const id of childSessions.keys()) {
+      if (!childPresence.has(id)) childSessions.delete(id);
+    }
+    if (Number.isFinite(remaining)) {
+      childGraceTimer = setTimeout(() => {
+        expireChildPresence();
+        updateSelector(sessionsForView());
+        render(false);
+      }, remaining + 1);
+    }
+  }
+
+  function retainedSubagents(session) {
+    return [...(childPresence.get(session.id)?.values() || [])].filter(entry => entry.goneAt !== null).map(entry => {
+      const previous = entry.card;
+      const done = (session.completedSubagents || []).find(card => card.subagentId === previous.subagentId
+        && card.routeId != null && card.routeId === previous.routeId);
+      if (done) return { ...done, id: previous.id, grace: true };
+      const detail = '模型请求暂时结束，等待下一次请求或最终用量；空闲满 10 秒后收起';
+      return { ...previous, state: 'intermission', current: false, grace: true, error: null, detail,
+        note: { ...previous.note, kind: '间歇', text: detail } };
+    });
+  }
+
+  /** 总览保留短暂间歇的子项；会话详情补入每个子 Agent 的最近完成记录。 */
+  function subagentsForView(session, includeCompleted = false) {
+    const active = activeSubagents(session);
+    const activeIds = new Set(active.map(card => card.subagentId || card.id));
+    const retained = retainedSubagents(session).filter(card => !activeIds.has(card.subagentId || card.id));
+    if (!includeCompleted) {
+      const ranks = new Map([...(childPresence.get(session.id)?.keys() || [])].map((id, index) => [id, index]));
+      return [...active, ...retained].sort((a, b) => (ranks.get(a.subagentId || a.id) ?? Infinity) - (ranks.get(b.subagentId || b.id) ?? Infinity));
+    }
+    const retainedIds = new Set(retained.map(card => card.subagentId || card.id));
+    const completed = (session.completedSubagents || []).filter(card => !activeIds.has(card.subagentId || card.id) && !retainedIds.has(card.subagentId || card.id));
+    return [...active, ...retained, ...completed];
+  }
+
+  /** 没有完成日志的临时会话也保留子项锚点，但不保留已失活的根请求。 */
+  function sessionsForView() {
+    const sessions = [...snapshot.sessions];
+    const ids = new Set(sessions.map(session => session.id));
+    for (const [id, session] of childSessions) {
+      if (!ids.has(id) && childPresence.has(id)) sessions.push({ ...session, routes: [], subagents: [] });
+    }
+    return sessions;
+  }
+
+  function hasSessionContent(session) {
+    return session.routes.length || subagentsForView(session).length || (session.completedSubagents || []).length;
+  }
+
   function subagentName(card, session) {
     const id = card.subagentId || card.id;
     if (!subagentNumbers.has(session.id)) subagentNumbers.set(session.id, new Map());
     const numbers = subagentNumbers.get(session.id);
     if (!numbers.has(id)) numbers.set(id, numbers.size + 1);
     const label = card.subagentLabel || '';
-    return label && !/^子\s*Agent(?:\s|$)/i.test(label) ? label : `子 Agent ${numbers.get(id)}`;
+    return label && label !== `子 Agent ${id.slice(0, 8)}` ? label : `子 Agent ${numbers.get(id)}`;
   }
 
-  /** 主会话与子请求共用模型、状态及指标渲染，子项仅重新排列成一行。 */
+  /** 共用模型与状态渲染，子项独立按内容排成紧凑的一行。 */
   function createSubagent(card, session) {
     const button = createCard(card, session);
     button.classList.add('subagent-row');
     button.dataset.subagentId = card.subagentId || card.id;
+    button.dataset.grace = String(Boolean(card.grace));
     const label = subagentName(card, session);
     button.querySelector('.session-title').textContent = label;
     button.title = `${label}\n子 Agent ID: ${card.subagentId || card.id}\n${button.title}`;
@@ -266,6 +367,7 @@
     metrics.title = metrics.title.replaceAll('该会话', '该子 Agent');
     const copy = button.querySelector('.card-copy');
     const name = copy.querySelector('.session-title');
+    name.title = label;
     const state = copy.querySelector('.state-tag');
     const model = copy.querySelector('.card-model');
     const account = copy.querySelector('.card-account');
@@ -281,8 +383,8 @@
     const note = session.notes[0];
     return {
       id: `parent-${session.id}`, sessionId: session.id, sessionLabel: session.label,
-      account: '账号未提供', model: '子 Agent 请求中', provider: '', effort: '待定',
-      state: 'delegating', detail: '主会话当前没有模型请求，下方为活跃子 Agent',
+      account: '账号未提供', model: activeSubagents(session).length ? '子 Agent 请求中' : '子 Agent 请求记录', provider: '', effort: '待定',
+      state: 'delegating', detail: '主会话暂无独立请求记录，下方为子 Agent 请求',
       error: null, time: note.time, current: true, tokens: null, tokensPerSecond: null,
       metricsArePrevious: false, note,
     };
@@ -297,23 +399,48 @@
     });
   }
 
+  /** 六项数值和可聚焦区域共用完整说明，避免数字节点自己的 title 遮住详情。 */
+  function metric(id, valueId, value, detail) {
+    text(valueId, value);
+    const element = byId(id);
+    element.title = detail;
+    element.setAttribute('aria-label', detail);
+    byId(valueId).title = detail;
+  }
+
+  function callCost(value) {
+    if (!Number.isFinite(value)) return '—';
+    if (value > 0 && value < .01) return '<$0.01';
+    return `$${value.toFixed(value < 10 ? 2 : value < 100 ? 1 : 0)}`;
+  }
+
   /** 当日输出速度为 Σout / Σ(ms−ttft_ms)，不把输入或缓存读计为输出吞吐。 */
   function renderStats(stats, scope) {
     text('stats-date', snapshot.date.slice(5));
-    const short = innerHeight <= 420;
-    const tokens = short ? new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 0 }).format(stats.tokens) : compact(stats.tokens);
-    text('daily-tokens', tokens);
-    byId('hud').dataset.costStale = String(Boolean(snapshot.costError));
-    text('request-count', `${stats.requests.toLocaleString('zh-CN')} 次请求`);
-    byId('tokens-metric').title = `当日 Token ${stats.tokens.toLocaleString('zh-CN')}；输入 + 输出 + 缓存读取，不含 kind=routing 的内部分类调用`;
+    const tokens = compact(stats.tokens);
+    text('request-count', `${stats.requests} 次请求`);
+    metric('tokens-metric', 'daily-tokens', tokens, `Token · ${scope}\n当日 ${stats.tokens.toLocaleString('zh-CN')} Token；输入 + 输出 + 缓存读取，不含内部分类调用。`);
     text('cost-status', snapshot.costError ? '旧读数' : '');
-    text('daily-cost', stats.cost == null ? '未定价' : `$${stats.cost.toFixed(short && stats.cost >= 100 ? 0 : 2)}`);
     text('cost-unit', stats.cost == null ? '' : 'USD');
     text('cost-coverage', stats.cost == null ? (stats.unpricedRequests ? `${stats.unpricedRequests} 条未定价` : '等待 Magpie 费用') : `${stats.pricedRequests} 条已定价${stats.unpricedRequests ? ` · ${stats.unpricedRequests} 条未定价` : ''}${snapshot.costError ? ' · 旧读数' : ''}`);
-    byId('cost-metric').title = `${stats.cost == null ? '未定价' : `$${stats.cost.toFixed(2)} USD`}\n${snapshot.costError || 'Magpie 按模型价格计算的当日美元等价费用，沿用 Magpie 用量页口径（含内部路由）；订阅账号的金额是使用量估值，未定价请求不计入。'}`;
-    text('daily-speed', stats.tokensPerSecond === null ? '—' : stats.tokensPerSecond.toFixed(1));
-    byId('speed-metric').title = `最近 10 个会话加权输出速度 = Σ输出 Token / Σ(总耗时 − 首字耗时)；${stats.speedSamples} 条有效记录，不包含等待首字的时间。选中单个会话时只显示该会话。`;
+    metric('cost-metric', 'daily-cost', callCost(stats.cost),
+      `费用估值 · ${scope}\n${stats.cost == null ? '未定价' : `$${stats.cost.toFixed(6)} USD`}\n${snapshot.costError || 'Magpie 当日美元等价费用，含内部分类调用；订阅账号为用量估值。'}\n${stats.pricedRequests} 次已定价，${stats.unpricedRequests} 次未定价。`);
+    metric('speed-metric', 'daily-speed', Number.isFinite(stats.tokensPerSecond) ? compactFormat.format(stats.tokensPerSecond).replace('K', 'k') : '—',
+      `TPS · ${scope}\n${Number.isFinite(stats.tokensPerSecond) ? `${stats.tokensPerSecond.toFixed(3)} tok/s\n` : ''}${sessionSpeedScope(scope)}加权输出速度 = Σ输出 Token / Σ(总耗时 − 首字耗时)；${stats.speedSamples} 条有效记录，不包含等待首字的时间。`);
+    const cache = stats.cacheHitRate;
+    metric('cache-metric', 'daily-cache', Number.isFinite(cache) ? `${(cache * 100).toFixed(1)}%` : '—',
+      `缓存命中率 · ${scope}\n${Number.isFinite(cache) ? `${(cache * 100).toFixed(3)}%` : '暂无有效缓存输入'}\n缓存读取 Token / (输入 Token + 缓存读取 Token)，按完成请求加权；不含输出与内部分类调用。`);
+    metric('calls-metric', 'daily-calls', String(stats.requests),
+      `调用次数 · ${scope}\n当日 ${stats.requests} 次已结束调用，含主会话和子 Agent，不含内部分类调用。`);
+    const average = stats.costPerCall;
+    metric('average-metric', 'daily-average', callCost(average), `单次调用费用 · ${scope}\n${Number.isFinite(average)
+      ? `$${average.toFixed(8)} USD / 次 = Magpie 费用 / ${stats.pricedRequests} 次已定价调用（含内部分类），不计未定价调用。${snapshot.costError ? '\n费用为旧读数' : ''}`
+      : '暂无可用的已定价调用，等待 Magpie 费用读数。'}`);
     text('stats-scope', scope);
+  }
+
+  function sessionSpeedScope(scope) {
+    return scope === '全部会话' ? '最近 10 个会话' : '当前会话';
   }
 
   /** 来源按真实 Agent 合并，最多两个时与 Magpie 纵向排列，给会话留出宽度。 */
@@ -495,8 +622,9 @@
     if (!quotaOrderTimer) quotaOrderTimer = setTimeout(() => { quotaOrderTimer = 0; render(false); }, 60_000);
     hud.dataset.layout = innerWidth / innerHeight < 1.25 || innerWidth < 680 ? 'tall' : 'wide';
     if (!snapshot) return;
-    const visibleSessions = snapshot.sessions.filter(item => item.routes.length || activeSubagents(item).length);
-    const session = visibleSessions.find(item => item.id === selector.value);
+    const allSessions = sessionsForView().filter(hasSessionContent);
+    const visibleSessions = allSessions.filter(item => item.routes.length || subagentsForView(item).length);
+    const session = allSessions.find(item => item.id === selector.value);
     const active = visibleSessions.filter(item => item.routes.some(card => ['running', 'waiting'].includes(card.state)) || activeSubagents(item).length);
     const recent = visibleSessions.filter(item => !active.includes(item));
     const chooseSessions = () => session ? [session] : [...active, ...recent.slice(0, Math.max(0, visibleSessionCapacity() - active.length))];
@@ -509,6 +637,10 @@
     renderSources(sessions);
     if (hud.dataset.sources === 'multiple' && innerWidth < 980) hud.dataset.layout = 'tall';
     renderStats(session ? session.daily : snapshot.daily, session ? session.label : '全部会话');
+    window.dispatchEvent(new CustomEvent('hud-hourly-update', { detail: {
+      hourly: (session ? session.daily : snapshot.daily).hourly,
+      date: snapshot.date, scope: session ? session.label : '全部会话', error: snapshot.costError,
+    } }));
     renderQuotas(session ? [session] : snapshot.sessions, forceQuotaOrder);
     if (hud.dataset.layout === 'tall') {
       sessions = chooseSessions();
@@ -527,7 +659,7 @@
       const group = document.createElement('div');
       group.className = 'session-group';
       group.dataset.sessionId = item.id;
-      const children = activeSubagents(item);
+      const children = subagentsForView(item, Boolean(session));
       const parents = item.routes.length ? item.routes.slice(0, 4) : [parentAnchor(item)];
       parents.forEach(card => { group.append(createCard(card, item)); rememberCard(card); });
       if (children.length) {
@@ -535,7 +667,7 @@
         const list = document.createElement('div');
         list.className = 'subagent-list';
         list.setAttribute('role', 'group');
-        list.setAttribute('aria-label', `${item.label}的活跃子 Agent`);
+        list.setAttribute('aria-label', `${item.label}的${session ? '子 Agent 请求' : '活跃子 Agent'}`);
         children.forEach(card => { list.append(createSubagent(card, item)); rememberCard(card); });
         group.append(list);
       }
@@ -545,8 +677,11 @@
     routeList.hidden = sessions.length === 0;
     routeList.scrollTop = oldScroll;
     byId('empty-route').hidden = sessions.length > 0;
-    byId('inbound-active').style.opacity = sessions.length ? '1' : '0';
-    const picked = sessions.flatMap(item => [...item.routes, ...activeSubagents(item)]).find(card => card.id === selectedCard);
+    const inbound = byId('inbound-active');
+    const hasRequests = sessions.some(item => item.routes.some(card => ['running', 'waiting'].includes(card.state)) || activeSubagents(item).length);
+    inbound.classList.toggle('flowing', hasRequests);
+    inbound.style.opacity = sessions.length ? '1' : '0';
+    const picked = sessions.flatMap(item => [...item.routes, ...subagentsForView(item, Boolean(session))]).find(card => card.id === selectedCard);
     if (picked) renderNotes([picked.note, sessions.find(item => item.id === picked.sessionId).notes[1]]);
     else { selectedCard = null; renderNotes(session ? session.notes : snapshot.notes); }
     renderedIds = currentIds;
@@ -588,7 +723,8 @@
       const rectangle = card.getBoundingClientRect();
       const x = rectangle.left - layer.left;
       const y = rectangle.top + rectangle.height / 2 - layer.top;
-      const id = card.dataset.cardId;
+      const id = card.classList.contains('subagent-row')
+        ? JSON.stringify([card.closest('.session-group').dataset.sessionId, card.dataset.subagentId]) : card.dataset.cardId;
       visibleIds.add(id);
       let view = branchViews.get(id);
       const isNew = !view;
@@ -599,8 +735,7 @@
         branchViews.set(id, view);
       }
       const { path } = view;
-      const state = card.classList.contains('waiting') ? 'running'
-        : [...card.classList].find(name => ['running', 'success', 'recovered', 'failed', 'cancelled', 'unknown', 'delegating'].includes(name)) || 'unknown';
+      const state = [...card.classList].find(name => ['running', 'waiting', 'success', 'recovered', 'failed', 'cancelled', 'unknown', 'delegating', 'intermission'].includes(name)) || 'unknown';
       const isChild = card.classList.contains('subagent-row');
       if (isChild) {
         const parent = card.closest('.session-group').querySelector('.route-card:not(.subagent-row)').getBoundingClientRect();
@@ -609,11 +744,12 @@
       } else path.setAttribute('d', tall
         ? `M${startX} ${origin}V${bendY}H${trunkX}V${Math.max(bendY, y - 16)}Q${trunkX} ${y} ${x} ${y}`
         : `M${startX} ${origin}C${startX + Math.max(18, (x - startX) * .45)} ${origin} ${startX + Math.max(18, (x - startX) * .25)} ${y} ${x} ${y}`);
-      if (state === 'running') {
+      if (['running', 'waiting'].includes(state)) {
         if (!view.base) {
           view.base = document.createElementNS(namespace, 'path');
           view.base.setAttribute('class', 'branch-base');
         }
+        view.base.setAttribute('class', `branch-base ${state}`);
         view.base.setAttribute('d', path.getAttribute('d'));
         place(view.base);
       } else if (view.base) {
@@ -645,10 +781,10 @@
 
   /** 完整 ID 用于选择，显示会话名；不会把两个前缀相同的会话合并。 */
   function updateSelector(sessions) {
-    sessions = sessions.filter(item => item.routes.length || activeSubagents(item).length);
+    sessions = sessions.filter(hasSessionContent);
     const previous = selector.value;
     const options = [new Option('最近会话', '*')];
-    sessions.forEach(session => options.push(new Option(`${session.label} · ${shortAccount(session.routes[0]?.account || activeSubagents(session)[0]?.account || '账号未提供')}`, session.id)));
+    sessions.forEach(session => options.push(new Option(`${session.label} · ${shortAccount(session.routes[0]?.account || activeSubagents(session)[0]?.account || session.completedSubagents?.[0]?.account || '账号未提供')}`, session.id)));
     selector.replaceChildren(...options);
     selector.value = sessions.some(session => session.id === previous) ? previous : '*';
   }
@@ -658,7 +794,8 @@
     if (snapshot && next.revision < snapshot.revision) return;
     if (snapshot && next.revision === snapshot.revision) return;
     snapshot = next;
-    updateSelector(next.sessions);
+    updateChildPresence(next);
+    updateSelector(sessionsForView());
     render(animate);
   }
 
@@ -670,6 +807,11 @@
 
   /** 先完成事件订阅，再拉取后端已缓存快照；只在 Tauri 环境访问原生 API。 */
   async function start() {
+    // 失焦时 Windows 把 Acrylic 换成纯灰，改由样式铺深色底；恢复焦点再交还模糊玻璃。
+    const syncFocus = focused => { hud.dataset.focus = String(focused); };
+    window.addEventListener('focus', () => syncFocus(true));
+    window.addEventListener('blur', () => syncFocus(false));
+    syncFocus(document.hasFocus());
     selector.addEventListener('change', () => { selectedCard = null; renderedIds.clear(); quotaOrderTimer = clearTimeout(quotaOrderTimer); render(false); });
     routeList.addEventListener('scroll', () => requestDraw(), { passive: true });
     new ResizeObserver(() => render(false)).observe(hud);

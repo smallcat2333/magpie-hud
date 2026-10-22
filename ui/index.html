@@ -4,16 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Magpie HUD V.0.0.23(2026/10/21)</title>
+  <title>Magpie HUD V.0.0.25(2026/10/21)</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="hud.css?v=0.0.23">
-  <script src="hud.js?v=0.0.23" defer></script>
+  <link rel="stylesheet" href="hud.css?v=0.0.25-20261022-compact">
+  <script src="hourly.js?v=0.0.25-20261022-compact" defer></script>
+  <script src="hud.js?v=0.0.25" defer></script>
 </head>
 <body>
-<main class="hud" id="hud" data-state="waiting" data-sources="compact">
+<main class="hud" id="hud" data-state="waiting" data-sources="compact" data-focus="true">
   <header class="window-bar" id="drag-region" data-tauri-drag-region>
     <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg>
-    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.0.0.23(2026/10/21)</span></h1><span class="brand-subtitle">路由监视</span>
+    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.0.0.25(2026/10/21)</span></h1><span class="brand-subtitle">路由监视</span>
     <span class="watch-state" id="watch-label" role="status">等待今日记录</span>
     <label class="scope-label" for="session-select">查看</label>
     <select id="session-select" aria-label="按会话查看路由"><option value="*">最近会话</option></select>
@@ -31,10 +32,21 @@
       <div class="daily-heading"><strong>当日</strong><time id="stats-date">—</time></div>
       <dl>
         <div class="metric" id="tokens-metric" tabindex="0"><dt>Token</dt><dd id="daily-tokens">—</dd><small id="request-count">等待记录</small></div>
-        <div class="metric" id="cost-metric" tabindex="0"><dt>费用估值 <span id="cost-unit"></span> <span id="cost-status" role="status"></span></dt><dd id="daily-cost">未定价</dd><small id="cost-coverage">等待 Magpie 费用</small></div>
         <div class="metric" id="speed-metric" tabindex="0"><dt>TPS <span>tok/s</span></dt><dd id="daily-speed">—</dd><small>最近 10 个会话</small></div>
+        <div class="metric" id="cost-metric" tabindex="0"><dt>费用估值 <span id="cost-unit"></span> <span id="cost-status" role="status"></span></dt><dd id="daily-cost">未定价</dd><small id="cost-coverage">等待 Magpie 费用</small></div>
+        <div class="metric secondary-metric" id="cache-metric" tabindex="0"><dt><span class="label-wide">缓存命中</span><span class="label-compact">缓存</span></dt><dd id="daily-cache">—</dd></div>
+        <div class="metric secondary-metric" id="calls-metric" tabindex="0"><dt><span class="label-wide">调用次数</span><span class="label-compact">调用</span></dt><dd id="daily-calls">0</dd></div>
+        <div class="metric secondary-metric" id="average-metric" tabindex="0"><dt><span class="label-wide">均次费用</span><span class="label-compact">$/次</span></dt><dd id="daily-average">—</dd></div>
       </dl>
       <span class="stats-scope" id="stats-scope">全部会话</span>
+    </section>
+    <section class="hourly" aria-label="今日每小时 Token 与金额">
+      <div class="hourly-heading"><span class="hourly-key"><i class="hourly-bar-key" aria-hidden="true"></i>Token</span><span class="hourly-key"><i class="hourly-line-key" aria-hidden="true"></i>金额</span></div>
+      <div id="hourly-plot" class="hourly-plot" tabindex="0" role="group" aria-label="24 小时趋势，左右方向键查看每小时数值">
+        <svg id="hourly-chart" class="hourly-chart" aria-hidden="true"></svg>
+        <div id="hourly-tooltip" class="hourly-tooltip" role="status" hidden></div>
+      </div>
+      <table id="hourly-table" class="hourly-table"><caption>每小时明细</caption><thead><tr><th>时段</th><th>Token</th><th>USD</th></tr></thead><tbody></tbody></table>
     </section>
     <section class="quota" aria-labelledby="quota-heading">
       <div class="quota-heading"><h2 id="quota-heading">用量</h2><span id="quota-freshness"></span></div>
