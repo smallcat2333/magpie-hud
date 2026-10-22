@@ -74,7 +74,7 @@
       ['huaweicloud-color', /huawei|盘古/],
       ['volcengine-color', /volcengine|ark|火山/],
       ['doubao-color', /doubao|豆包/],
-      ['zai', /\bzai\b/],
+      ['zai', /\bzai\b|glm|zhipu|智谱/],
       ['together-color', /together/],
       ['fireworks-color', /fireworks/],
       ['nvidia-color', /nvidia|nemotron/],
@@ -99,7 +99,6 @@
       ['grok', /grok/],
       ['gemini-color', /gemini/],
       ['deepseek-color', /deepseek/],
-      ['zhipu-color', /glm|zhipu|智谱/],
     ];
     const match = families.find(([, pattern]) => pattern.test(name));
     return match ? match[0] : null;
