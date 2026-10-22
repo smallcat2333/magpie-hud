@@ -528,8 +528,7 @@
       list.append(empty);
     } else if (entries.length && empty) empty.remove();
     const quotaFailed = snapshot.quotaError || [...quotaViews.values()].some(view => view.item.dataset.stale === 'true');
-    text('quota-freshness', quotaFailed ? '旧读数' : '');
-    byId('quota-freshness').title = snapshot.quotaError || (readings.length ? `最近读数 ${new Date(Math.min(...readings)).toLocaleString('zh-CN')}` : '暂无额度读数');
+    list.title = [quotaFailed ? '旧读数' : '', snapshot.quotaError || (readings.length ? `最近读数 ${new Date(Math.min(...readings)).toLocaleString('zh-CN')}` : '暂无额度读数')].filter(Boolean).join('\n');
     list.scrollTop = scroll;
   }
 

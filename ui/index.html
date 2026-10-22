@@ -7,8 +7,8 @@
   <title>Magpie HUD V.0.0.25(2026/10/21)</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
   <link rel="stylesheet" href="hud.css?v=0.0.25-20261022-compact">
-  <script src="hourly.js?v=0.0.25-20261022-compact" defer></script>
-  <script src="hud.js?v=0.0.25" defer></script>
+  <script src="hourly.js?v=0.0.25-20261022-four-ticks" defer></script>
+  <script src="hud.js?v=0.0.25-20261022-no-quota-heading" defer></script>
 </head>
 <body>
 <main class="hud" id="hud" data-state="waiting" data-sources="compact" data-focus="true">
@@ -48,8 +48,7 @@
       </div>
       <table id="hourly-table" class="hourly-table"><caption>每小时明细</caption><thead><tr><th>时段</th><th>Token</th><th>USD</th></tr></thead><tbody></tbody></table>
     </section>
-    <section class="quota" aria-labelledby="quota-heading">
-      <div class="quota-heading"><h2 id="quota-heading">用量</h2><span id="quota-freshness"></span></div>
+    <section class="quota" aria-label="账号用量">
       <div id="quota-list" class="quota-list"><p class="quota-empty">等待当前会话的额度</p></div>
     </section>
     </aside>

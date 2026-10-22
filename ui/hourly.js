@@ -152,7 +152,7 @@
       if (!costValues.length) fragment.append(element('text', { class: 'hourly-note', x: width - 2, y: 10, 'text-anchor': 'end' }, '金额待更新'));
       else if (series.some(item => item.partial)) fragment.append(element('text', { class: 'hourly-note', x: width - 2, y: 10, 'text-anchor': 'end' }, '部分观测'));
     }
-    for (const hour of [0, 4, 8, 12, 16, 20, 24]) fragment.append(element('text', {
+    for (const hour of [0, 8, 16, 24]) fragment.append(element('text', {
       class: 'hourly-tick', x: left + span * hour / 24, y: height - 3,
       'text-anchor': hour === 0 ? 'start' : hour === 24 ? 'end' : 'middle',
     }, `${hour}h`));
