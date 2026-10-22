@@ -1,6 +1,8 @@
 # 图标来源
 
-品牌资源来自 `@lobehub/icons-static-svg@1.95.1`，遵循本目录的 [MIT License](LICENSE)。
+品牌资源来自 `@lobehub/icons-static-svg@1.95.1`，新增的 WorkBuddy 与 GitHub Copilot 供应商图标来自 `1.97.0`，遵循本目录的 [MIT License](LICENSE)。
+
+2026-10-22 额度供应商图标：`workbuddy-color.svg` 来自 https://unpkg.com/@lobehub/icons-static-svg@1.97.0/icons/workbuddy-color.svg ，保留原始彩色；`githubcopilot.svg` 来自 https://unpkg.com/@lobehub/icons-static-svg@1.97.0/icons/githubcopilot.svg ，`currentColor` 固定为 `#f2f0f2`。额度按 Magpie 订阅页映射：codex/chatgpt-api → openai，workbuddy/workbuddy-ai → workbuddy-color，grok → xai，gemini → geminicli-color，copilot → githubcopilot；其余已知供应商沿用本地图标，未知显示中性符号。
 
 彩色资源保留上游 SVG 原样：
 

@@ -157,7 +157,7 @@
     const icon = document.createElement('span');
     icon.className = 'model-icon';
     const selecting = ['running', 'waiting'].includes(card.state) && card.account === '正在选择账号';
-    const family = selecting ? null : modelIcon(card.model);
+    const family = modelIcon(card.model);
     if (family) {
       const image = document.createElement('img');
       image.src = `icons/${family}.svg`;
@@ -473,7 +473,14 @@
     const model = copy.querySelector('.card-model');
     const account = copy.querySelector('.card-account');
     const effort = copy.querySelector('.effort');
-    button.replaceChildren(button.querySelector('.model-icon'), name, model, state, effort, metrics);
+    const created = document.createElement('time');
+    created.className = 'subagent-created';
+    const start = /^(\d{2}):(\d{2}):\d{2}$/.exec(card.time || '');
+    created.textContent = start ? `${start[1]}:${start[2]}` : '—';
+    if (start) created.dateTime = card.time;
+    created.title = start ? `请求创建时间 ${card.time}` : '请求创建时间未提供';
+    created.setAttribute('aria-label', created.title);
+    button.replaceChildren(button.querySelector('.model-icon'), name, model, created, state, effort, metrics);
     button.title += `\n账号: ${account.title}`;
     button.setAttribute('aria-label', button.title.replaceAll('\n', '，'));
     return button;
@@ -589,7 +596,9 @@
     for (const [key, { card, models }] of accounts) {
       const candidates = (snapshot.quotas || []).filter(quota =>
         quota.provider.toLowerCase() === card.provider.toLowerCase() &&
-        (quota.user ? quota.user === card.account : quota.kind === 'balance' && quota.name === card.account));
+        (quota.user ? quota.user === card.account
+          : quota.kind === 'balance' && quota.name === card.account
+            || quota.kind === 'plan' && quota.provider === 'opencode-go' && card.account === 'opencode.ai'));
       if (candidates.length !== 1) continue;
       const quota = candidates[0];
       const read = quota.readAt || quota.asOf;
@@ -630,6 +639,9 @@
     } else if (entries.length && empty) empty.remove();
     const quotaFailed = snapshot.quotaError || [...quotaViews.values()].some(view => view.item.dataset.stale === 'true');
     list.title = [quotaFailed ? '旧读数' : '', snapshot.quotaError || (readings.length ? `最近读数 ${new Date(Math.min(...readings)).toLocaleString('zh-CN')}` : '暂无额度读数')].filter(Boolean).join('\n');
+    const freshness = byId('quota-freshness');
+    freshness.hidden = !quotaFailed;
+    freshness.title = list.title;
     list.scrollTop = scroll;
   }
 
@@ -648,11 +660,31 @@
     return Number(match[1]) * scale;
   }
 
+  /** 额度使用供应商品牌，不根据供应商背后的模型猜测图标。 */
+  function quotaIcon(provider) {
+    const name = provider.toLowerCase().replace(/[-_\s]/g, '');
+    if (['codex', 'chatgpt', 'chatgptapi', 'openai'].includes(name)) return 'openai';
+    if (name.startsWith('workbuddy')) return 'workbuddy-color';
+    if (name === 'grok') return 'xai';
+    if (name === 'gemini') return 'geminicli-color';
+    if (name === 'copilot') return 'githubcopilot';
+    return modelIcon(provider);
+  }
+
   /** 只创建稳定元素，不在每次快照中重排。 */
   function createQuotaItem() {
     const item = document.createElement('div');
     item.className = 'quota-item';
     item.tabIndex = 0;
+    const icon = document.createElement('span');
+    icon.className = 'quota-icon';
+    const image = document.createElement('img');
+    image.alt = '';
+    image.hidden = true;
+    const fallback = document.createElement('span');
+    fallback.textContent = '◇';
+    fallback.setAttribute('aria-hidden', 'true');
+    icon.append(image, fallback);
     const header = document.createElement('div');
     header.className = 'quota-meta';
     const account = document.createElement('span');
@@ -672,8 +704,8 @@
     track.append(fill);
     const value = document.createElement('strong');
     row.append(label, track, value);
-    item.append(header, row);
-    return { item, account, reset, label, track, fill, value };
+    item.append(icon, header, row);
+    return { item, icon, image, fallback, account, reset, label, track, fill, value };
   }
 
   /** 重置倒计时使用两级单位；不足一分钟时不显示负数或虚假的零分钟。 */
@@ -690,7 +722,12 @@
   /** 更新同一额度项的数值和提示，不改变其在列表中的位置。 */
   function updateQuotaItem(view, { card, models, quota, span, windowName }) {
     view.item.dataset.stale = String(Boolean(snapshot.quotaError || quota.error));
-    view.account.textContent = shortAccount(card.account);
+    const family = quotaIcon(quota.provider);
+    if (family && view.image.getAttribute('src') !== `icons/${family}.svg`) view.image.src = `icons/${family}.svg`;
+    view.image.hidden = !family;
+    view.fallback.hidden = Boolean(family);
+    view.image.alt = quota.name || quota.provider;
+    view.account.textContent = !quota.user && quota.kind === 'plan' ? quota.name || card.account : shortAccount(card.account);
     view.account.title = card.account;
     const resetTime = span?.resetsAt && !Number.isNaN(Date.parse(span.resetsAt)) ? new Date(span.resetsAt) : null;
     const credits = /credits?|积分/i.test(`${span?.name || ''} ${span?.unit || ''}`);
@@ -729,10 +766,10 @@
         ? `${new Date(window.resetsAt).toLocaleString('zh-CN', { hour12: false })} 重置` : '重置时间未提供';
       return `${[window.family || window.pool, window.name || '额度'].filter(Boolean).join(' · ')} · ${status}\n${reset}`;
     });
-    view.item.title = [card.account, [...models].join(' · '), ...windows,
+    view.item.title = [quota.name || quota.provider, card.account, [...models].join(' · '), ...windows,
       quota.balance ? `余额 ${quota.balance}` : '', read ? `读数 ${read}` : '', snapshot.quotaError || quota.error || ''].filter(Boolean).join('\n');
     // 子节点使用同一提示，账号或重置时间自己的 title 不再遮住完整窗口清单。
-    [view.account, view.reset, view.track, view.value, view.label].forEach(element => { element.title = view.item.title; });
+    [view.icon, view.account, view.reset, view.track, view.value, view.label].forEach(element => { element.title = view.item.title; });
     view.item.setAttribute('aria-label', view.item.title.replaceAll('\n', '，'));
   }
 
@@ -745,6 +782,7 @@
     const allSessions = sessionsForView().filter(hasSessionContent);
     const visibleSessions = allSessions.filter(item => item.routes.length || subagentsForView(item).length);
     const session = allSessions.find(item => item.id === selector.value);
+    hud.dataset.scope = session ? 'session' : 'all';
     const { protectedSessions, recent } = orderedSessions(visibleSessions);
     const chooseSessions = () => session ? [session] : [...protectedSessions, ...recent.slice(0, Math.max(0, visibleSessionCapacity() - protectedSessions.length))];
     let sessions = chooseSessions();

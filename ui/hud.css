@@ -54,6 +54,11 @@
 .hourly{container-type:inline-size}.hourly-plot{--hourly-compact:0}.hourly-grid,.hourly-reference{fill:none;stroke:var(--muted);stroke-width:.6;vector-effect:non-scaling-stroke;pointer-events:none}.hourly-grid{stroke-dasharray:2 3;opacity:.28}.hourly-reference{opacity:.35}
 @container(max-width:180px){.hourly-heading{display:none}.hourly-plot{--hourly-compact:1;height:56px}.hourly-extreme{font-size:8px}.hourly-dot{r:2px}}
 @media(max-height:420px){.hud[data-layout="wide"] .hourly-heading{display:none}.hud[data-layout="wide"] .hourly-plot{--hourly-compact:1;height:56px}.hud[data-layout="wide"] .hourly-extreme{font-size:8px}.hud[data-layout="wide"] .hourly-dot{r:2px}}
+/* 供应商图标跨账号和窗口两行居中，正文继续在剩余宽度内省略。 */
+.quota-item{grid-template-columns:18px minmax(0,1fr);column-gap:6px}
+.quota-icon{grid-column:1;grid-row:1/3;align-self:center;display:grid;place-items:center;width:18px;height:18px;color:var(--muted)}
+.quota-icon img{display:block;width:18px;height:18px;object-fit:contain}
+.quota-meta,.quota-window{grid-column:2}
 /* 额度按已用原值分级；文字和进度使用同一状态色。 */
 .branch-trunk{stroke:var(--muted);opacity:.4}
 .quota-window{--quota-color:var(--stat-tokens)}
@@ -63,7 +68,9 @@
 .quota-window[data-severity="warning"] strong,.quota-window[data-severity="critical"] strong{color:var(--quota-color)}
 .quota-window[data-severity="critical"] .quota-track{background:rgb(255 79 94/.17)}
 /* 拉高窗口只增加侧栏细节和会话容量，不改变左右路由结构。 */
+.quota-heading{display:none}
 @media(min-height:541px){
+.quota-heading{display:flex}
 .hud[data-layout="wide"] .daily dl{grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 8px}
 .hud[data-layout="wide"] .daily .metric,.hud[data-layout="wide"] .daily #cost-metric{align-items:flex-start;gap:3px}
 .hud[data-layout="wide"] .daily .metric dt{position:static;width:auto;height:auto;margin:0;overflow:visible;clip-path:none;line-height:16px;white-space:nowrap}
@@ -88,11 +95,13 @@
 }
 /* 按卡片可用宽度显示时间和组路径，窄卡不挤压模型、状态与指标。 */
 .routes{container-type:inline-size}
-.card-time,.card-route-groups,.card-heading-account{display:none}
+.card-time,.card-route-groups,.card-heading-account,.subagent-created{display:none}
 .card-model{display:flex;align-items:center}
 .card-model-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .card-route-groups strong{font-weight:600;color:var(--ink)}
 @container(min-width:450px){
+.hud[data-layout="wide"][data-scope="session"] .subagent-row .subagent-created{display:block;flex:0 0 34px;margin-left:auto;text-align:center;font-size:11px;line-height:16px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.hud[data-layout="wide"][data-scope="session"] .subagent-row .subagent-created+.state-tag{margin-left:0}
 .hud[data-layout="wide"] .route-card:not(.subagent-row)>.card-copy{grid-template-columns:minmax(0,1fr) minmax(38px,72px) 44px 48px;column-gap:6px}
 .hud[data-layout="wide"] .route-card:not(.subagent-row) .card-heading-account{display:block;grid-column:2;grid-row:1;max-width:100%;font-size:11px;color:var(--muted)}
 .hud[data-layout="wide"] .route-card:not(.subagent-row) .card-time{display:flex;grid-column:3;grid-row:1/3;flex-direction:column;gap:6px;font-size:11px;line-height:15px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:center}
