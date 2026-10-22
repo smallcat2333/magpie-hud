@@ -72,7 +72,7 @@
     const span = width - 6;
     const slot = span / 24;
     const compact = getComputedStyle(plot).getPropertyValue('--hourly-compact').trim() === '1';
-    const top = compact ? 11 : 20;
+    const top = compact ? 11 : 26;
     const bottom = height - (compact ? 17 : 23);
     geometry = { width, left, slot };
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
@@ -87,7 +87,8 @@
     svg.dataset.costDomain = costMinMax.join(',');
     const y = (value, min, max) => bottom - (value - min) / (max - min) * (bottom - top);
     const x = hour => left + (hour + .5) * slot;
-    const barWidth = Math.max(1, Math.min(10, slot * .62));
+    // 每小时时段之间固定留 2px 细缝，宽图中柱宽随可用空间增大。
+    const barWidth = Math.max(1, slot - 2);
     for (const hour of [4, 8, 12, 16, 20]) fragment.append(element('line', {
       class: 'hourly-grid', x1: left + span * hour / 24, x2: left + span * hour / 24, y1: top, y2: bottom,
     }));
@@ -114,7 +115,7 @@
     });
     fragment.append(element('path', { class: 'hourly-cost', d: path.trim() }));
     const labels = [];
-    const labelTop = compact ? 10 : !costValues.length || series.some(item => item.partial) ? 25 : 11;
+    const labelTop = compact ? 10 : !costValues.length || series.some(item => item.partial) ? 25 : 18;
     const labelBottom = height - (compact ? 19 : 26);
     const labelGap = 13;
     measure.font = `${compact ? 8 : 9}px ${getComputedStyle(plot).fontFamily}`;
@@ -149,8 +150,8 @@
     extremes('tokens', tokenMin, tokenMax, value => number.format(value));
     extremes('cost', costMin, costMax, money);
     if (!compact) {
-      if (!costValues.length) fragment.append(element('text', { class: 'hourly-note', x: width - 2, y: 10, 'text-anchor': 'end' }, '金额待更新'));
-      else if (series.some(item => item.partial)) fragment.append(element('text', { class: 'hourly-note', x: width - 2, y: 10, 'text-anchor': 'end' }, '部分观测'));
+      if (!costValues.length) fragment.append(element('text', { class: 'hourly-note', x: 3, y: 10, 'text-anchor': 'start' }, '金额待更新'));
+      else if (series.some(item => item.partial)) fragment.append(element('text', { class: 'hourly-note', x: 3, y: 10, 'text-anchor': 'start' }, '部分观测'));
     }
     for (const hour of [0, 8, 16, 24]) fragment.append(element('text', {
       class: 'hourly-tick', x: left + span * hour / 24, y: height - 3,

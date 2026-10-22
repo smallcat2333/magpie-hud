@@ -19,8 +19,14 @@
   const childPresence = new Map();
   const childSessions = new Map();
   let childPresenceDate = '';
-  const childGraceMs = 10_000;
+  const childGraceMs = 60_000;
   let childGraceTimer = 0;
+  const sessionOrder = new Map();
+  const sessionGraceMs = 10 * 60_000;
+  let sessionOrderDate = '';
+  let sessionOrderTimer = 0;
+  let sessionOrderRank = 0;
+  let sessionFrontRank = 0;
   let quotaRenderKey = '';
   let quotaOrderTimer = 0;
 
@@ -119,6 +125,22 @@
     }
   }
 
+  /** 时间只更新文本，不触发卡片重建或会话重排。 */
+  function updateCardTimes() {
+    const now = Date.now();
+    routeList.querySelectorAll('.card-time').forEach(element => {
+      const updated = Date.parse(element.dataset.updatedAt);
+      const valid = Number.isFinite(updated);
+      element.querySelector('time').textContent = valid
+        ? new Date(updated).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }) : '—';
+      const seconds = valid ? Math.max(0, Math.floor((now - updated) / 1000)) : 0;
+      const active = element.closest('.route-card').matches('.running,.waiting');
+      element.querySelector('.card-age').textContent = active ? '--' : !valid ? '—' : seconds >= 3600
+        ? `${Math.floor(seconds / 3600)}h${Math.floor(seconds % 3600 / 60)}m`
+        : `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`;
+    });
+  }
+
   /** 创建一块两行路由卡；只有本地固定路径可用于图片 src。 */
   function createCard(card, session) {
     const button = document.createElement('button');
@@ -211,8 +233,23 @@
     separator.textContent = '·';
     const model = document.createElement('span');
     model.className = 'card-model';
-    model.textContent = /^(正在选择账号|正在选择模型|模型待定)$/.test(card.model) ? '正在选路' : card.model;
-    model.title = card.model;
+    const groups = Array.isArray(card.routeGroups) ? card.routeGroups.filter(group => typeof group === 'string' && group) : [];
+    const chain = document.createElement('span');
+    chain.className = 'card-route-groups';
+    groups.forEach(group => {
+      const name = document.createElement('strong');
+      name.textContent = group;
+      chain.append(name, document.createTextNode(' → '));
+    });
+    const modelName = document.createElement('span');
+    modelName.className = 'card-model-name';
+    modelName.textContent = /^(正在选择账号|正在选择模型|模型待定)$/.test(card.model) ? '正在选路' : card.model;
+    model.append(chain, modelName);
+    model.title = [...groups, card.model].join(' → ');
+    if (groups.length) {
+      button.title += `\n路由 ${model.title}`;
+      button.setAttribute('aria-label', button.title.replaceAll('\n', '，'));
+    }
     const effort = document.createElement('span');
     effort.className = 'effort';
     effort.textContent = /^(强度待确定|强度未提供|待定)$/.test(card.effort) ? '待定' : card.effort;
@@ -236,6 +273,19 @@
       ? '进行中请求尚无精确用量；这里显示该会话上一轮已完成请求。Token = 输入 + 输出 + 缓存读取；TPS = 输出 / (总耗时 − 首字耗时)。'
       : '本次请求 Token = 输入 + 输出 + 缓存读取；TPS = 输出 / (总耗时 − 首字耗时)。暂无上轮记录时，进行中等待最终用量。'].filter(Boolean).join('\n');
     metrics.append(tokens, speed);
+    const clock = document.createElement('span');
+    clock.className = 'card-time';
+    clock.dataset.updatedAt = card.updatedAt || '';
+    clock.setAttribute('aria-label', '更新时间与距今时长');
+    const updated = document.createElement('time');
+    updated.dateTime = card.updatedAt || '';
+    const age = document.createElement('span');
+    age.className = 'card-age';
+    clock.append(updated, age);
+    clock.title = card.updatedAt ? `最近请求活动 ${new Date(card.updatedAt).toLocaleString('zh-CN', { hour12: false })}` : '更新时间未提供';
+    const headingAccount = label.cloneNode(true);
+    headingAccount.classList.add('card-heading-account');
+    copy.append(headingAccount, clock);
     button.append(icon, copy, metrics);
     button.addEventListener('click', () => {
       selectedCard = card.id;
@@ -250,7 +300,59 @@
     return (session.subagents || []).filter(card => ['running', 'waiting'].includes(card.state));
   }
 
-  /** 活跃消失时开始十秒保留，重复快照不续期，新请求沿用同一子项位置。 */
+  function sessionIsActive(session) {
+    return session.routes.some(card => ['running', 'waiting'].includes(card.state)) || activeSubagents(session).length > 0;
+  }
+
+  /** 父会话独立保序十分钟；只有真实请求活动才重置，子项的一分钟保留不续期。 */
+  function updateSessionOrder(next) {
+    const now = performance.now();
+    const initial = sessionOrderDate !== next.date;
+    if (initial) {
+      sessionOrder.clear();
+      sessionOrderRank = 0;
+      sessionFrontRank = 0;
+      sessionOrderDate = next.date;
+    }
+    const newcomers = initial ? [] : next.sessions.filter(session => !sessionOrder.has(session.id));
+    sessionFrontRank -= newcomers.length;
+    const frontRanks = new Map(newcomers.map((session, index) => [session.id, sessionFrontRank + index]));
+    const ids = new Set(next.sessions.map(session => session.id));
+    for (const id of sessionOrder.keys()) if (!ids.has(id)) sessionOrder.delete(id);
+    for (const session of next.sessions) {
+      const active = sessionIsActive(session);
+      let entry = sessionOrder.get(session.id);
+      if (!entry) {
+        entry = { rank: frontRanks.has(session.id) ? frontRanks.get(session.id) : sessionOrderRank++,
+          idleAt: active ? null : initial ? -Infinity : now };
+        sessionOrder.set(session.id, entry);
+      } else if (active) {
+        if (entry.idleAt !== null && now - entry.idleAt >= sessionGraceMs) entry.rank = sessionOrderRank++;
+        entry.idleAt = null;
+      } else if (entry.idleAt === null) entry.idleAt = now;
+    }
+  }
+
+  function orderedSessions(sessions) {
+    clearTimeout(sessionOrderTimer);
+    const now = performance.now();
+    let remaining = Infinity;
+    const protectedSessions = [];
+    const recent = [];
+    for (const session of sessions) {
+      const entry = sessionOrder.get(session.id);
+      const delay = entry?.idleAt === null ? Infinity : (entry?.idleAt ?? -Infinity) + sessionGraceMs - now;
+      if (sessionIsActive(session) || delay > 0) {
+        protectedSessions.push(session);
+        if (Number.isFinite(delay)) remaining = Math.min(remaining, delay);
+      } else recent.push(session);
+    }
+    protectedSessions.sort((a, b) => (sessionOrder.get(a.id)?.rank ?? Infinity) - (sessionOrder.get(b.id)?.rank ?? Infinity));
+    if (Number.isFinite(remaining)) sessionOrderTimer = setTimeout(() => render(false), remaining + 1);
+    return { protectedSessions, recent };
+  }
+
+  /** 活跃消失时开始一分钟保留，重复快照不续期，新请求沿用同一子项位置。 */
   function updateChildPresence(next) {
     if (childPresenceDate !== next.date) {
       childPresence.clear();
@@ -309,7 +411,7 @@
       const done = (session.completedSubagents || []).find(card => card.subagentId === previous.subagentId
         && card.routeId != null && card.routeId === previous.routeId);
       if (done) return { ...done, id: previous.id, grace: true };
-      const detail = '模型请求暂时结束，等待下一次请求或最终用量；空闲满 10 秒后收起';
+      const detail = '模型请求暂时结束，等待下一次请求或最终用量；空闲满 1 分钟后收起';
       return { ...previous, state: 'intermission', current: false, grace: true, error: null, detail,
         note: { ...previous.note, kind: '间歇', text: detail } };
     });
@@ -591,14 +693,21 @@
     view.account.textContent = shortAccount(card.account);
     view.account.title = card.account;
     const resetTime = span?.resetsAt && !Number.isNaN(Date.parse(span.resetsAt)) ? new Date(span.resetsAt) : null;
-    view.reset.textContent = resetRemaining(resetTime);
-    view.reset.dateTime = resetTime ? span.resetsAt : '';
+    const credits = /credits?|积分/i.test(`${span?.name || ''} ${span?.unit || ''}`);
+    let remainingCredits = null;
+    if (credits && Number.isFinite(span.limit)) {
+      if (Number.isFinite(span.amount)) remainingCredits = Math.max(0, span.limit - span.amount);
+      else if (Number.isFinite(span.remaining)) remainingCredits = Math.max(0, span.limit * span.remaining / 100);
+      else if (Number.isFinite(span.used)) remainingCredits = Math.max(0, span.limit * (1 - span.used / 100));
+    }
+    view.reset.textContent = credits ? remainingCredits === null ? '—' : String(Number(remainingCredits.toFixed(2))) : resetRemaining(resetTime);
+    view.reset.dateTime = !credits && resetTime ? span.resetsAt : '';
     view.reset.title = resetTime ? `${resetTime.toLocaleString('zh-CN', { hour12: false })} 重置` : '重置时间未提供';
-    view.label.textContent = windowName;
+    view.label.textContent = credits ? '积分' : windowName;
     const used = span && !span.unlimited ? (Number.isFinite(span.used) ? span.used : Number.isFinite(span.remaining) ? 100 - span.remaining : null) : null;
     const percent = used === null ? null : Math.min(100, Math.max(0, used));
-    const summary = percent !== null ? `已用 ${percent.toFixed(0)}%` : span?.unlimited ? '不限量' : quota.balance || '未提供';
-    view.value.textContent = percent !== null ? `${percent.toFixed(0)}%` : span?.unlimited ? '∞' : '—';
+    const summary = percent !== null ? `已用 ${Number.isInteger(percent) ? percent : percent.toFixed(1)}%` : span?.unlimited ? '不限量' : quota.balance || '未提供';
+    view.value.textContent = percent !== null ? `${Number.isInteger(percent) ? percent : percent.toFixed(1)}%` : span?.unlimited ? '∞' : '—';
     view.track.setAttribute('aria-label', `${card.account} ${windowName} 已用额度`);
     view.track.setAttribute('aria-valuetext', summary);
     view.track.dataset.unknown = String(percent === null);
@@ -608,9 +717,22 @@
       view.track.setAttribute('aria-valuenow', String(percent));
       view.fill.style.width = `${percent}%`;
     } else view.fill.style.width = '0';
-    view.track.parentElement.dataset.low = String(percent !== null && percent >= 90);
+    const severity = percent === null ? 'unknown' : used > 98 ? 'critical' : used > 80 ? 'warning' : 'normal';
+    view.track.parentElement.dataset.severity = severity;
+    view.track.parentElement.dataset.low = String(severity === 'warning');
     const read = quota.readAt || quota.asOf;
-    view.item.title = [card.account, [...models].join(' · '), [span?.family || span?.pool, windowName, summary].filter(Boolean).join(' · '), view.reset.title, read ? `读数 ${read}` : '', snapshot.quotaError || quota.error || ''].filter(Boolean).join('\n');
+    const windows = (quota.windows || []).map(window => {
+      const used = window.unlimited ? null : Number.isFinite(window.used) ? window.used
+        : Number.isFinite(window.remaining) ? 100 - window.remaining : null;
+      const status = window.unlimited ? '不限量' : used === null ? '用量未提供' : `已用 ${Number.isInteger(used) ? used : used.toFixed(1)}%`;
+      const reset = window.resetsAt && !Number.isNaN(Date.parse(window.resetsAt))
+        ? `${new Date(window.resetsAt).toLocaleString('zh-CN', { hour12: false })} 重置` : '重置时间未提供';
+      return `${[window.family || window.pool, window.name || '额度'].filter(Boolean).join(' · ')} · ${status}\n${reset}`;
+    });
+    view.item.title = [card.account, [...models].join(' · '), ...windows,
+      quota.balance ? `余额 ${quota.balance}` : '', read ? `读数 ${read}` : '', snapshot.quotaError || quota.error || ''].filter(Boolean).join('\n');
+    // 子节点使用同一提示，账号或重置时间自己的 title 不再遮住完整窗口清单。
+    [view.account, view.reset, view.track, view.value, view.label].forEach(element => { element.title = view.item.title; });
     view.item.setAttribute('aria-label', view.item.title.replaceAll('\n', '，'));
   }
 
@@ -618,14 +740,13 @@
   function render(animate) {
     const forceQuotaOrder = !quotaOrderTimer;
     if (!quotaOrderTimer) quotaOrderTimer = setTimeout(() => { quotaOrderTimer = 0; render(false); }, 60_000);
-    hud.dataset.layout = innerWidth / innerHeight < 1.25 || innerWidth < 680 ? 'tall' : 'wide';
+    hud.dataset.layout = innerWidth < 680 ? 'tall' : 'wide';
     if (!snapshot) return;
     const allSessions = sessionsForView().filter(hasSessionContent);
     const visibleSessions = allSessions.filter(item => item.routes.length || subagentsForView(item).length);
     const session = allSessions.find(item => item.id === selector.value);
-    const active = visibleSessions.filter(item => item.routes.some(card => ['running', 'waiting'].includes(card.state)) || activeSubagents(item).length);
-    const recent = visibleSessions.filter(item => !active.includes(item));
-    const chooseSessions = () => session ? [session] : [...active, ...recent.slice(0, Math.max(0, visibleSessionCapacity() - active.length))];
+    const { protectedSessions, recent } = orderedSessions(visibleSessions);
+    const chooseSessions = () => session ? [session] : [...protectedSessions, ...recent.slice(0, Math.max(0, visibleSessionCapacity() - protectedSessions.length))];
     let sessions = chooseSessions();
     const oldScroll = routeList.scrollTop;
     hud.dataset.state = snapshot.state;
@@ -633,7 +754,6 @@
     byId('watch-label').title = snapshot.error || snapshot.watchLabel;
     text('router-host', snapshot.magpieHost);
     renderSources(sessions);
-    if (hud.dataset.sources === 'multiple' && innerWidth < 980) hud.dataset.layout = 'tall';
     renderStats(session ? session.daily : snapshot.daily, session ? session.label : '全部会话');
     window.dispatchEvent(new CustomEvent('hud-hourly-update', { detail: {
       hourly: (session ? session.daily : snapshot.daily).hourly,
@@ -683,6 +803,7 @@
     if (picked) renderNotes([picked.note, sessions.find(item => item.id === picked.sessionId).notes[1]]);
     else { selectedCard = null; renderNotes(session ? session.notes : snapshot.notes); }
     renderedIds = currentIds;
+    updateCardTimes();
     requestDraw(animate ? newIds : []);
   }
 
@@ -703,15 +824,33 @@
   function drawLines(newIds = []) {
     const layer = lineLayer.getBoundingClientRect();
     const router = document.querySelector('.router-emblem').getBoundingClientRect();
+    const node = document.querySelector('.router-node').getBoundingClientRect();
     const area = byId('route-area').getBoundingClientRect();
     const tall = hud.dataset.layout === 'tall';
-    const startX = (tall ? router.left + router.width / 2 : router.right) - layer.left;
-    const origin = (tall ? router.bottom : router.top + router.height / 2) - layer.top;
-    const trunkX = area.left - layer.left + 12;
-    const bendY = Math.max(origin + 6, area.top - layer.top - 6);
+    // 竖排从节点文字下方引出，避免连线穿过 magpie 名称和地址。
+    const startX = (tall ? node.left + node.width / 2 : router.right) - layer.left;
+    const origin = (tall ? node.bottom : router.top + router.height / 2) - layer.top;
     const visibleIds = new Set();
     lineLayer.setAttribute('viewBox', `0 0 ${layer.width} ${layer.height}`);
-    let previousNode = null;
+    const parents = [...routeList.querySelectorAll('.route-card:not(.subagent-row)')].map(card => card.getBoundingClientRect());
+    const columns = new Map();
+    if (tall) parents.forEach(rect => {
+      const x = Math.round(rect.left - layer.left) - 14;
+      columns.set(x, Math.max(columns.get(x) ?? 0, rect.top + rect.height / 2 - layer.top));
+    });
+    const busY = Math.max(origin + 12, area.top - layer.top + 12);
+    let trunk = lineLayer.querySelector('.branch-trunk');
+    if (tall && parents.length) {
+      if (!trunk) {
+        trunk = document.createElementNS(namespace, 'path');
+        trunk.setAttribute('class', 'branch-trunk');
+      }
+      // 所有列从卡片上方横向分流，列内竖线只占左侧预留走廊，不穿过卡片。
+      trunk.setAttribute('d', [...columns].map(([x, end]) =>
+        `M${startX} ${origin}C${startX} ${busY} ${x} ${origin} ${x} ${busY + 12}L${x} ${Math.max(end, busY + 12)}`).join(' '));
+      if (lineLayer.firstChild !== trunk) lineLayer.insertBefore(trunk, lineLayer.firstChild);
+    } else { trunk?.remove(); trunk = null; }
+    let previousNode = trunk;
     const place = node => {
       const next = previousNode ? previousNode.nextSibling : lineLayer.firstChild;
       if (next !== node) lineLayer.insertBefore(node, next);
@@ -738,10 +877,12 @@
       if (isChild) {
         const parent = card.closest('.session-group').querySelector('.route-card:not(.subagent-row)').getBoundingClientRect();
         const stemX = x - 10;
-        path.setAttribute('d', `M${stemX} ${parent.bottom - layer.top}V${y - 5}Q${stemX} ${y} ${stemX + 5} ${y}H${x}`);
-      } else path.setAttribute('d', tall
-        ? `M${startX} ${origin}V${bendY}H${trunkX}V${Math.max(bendY, y - 16)}Q${trunkX} ${y} ${x} ${y}`
-        : `M${startX} ${origin}C${startX + Math.max(18, (x - startX) * .45)} ${origin} ${startX + Math.max(18, (x - startX) * .25)} ${y} ${x} ${y}`);
+        path.setAttribute('d', `M${stemX} ${parent.bottom - layer.top}L${stemX} ${y - 7}C${stemX} ${y - 2} ${x - 5} ${y} ${x} ${y}`);
+      } else if (tall) {
+        const spine = Math.round(x) - 14;
+        path.setAttribute('d', `M${spine} ${y - 12}C${spine} ${y - 4} ${x - 8} ${y} ${x} ${y}`);
+      } else path.setAttribute('d',
+        `M${startX} ${origin}C${startX + Math.max(18, (x - startX) * .45)} ${origin} ${startX + Math.max(18, (x - startX) * .25)} ${y} ${x} ${y}`);
       if (['running', 'waiting'].includes(state)) {
         if (!view.base) {
           view.base = document.createElementNS(namespace, 'path');
@@ -793,6 +934,7 @@
     if (snapshot && next.revision === snapshot.revision) return;
     snapshot = next;
     updateChildPresence(next);
+    updateSessionOrder(next);
     updateSelector(sessionsForView());
     render(animate);
   }
@@ -812,7 +954,10 @@
     syncFocus(document.hasFocus());
     selector.addEventListener('change', () => { selectedCard = null; renderedIds.clear(); quotaOrderTimer = clearTimeout(quotaOrderTimer); render(false); });
     routeList.addEventListener('scroll', () => requestDraw(), { passive: true });
+    setInterval(updateCardTimes, 1000);
     new ResizeObserver(() => render(false)).observe(hud);
+    new ResizeObserver(() => requestDraw()).observe(document.querySelector('.routing'));
+    document.querySelector('.content').addEventListener('scroll', () => requestDraw(), { passive: true });
     reduced.addEventListener('change', () => requestDraw());
     document.addEventListener('visibilitychange', () => { if (!document.hidden) render(false); });
     if (!window.__TAURI__) {

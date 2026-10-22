@@ -136,6 +136,18 @@ impl Record {
         }
     }
 
+    /// 日志的 t 是请求开始时间，ms 是本请求耗时；完成时刻为二者之和。
+    /// 不随轮询变化，刷新不会给已结束的卡续期。
+    fn updated_at(&self) -> Option<String> {
+        // 只用有限的非负耗时；超大值饱和转换，不截断成 24 小时。
+        let duration = self.duration_ms
+            .filter(|ms| ms.is_finite() && *ms >= 0.0)
+            .map(|ms| if ms >= i64::MAX as f64 { i64::MAX } else { ms as i64 })
+            .unwrap_or(0);
+        let finished = self.timestamp_ms.saturating_add(duration);
+        DateTime::from_timestamp_millis(finished).map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    }
+
     /// 输出带原始状态码的简短中文说明，不虚构重试间隔。
     fn detail(&self, recovered: bool) -> String {
         match self.outcome() {
@@ -219,6 +231,14 @@ pub struct RouteCard {
     /// 不含正文的通用标签。缺省时前端用「子 Agent」加短 ID。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_label: Option<String>,
+    /// 实际命中的组链，从父组到子组，不含最终模型。只有实时 trace 的选中尝试
+    /// 能确定；日志与无法唯一判定时为空，不用候选全集拼链。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_groups: Vec<String>,
+    /// 最近真实请求活动时刻（RFC3339 UTC）。活跃卡随进度推进；完成卡固定为
+    /// 真实完成时刻，刷新不会续期。旧快照与无法确定时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
     pub note: Note,
 }
 
@@ -483,6 +503,8 @@ impl UsageLedger {
                     metrics_are_previous: false,
                     subagent_id: (!record.subagent.is_empty()).then(|| record.subagent.clone()),
                     subagent_label: (!record.subagent.is_empty()).then(|| crate::live::fallback_child_label(&record.subagent)),
+                    route_groups: Vec::new(),
+                    updated_at: record.updated_at(),
                     note: record.note(recovered),
                 }
             };
@@ -1029,6 +1051,30 @@ mod tests {
         let view = ledger.snapshot("h", "ready", None);
         assert_eq!(view.sessions[0].id, "beta");
         assert_eq!(view.sessions[1].routes[0].state, "recovered");
+    }
+
+    /// 完成卡的 updatedAt 是 t + ms 的真实完成时刻，刷新不随轮询续期。
+    #[test]
+    fn completed_card_updated_at_uses_finish_time_and_stays_fixed() {
+        let mut ledger = ledger();
+        ledger.ingest(fixture(1, "alpha", 200).to_string().as_bytes());
+        let first = ledger.snapshot("h", "ready", None);
+        let card = &first.sessions[0].routes[0];
+        assert_eq!(card.updated_at.as_deref(), Some("2026-10-20T00:00:04.000Z"));
+        // 现有 time 槽仍是日志里的开始时间 HH:mm:ss（本地时区）。
+        let expected_time = DateTime::parse_from_rfc3339("2026-10-20T00:00:01Z").unwrap()
+            .with_timezone(&Local).format("%H:%M:%S").to_string();
+        assert_eq!(card.time, expected_time);
+        assert!(card.route_groups.is_empty(), "日志没有完整组链，不能猜");
+        // 重复快照与毫秒缺失都不改变已结束卡的时间。
+        let second = ledger.snapshot("h", "ready", None);
+        assert_eq!(second.sessions[0].routes[0].updated_at, card.updated_at);
+        let mut no_duration = fixture(2, "beta", 200);
+        no_duration.as_object_mut().unwrap().remove("ms");
+        ledger.ingest(no_duration.to_string().as_bytes());
+        let view = ledger.snapshot("h", "ready", None);
+        let beta = view.sessions.iter().find(|session| session.id == "beta").unwrap();
+        assert_eq!(beta.routes[0].updated_at.as_deref(), Some("2026-10-20T00:00:02.000Z"));
     }
 
     /// 跨日清空且坏行不清掉有效画面。

@@ -40,10 +40,33 @@ pub struct LiveRoute {
     pub first_text: Option<u64>,
     #[serde(default)]
     pub kind: String,
+    /// 入口组；子组及其归属只用于把选中尝试映射回实际组链。
+    #[serde(default)]
+    pub group: Option<RouteGroup>,
     #[serde(default)]
     pub order: Option<Vec<Candidate>>,
     #[serde(default)]
     pub tries: Option<Vec<Attempt>>,
+}
+
+/// 组链信息只保留组名与直接子组，不读取成员账号或规则。
+#[derive(Clone, Default, Deserialize)]
+pub struct RouteGroup {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub subs: Vec<RouteSubgroup>,
+}
+
+/// 子组通过 `in` 指回父组；`via` 出现在候选行，值是子组的 id 或 ref。
+#[derive(Clone, Default, Deserialize)]
+pub struct RouteSubgroup {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, rename = "ref")]
+    pub reference: String,
+    #[serde(default)]
+    pub name: String,
 }
 
 /// 路由候选的账号归属，仅按尝试 id 精确匹配。
@@ -57,6 +80,9 @@ pub struct Candidate {
     pub model: String,
     #[serde(default)]
     pub who: String,
+    /// 该候选实际经过的子组 id（通常是直接子组，不含父组）。
+    #[serde(default)]
+    pub via: Vec<String>,
 }
 
 /// 当前尝试用于显示真实模型、强度以及是否已结束。
@@ -67,6 +93,9 @@ pub struct Attempt {
     pub model: String,
     #[serde(default)]
     pub effort: String,
+    /// 该尝试被最终选中；用于已结束 trace 在没有 active 时定位实际路径。
+    #[serde(default)]
+    pub picked: bool,
     #[serde(default)]
     pub done: bool,
     #[serde(default, rename = "firstText")]
@@ -130,6 +159,17 @@ impl LiveState {
 
     /// 用活跃请求覆盖展示，不改账本中的次数、费用与当日 Token。
     pub fn apply(&self, view: &mut RouteSnapshot) {
+        // 账本卡没有完整链，按日志 route_id 复用同一条已结束 trace；只补空链，
+        // 不改日志算出的 time/updatedAt。活跃卡稍后由自身选中尝试单独计算。
+        for session in &mut view.sessions {
+            for card in session.routes.iter_mut().chain(session.completed_subagents.iter_mut())
+                .filter(|card| card.route_groups.is_empty()) {
+                if let Some(chain) = card.route_id.and_then(|id| self.routes.get(&id))
+                    .map(trace_chain).filter(|chain| !chain.is_empty()) {
+                    card.route_groups = chain;
+                }
+            }
+        }
         let mut active_sessions = HashSet::new();
         let mut child_sessions = HashSet::new();
         // 根上轮只取根卡片；子 Agent 上轮按子 ID 单独保存，互不混用。
@@ -228,6 +268,8 @@ impl LiveState {
                 metrics_are_previous: previous.is_some(),
                 subagent_id: child.map(str::to_owned),
                 subagent_label: child.map(|id| self.child_label(session_id, id)),
+                route_groups: route.map(|r| route_chain(r, attempt, candidate)).unwrap_or_default(),
+                updated_at: started.map(|start| updated_at(start, active.ms)),
                 note: note.clone(),
             };
             if child.is_some() {
@@ -343,6 +385,56 @@ fn selected_candidate<'a>(route: &'a LiveRoute, attempt: &Attempt) -> Option<&'a
         }
     }
     identity
+}
+
+/// 实际组链只认选中尝试匹配到的候选行：候选行的 via 是子组 id/ref，
+/// 经 group.subs 映射成组名；再前置入口组名。观测到的 via 只有一个子组；
+/// 多 token 的顺序语义未验证，同 id 多行 via 不一致、token 无法映射或缺 via
+/// 时返回空链（或仅入口组），绝不把候选全集串成一条假路径。
+fn route_chain(route: &LiveRoute, attempt: Option<&Attempt>, candidate: Option<&Candidate>) -> Vec<String> {
+    let Some(group) = route.group.as_ref() else { return Vec::new(); };
+    if group.name.trim().is_empty() { return Vec::new(); }
+    let Some(attempt) = attempt else { return Vec::new(); };
+    if attempt.id.is_empty() { return Vec::new(); }
+    // 账号身份已由 selected_candidate 确认的候选行。
+    let Some(candidate) = candidate else { return vec![group.name.clone()]; };
+    let vias: std::collections::BTreeSet<&str> = route.order.as_deref().unwrap_or_default().iter()
+        .filter(|row| row.id == attempt.id && row.model == candidate.model
+            && row.provider == candidate.provider && row.who == candidate.who)
+        .flat_map(|row| row.via.iter().map(String::as_str))
+        .collect();
+    if vias.len() > 1 { return Vec::new(); }
+    let mut chain = vec![group.name.clone()];
+    for via in vias {
+        let Some(subgroup) = group.subs.iter().find(|sub| sub.id == via || sub.reference == via) else {
+            return Vec::new();
+        };
+        if subgroup.name.trim().is_empty() { return Vec::new(); }
+        if !chain.contains(&subgroup.name) { chain.push(subgroup.name.clone()); }
+    }
+    chain
+}
+
+/// 已结束的 trace 行没有 active 可定位选中尝试；优先用被选中且已结束的尝试。
+/// 没有 picked 时仅在唯一尝试上使用。身份无法唯一确认时留空，不借入口组。
+fn trace_chain(route: &LiveRoute) -> Vec<String> {
+    let Some(group) = route.group.as_ref() else { return Vec::new(); };
+    if group.name.trim().is_empty() { return Vec::new(); }
+    let tries = route.tries.as_deref().unwrap_or_default();
+    let attempt = tries.iter().rev().find(|attempt| attempt.picked && attempt.done)
+        .or_else(|| tries.iter().rev().find(|attempt| attempt.picked))
+        .or_else(|| (tries.len() == 1).then(|| &tries[0]));
+    let Some(attempt) = attempt else { return Vec::new(); };
+    if attempt.id.is_empty() { return Vec::new(); }
+    let Some(candidate) = selected_candidate(route, attempt) else { return Vec::new(); };
+    route_chain(route, Some(attempt), Some(&candidate))
+}
+
+/// 活跃卡的更新时间跟随 Magpie 报告的已用时长；start 不可解析时由调用方留空。
+fn updated_at(start: DateTime<chrono::FixedOffset>, elapsed_ms: u64) -> String {
+    (start + chrono::Duration::milliseconds(elapsed_ms.min(i64::MAX as u64) as i64))
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// 来源文案与日志口径一致。
@@ -630,6 +722,44 @@ mod tests {
     use super::*;
     use crate::usage::UsageLedger;
 
+    /// 完成卡从同 route_id 的 trace 补组链，但保留日志算出的完成时间；
+    /// 没有同 id 的 trace 时保持空链并继续显示完成时间。
+    #[test]
+    fn completed_card_reuses_trace_chain_without_renewing_time() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        let row = serde_json::json!({"route_id":7,"t":now.to_rfc3339(),"session":"alpha",
+            "providerAccount":"one@example.com","provider":"codex","model":"gpt-test",
+            "status":200,"in":10,"out":10,"ms":2000,"req":"group/smart-split"});
+        ledger.ingest(row.to_string().as_bytes());
+        let mut live = LiveState::default();
+        live.routes.insert(7, LiveRoute { id: 7, session: "alpha".into(), done: true,
+            group: Some(RouteGroup { name: "自动".into(), subs: vec![
+                RouteSubgroup { id: "sub-a".into(), name: "干活".into(), ..Default::default() },
+            ], ..Default::default() }),
+            order: Some(vec![Candidate { id: "seat".into(), provider: "codex".into(),
+                model: "gpt-test".into(), who: "one@example.com".into(), via: vec!["sub-a".into()] }]),
+            tries: Some(vec![Attempt { id: "seat".into(), model: "gpt-test".into(), picked: true, done: true, ..Default::default() }]),
+            ..Default::default() });
+        let mut view = ledger.snapshot("h", "ready", None);
+        let baseline_time = view.sessions[0].routes[0].updated_at.clone();
+        live.apply(&mut view);
+        let card = view.sessions[0].routes.iter()
+            .find(|card| card.route_id == Some(7) && !card.id.starts_with("live-")).unwrap();
+        assert_eq!(card.route_groups, vec!["自动", "干活"]);
+        assert_eq!(card.updated_at, baseline_time, "复用组链不得改写完成时间");
+
+        // 同会话但 route_id 不匹配的 trace 不能被借用。
+        live.routes.clear();
+        live.routes.insert(70, LiveRoute { id: 70, group: Some(RouteGroup { name: "其他".into(), ..Default::default() }), ..Default::default() });
+        let mut unmatched = ledger.snapshot("h", "ready", None);
+        live.apply(&mut unmatched);
+        let card = unmatched.sessions[0].routes.iter()
+            .find(|card| card.route_id == Some(7) && !card.id.starts_with("live-")).unwrap();
+        assert!(card.route_groups.is_empty());
+        assert_eq!(card.updated_at, baseline_time);
+    }
+
     /// 活跃请求提前显示，不重复累计；完成与失联都停止活跃态。
     #[test]
     fn live_overlay_does_not_count_unfinished_usage() {
@@ -682,7 +812,7 @@ mod tests {
         live.activity.active[0].ms = FIRST_RESPONSE_WAIT_MS - 1;
         live.routes.insert(10, LiveRoute { id: 10, session: "alpha".into(),
             order: Some(vec![Candidate { id: "seat".into(), provider: "codex".into(),
-                model: "gpt-test".into(), who: "current@example.com".into() }]),
+                model: "gpt-test".into(), who: "current@example.com".into(), ..Default::default() }]),
             tries: Some(vec![Attempt { id: "seat".into(), model: "gpt-test".into(), effort: "xhigh".into(), ..Default::default() }]),
             ..Default::default() });
         let mut upstream = baseline.clone();
@@ -1050,8 +1180,8 @@ mod tests {
     #[test]
     fn selected_candidate_accepts_duplicate_model_rows_with_same_identity() {
         let route = LiveRoute { order: Some(vec![
-            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into() },
-            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into() },
+            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into(), ..Default::default() },
+            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into(), ..Default::default() },
         ]), ..Default::default() };
         let selected = selected_candidate(&route, &Attempt {
             id: "seat".into(), model: "model-a".into(), ..Default::default()
@@ -1064,9 +1194,9 @@ mod tests {
     #[test]
     fn selected_candidate_accepts_missing_model_only_with_same_identity() {
         let route = LiveRoute { order: Some(vec![
-            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into() },
-            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-b".into(), who: "account-a".into() },
-            Candidate { id: "other-seat".into(), provider: "provider-b".into(), model: "model-a".into(), who: "account-b".into() },
+            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into(), ..Default::default() },
+            Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-b".into(), who: "account-a".into(), ..Default::default() },
+            Candidate { id: "other-seat".into(), provider: "provider-b".into(), model: "model-a".into(), who: "account-b".into(), ..Default::default() },
         ]), ..Default::default() };
         let selected = selected_candidate(&route, &Attempt { id: "seat".into(), ..Default::default() });
         assert_eq!(selected.map(|candidate| (candidate.provider.as_str(), candidate.who.as_str())),
@@ -1078,8 +1208,8 @@ mod tests {
     fn selected_candidate_rejects_conflicting_account_or_provider() {
         for (provider, who) in [("provider-a", "account-b"), ("provider-b", "account-a")] {
             let route = LiveRoute { order: Some(vec![
-                Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into() },
-                Candidate { id: "seat".into(), provider: provider.into(), model: "model-a".into(), who: who.into() },
+                Candidate { id: "seat".into(), provider: "provider-a".into(), model: "model-a".into(), who: "account-a".into(), ..Default::default() },
+                Candidate { id: "seat".into(), provider: provider.into(), model: "model-a".into(), who: who.into(), ..Default::default() },
             ]), ..Default::default() };
             for model in ["model-a", ""] {
                 assert!(selected_candidate(&route, &Attempt {
@@ -1105,9 +1235,9 @@ mod tests {
         assert!(gateway_url("127.0.0.1:3425").is_ok());
         assert!(gateway_url("example.com:3425").is_err());
         let route = LiveRoute { provider: "grok".into(), order: Some(vec![
-            Candidate { id: "grok".into(), provider: "grok".into(), model: "grok-test".into(), who: "grok@example.com".into() },
-            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6.1".into(), who: "gpt@example.com".into() },
-            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6".into(), who: "other@example.com".into() },
+            Candidate { id: "grok".into(), provider: "grok".into(), model: "grok-test".into(), who: "grok@example.com".into(), ..Default::default() },
+            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6.1".into(), who: "gpt@example.com".into(), ..Default::default() },
+            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6".into(), who: "other@example.com".into(), ..Default::default() },
         ]), ..Default::default() };
         let selected = selected_candidate(&route, &Attempt { id: "codex".into(), model: "gpt-6.1".into(), ..Default::default() });
         assert_eq!(selected.map(|c| (c.provider.as_str(), c.who.as_str())), Some(("codex", "gpt@example.com")));
@@ -1116,18 +1246,86 @@ mod tests {
         assert!(selected_candidate(&legacy, &Attempt { id: "grok".into(), model: "grok-test".into(), ..Default::default() }).is_some());
         // 当前登录账号的休息键是 provider，组内每个模型各有一行。
         let shared = LiveRoute { order: Some(vec![
-            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6".into(), who: "one@example.com".into() },
-            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6.1".into(), who: "one@example.com".into() },
-            Candidate { id: "codex@two@example.com".into(), provider: "codex".into(), model: "gpt-6".into(), who: "two@example.com".into() },
+            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6".into(), who: "one@example.com".into(), ..Default::default() },
+            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6.1".into(), who: "one@example.com".into(), ..Default::default() },
+            Candidate { id: "codex@two@example.com".into(), provider: "codex".into(), model: "gpt-6".into(), who: "two@example.com".into(), ..Default::default() },
         ]), ..Default::default() };
         let signed_in = selected_candidate(&shared, &Attempt { id: "codex".into(), model: "gpt-6.1".into(), ..Default::default() });
         assert_eq!(signed_in.map(|c| (c.provider.as_str(), c.who.as_str())), Some(("codex", "one@example.com")));
         // 模型不在计划里，或同一键对应不同账号时，保持选择中，不用请求模型补身份。
         assert!(selected_candidate(&shared, &Attempt { id: "codex".into(), model: "gpt-other".into(), ..Default::default() }).is_none());
         let conflict = LiveRoute { order: Some(vec![
-            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6".into(), who: "one@example.com".into() },
-            Candidate { id: "codex".into(), provider: "other".into(), model: "gpt-6".into(), who: "one@example.com".into() },
+            Candidate { id: "codex".into(), provider: "codex".into(), model: "gpt-6".into(), who: "one@example.com".into(), ..Default::default() },
+            Candidate { id: "codex".into(), provider: "other".into(), model: "gpt-6".into(), who: "one@example.com".into(), ..Default::default() },
         ]), ..Default::default() };
         assert!(selected_candidate(&conflict, &Attempt { id: "codex".into(), model: "gpt-6".into(), ..Default::default() }).is_none());
+    }
+
+    /// 组链只跟随选中尝试的 via，并经子组 id/ref 映射组名；不含最终模型。
+    #[test]
+    fn route_chain_follows_selected_attempt_only() {
+        let route = LiveRoute {
+            group: Some(RouteGroup { name: "自动".into(),
+                subs: vec![
+                    RouteSubgroup { id: "sub-a".into(), reference: "ref-a".into(), name: "干活".into() },
+                    RouteSubgroup { id: "sub-b".into(), reference: "ref-b".into(), name: "deepseek".into() },
+                ] }),
+            order: Some(vec![
+                Candidate { id: "seat".into(), provider: "p".into(), model: "m".into(), who: "a@example.com".into(), via: vec!["ref-a".into()] },
+                Candidate { id: "other".into(), provider: "p".into(), model: "m".into(), who: "b@example.com".into(), via: vec!["sub-b".into()] },
+            ]),
+            ..Default::default()
+        };
+        let attempt = Attempt { id: "seat".into(), model: "m".into(), ..Default::default() };
+        let candidate = selected_candidate(&route, &attempt).unwrap();
+        assert_eq!(route_chain(&route, Some(&attempt), Some(candidate)), vec!["自动", "干活"]);
+
+        // 选中的候选缺少 via：只报入口组，绝不借用其它候选的子组。
+        let legacy = LiveRoute {
+            group: route.group.clone(),
+            order: Some(vec![Candidate { id: "seat".into(), provider: "p".into(), model: "m".into(), who: "a@example.com".into(), ..Default::default() }]),
+            ..Default::default()
+        };
+        let candidate = selected_candidate(&legacy, &attempt).unwrap();
+        assert_eq!(route_chain(&legacy, Some(&attempt), Some(candidate)), vec!["自动"]);
+    }
+
+    /// 同一尝试 id 的多行给出不同 via 时无法判定实际子组，整条链留空。
+    #[test]
+    fn route_chain_rejects_conflicting_or_unknown_via() {
+        let group = Some(RouteGroup { name: "自动".into(),
+            subs: vec![RouteSubgroup { id: "sub-a".into(), name: "干活".into(), ..Default::default() }], ..Default::default() });
+        let attempt = Attempt { id: "seat".into(), model: "m".into(), ..Default::default() };
+        let candidate = Candidate { id: "seat".into(), provider: "p".into(), model: "m".into(), who: "a@example.com".into(), ..Default::default() };
+        let conflicting = LiveRoute { group: group.clone(), order: Some(vec![
+            Candidate { via: vec!["sub-a".into()], ..candidate.clone() },
+            Candidate { via: vec!["unknown".into()], ..candidate.clone() },
+        ]), ..Default::default() };
+        assert!(route_chain(&conflicting, Some(&attempt), Some(&candidate)).is_empty());
+        let unknown = LiveRoute { group, order: Some(vec![
+            Candidate { via: vec!["unknown".into()], ..candidate.clone() },
+        ]), ..Default::default() };
+        assert!(route_chain(&unknown, Some(&attempt), Some(&candidate)).is_empty());
+        // 旧 trace 没有 group：不猜链。
+        assert!(route_chain(&LiveRoute::default(), Some(&attempt), Some(&candidate)).is_empty());
+    }
+
+    /// 活跃卡 updatedAt 取 start + 已用毫秒，按 UTC 毫秒精度输出。
+    #[test]
+    fn active_card_updated_at_tracks_elapsed_time() {
+        let now = Local::now();
+        let mut live = LiveState::default();
+        live.activity.active.push(Active { id: 1, session: "alpha".into(), agent: "test".into(),
+            started: now.to_rfc3339(), ms: 3_200, phase: "upstream".into(), route: 10, ..Active::default() });
+        live.routes.insert(10, LiveRoute { id: 10, session: "alpha".into(), ..LiveRoute::default() });
+        let ledger = UsageLedger::new(now.date_naive());
+        let mut view = ledger.snapshot("h", "ready", None);
+        live.apply(&mut view);
+        let card = &view.sessions[0].routes[0];
+        assert_eq!(card.updated_at.as_deref(), Some(updated_at(now.into(), 3_200).as_str()));
+        assert!(card.updated_at.as_deref().unwrap().ends_with('Z'));
+        assert_eq!(card.time.len(), 8);
+        // 无子组信息时组链为空，不用模型名填充。
+        assert!(card.route_groups.is_empty());
     }
 }
