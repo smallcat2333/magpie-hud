@@ -13,6 +13,7 @@
   let frame = 0;
   let context = '';
   let geometry = null;
+  let animateUpdate = false;
   const measure = document.createElement('canvas').getContext('2d');
 
   function element(tag, attrs, text) {
@@ -158,7 +159,33 @@
       'text-anchor': hour === 0 ? 'start' : hour === 24 ? 'end' : 'middle',
     }, `${hour}h`));
     fragment.append(element('line', { class: 'hourly-cursor', x1: 0, x2: 0, y1: top - 3, y2: bottom, hidden: '' }));
+    const previousBars = new Map([...svg.querySelectorAll('.hourly-bar')].map(bar => [bar.dataset.hour, Number(bar.getAttribute('height'))]));
+    const previousLine = svg.querySelector('.hourly-cost')?.getAttribute('d');
     svg.replaceChildren(fragment);
+    if (animateUpdate && window.hudMotion.enabled()) {
+      svg.querySelectorAll('.hourly-bar').forEach(bar => {
+        const height = Number(bar.getAttribute('height'));
+        const previous = previousBars.get(bar.dataset.hour) || 0;
+        if (height > 0 && Math.abs(height - previous) > .1) {
+          bar.style.transformOrigin = `${Number(bar.getAttribute('x'))}px ${bottom}px`;
+          window.hudMotion.animate(bar, [{ transform: `scaleY(${previous / height})` }, { transform: 'scaleY(1)' }], 480);
+        }
+      });
+      const line = svg.querySelector('.hourly-cost');
+      if (previousLine && line.getAttribute('d') && line.getAttribute('d') !== previousLine) {
+        const oldPoints = previousLine.match(/[ML][^ML]+/g) || [];
+        const nextPoints = line.getAttribute('d').match(/[ML][^ML]+/g) || [];
+        // 新整点从已有末端延伸，不清空历史线段或重新描线。
+        if (nextPoints.length >= oldPoints.length && oldPoints.length) {
+          const from = nextPoints.map((point, index) => index < oldPoints.length - 1 ? point
+            : `${point[0]}${oldPoints.at(-1).slice(1)}`).join(' ');
+          if (nextPoints.every((point, index) => index >= oldPoints.length || point[0] === oldPoints[index][0])) {
+            window.hudMotion.animate(line, [{ d: `path("${from}")` }, { d: `path("${line.getAttribute('d')}")` }], 480);
+          }
+        }
+      }
+    }
+    animateUpdate = false;
     if (activeHour != null) inspect(activeHour);
   }
 
@@ -182,6 +209,7 @@
     const nextKey = JSON.stringify([hourly, date, scope, error, new Date().getHours()]);
     if (nextKey === key) return;
     key = nextKey;
+    animateUpdate = true;
     const today = date === new Date().toLocaleDateString('en-CA');
     series = Array.from({ length: 24 }, (_, hour) => {
       const value = hourly?.[hour];

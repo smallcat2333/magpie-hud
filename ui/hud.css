@@ -111,6 +111,11 @@
 .hud[data-layout="wide"] .route-card:not(.subagent-row) .card-route-groups{display:block;flex:0 1 auto;max-width:65%;overflow:hidden;text-overflow:ellipsis;white-space:pre}
 .hud[data-layout="wide"] .route-card:not(.subagent-row) .card-model-name{flex:1 1 auto}
 }
+/* 数据过渡只使用局部图层，不改变卡片布局尺寸。 */
+.metric dd{position:relative}
+.metric-incoming{display:inline-block;transform-origin:50% 50%;backface-visibility:hidden}
+.metric-outgoing{position:absolute;inset:0 auto auto 0;white-space:nowrap;transform-origin:50% 50%;backface-visibility:hidden;pointer-events:none}
+.motion-exit{contain:layout style;pointer-events:none!important}
 /* 状态流动保持原速；减少动态效果只关闭入场强调，不改变持续状态动画的节奏。 */
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 @media(forced-colors:active){.hud,.sidebar,.daily,.quota,.route-card{border-color:CanvasText;background:Canvas}.branch,.route-active{stroke:Highlight}.quota-track{border:1px solid CanvasText}.quota-fill{background:Highlight}.request-spinner{color:Highlight}.route-card::before{background:Highlight}.route-card.failed{border-style:dashed}}

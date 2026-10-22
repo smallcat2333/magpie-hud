@@ -509,7 +509,7 @@
 
   /** 六项数值和可聚焦区域共用完整说明，避免数字节点自己的 title 遮住详情。 */
   function metric(id, valueId, value, detail) {
-    text(valueId, value);
+    window.hudMotion.flip(byId(valueId), value);
     const element = byId(id);
     element.title = detail;
     element.setAttribute('aria-label', detail);
@@ -584,6 +584,7 @@
   /** 按当前会话选择决定额度展示项；“最近会话”汇总当天全部会话。 */
   function renderQuotas(sessions, forceOrder) {
     const list = byId('quota-list');
+    const before = window.hudMotion.capture([...quotaViews.values()].map(view => view.item), node => node.dataset.quotaKey);
     const scroll = list.scrollTop;
     const accounts = new Map();
     sessions.flatMap(session => [...(session.quotaRoutes || []), ...session.routes, ...(session.subagents || [])]).forEach(card => {
@@ -624,6 +625,7 @@
       const itemKey = `${entry.key}|${entry.index}`;
       const view = quotaViews.get(itemKey) || createQuotaItem(entry);
       quotaViews.set(itemKey, view);
+      view.item.dataset.quotaKey = itemKey;
       updateQuotaItem(view, entry);
       if (view.item.parentElement !== list || view.item.previousElementSibling !== previous) {
         list.insertBefore(view.item, previous ? previous.nextSibling : list.firstChild);
@@ -643,6 +645,7 @@
     freshness.hidden = !quotaFailed;
     freshness.title = list.title;
     list.scrollTop = scroll;
+    window.hudMotion.layout(before, [...quotaViews.values()].map(view => view.item), node => node.dataset.quotaKey);
   }
 
   /** 同一账号只展示最短窗口；无法识别时排在已知窗口之后。 */
@@ -752,8 +755,18 @@
       view.track.setAttribute('aria-valuemin', '0');
       view.track.setAttribute('aria-valuemax', '100');
       view.track.setAttribute('aria-valuenow', String(percent));
+      const previous = Number(view.fill.dataset.percent || 0);
       view.fill.style.width = `${percent}%`;
-    } else view.fill.style.width = '0';
+      view.fill.dataset.percent = String(percent);
+      if (percent > 0 && Math.abs(previous - percent) > .01 && window.hudMotion.enabled()) {
+        view.fill.getAnimations().forEach(animation => animation.cancel());
+        view.fill.style.transformOrigin = 'left center';
+        window.hudMotion.animate(view.fill, [{ transform: `scaleX(${previous / percent})` }, { transform: 'scaleX(1)' }], 460);
+      }
+    } else {
+      view.fill.style.width = '0';
+      view.fill.dataset.percent = '0';
+    }
     const severity = percent === null ? 'unknown' : used > 98 ? 'critical' : used > 80 ? 'warning' : 'normal';
     view.track.parentElement.dataset.severity = severity;
     view.track.parentElement.dataset.low = String(severity === 'warning');
@@ -786,6 +799,7 @@
     const { protectedSessions, recent } = orderedSessions(visibleSessions);
     const chooseSessions = () => session ? [session] : [...protectedSessions, ...recent.slice(0, Math.max(0, visibleSessionCapacity() - protectedSessions.length))];
     let sessions = chooseSessions();
+    const before = window.hudMotion.capture(routeList.querySelectorAll('.route-card'), node => node.dataset.motionKey);
     const oldScroll = routeList.scrollTop;
     hud.dataset.state = snapshot.state;
     text('watch-label', snapshot.watchLabel);
@@ -802,8 +816,6 @@
       sessions = chooseSessions();
       renderSources(sessions);
     }
-    text('session-count', session ? session.label : `${visibleSessions.length}会话, 显示${sessions.length}个`);
-    byId('source-node').title = [...new Set(sessions.map(item => item.agent))].join('\n');
     const fragment = document.createDocumentFragment();
     const newIds = [];
     const currentIds = new Set();
@@ -817,20 +829,44 @@
       group.dataset.sessionId = item.id;
       const children = subagentsForView(item, Boolean(session));
       const parents = item.routes.length ? item.routes.slice(0, 4) : [parentAnchor(item)];
-      parents.forEach(card => { group.append(createCard(card, item)); rememberCard(card); });
+      parents.forEach((card, index) => {
+        const node = createCard(card, item);
+        node.dataset.motionKey = JSON.stringify([item.id, 'parent', index === 0 ? 'current' : card.id]);
+        group.append(node);
+        rememberCard(card);
+      });
       if (children.length) {
         group.classList.add('has-subagents');
         const list = document.createElement('div');
         list.className = 'subagent-list';
         list.setAttribute('role', 'group');
         list.setAttribute('aria-label', `${item.label}的${session ? '子 Agent 请求' : '活跃子 Agent'}`);
-        children.forEach(card => { list.append(createSubagent(card, item)); rememberCard(card); });
+        children.forEach(card => {
+          const node = createSubagent(card, item);
+          node.dataset.motionKey = JSON.stringify([item.id, 'child', card.subagentId || card.id]);
+          list.append(node);
+          rememberCard(card);
+        });
         group.append(list);
       }
       fragment.append(group);
     });
     routeList.replaceChildren(fragment);
     routeList.hidden = sessions.length === 0;
+    if (!session && hud.dataset.layout === 'wide') {
+      const available = byId('route-area').clientHeight;
+      while (sessions.length > 1 && routeList.scrollHeight > available) {
+        const index = sessions.findLastIndex(item => !sessionIsActive(item));
+        if (index < 0) break;
+        const [removed] = sessions.splice(index, 1);
+        const group = [...routeList.children].find(element => element.dataset.sessionId === removed.id);
+        group.querySelectorAll('.route-card').forEach(element => currentIds.delete(element.dataset.cardId));
+        group.remove();
+      }
+    }
+    renderSources(sessions);
+    text('session-count', session ? session.label : `${visibleSessions.length}会话, 显示${sessions.length}个`);
+    byId('source-node').title = [...new Set(sessions.map(item => item.agent))].join('\n');
     routeList.scrollTop = oldScroll;
     byId('empty-route').hidden = sessions.length > 0;
     const inbound = byId('inbound-active');
@@ -842,7 +878,9 @@
     else { selectedCard = null; renderNotes(session ? session.notes : snapshot.notes); }
     renderedIds = currentIds;
     updateCardTimes();
+    const moving = window.hudMotion.layout(before, routeList.querySelectorAll('.route-card'), node => node.dataset.motionKey);
     requestDraw(animate ? newIds : []);
+    if (moving) followCardMotion();
   }
 
   /** 至少显示三个会话；窗口更高时按卡片高度增加，活跃会话始终全部保留。 */
@@ -948,6 +986,17 @@
       view.path.remove();
       branchViews.delete(id);
     }
+  }
+
+  let motionFrame = 0;
+  function followCardMotion() {
+    cancelAnimationFrame(motionFrame);
+    const until = performance.now() + 340;
+    const tick = now => {
+      drawLines();
+      if (now < until && window.hudMotion.enabled()) motionFrame = requestAnimationFrame(tick);
+    };
+    motionFrame = requestAnimationFrame(tick);
   }
 
   /** 在一帧中合并布局重算，避免多次 ResizeObserver 通知造成抖动。 */
