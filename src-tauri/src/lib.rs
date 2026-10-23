@@ -10,7 +10,7 @@ mod telemetry;
 mod usage;
 mod winmon;
 
-use chrono::Local;
+use chrono::{Datelike, Local};
 use config::{load_config, save_config, usage_path, AppConfig, WindowPlacement};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use placement::{constrain, monitor_for_window, PhysicalRect};
@@ -25,6 +25,28 @@ use tauri::{
 };
 use usage::{RouteSnapshot, UsageLedger};
 
+/// 历史日期统计缓存项，与主账本和实时游标完全隔离。
+#[derive(Clone)]
+struct CachedDayStats {
+    host: String,
+    file_created: Option<std::time::SystemTime>,
+    file_modified: Option<std::time::SystemTime>,
+    file_len: u64,
+    read_at: Instant,
+    view: DateStatsView,
+}
+
+/// 按日统计查询结果；历史日期与实时主账本分离，不覆盖当日会话或实时游标。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DateStatsView {
+    date: String,
+    earliest_date: String,
+    latest_date: String,
+    daily: usage::DailyStats,
+    cost_error: Option<String>,
+}
+
 /// 后台增量游标和已发布快照只在这个状态内持有，避免启动与更新分叉。
 struct Runtime {
     config: AppConfig,
@@ -35,6 +57,7 @@ struct Runtime {
     telemetry: telemetry::Telemetry,
     quota_refresh: Option<std::sync::mpsc::SyncSender<()>>,
     snapshot: RouteSnapshot,
+    history_cache: std::collections::HashMap<chrono::NaiveDate, CachedDayStats>,
     /// 合并窗口保存请求。事件回调不在持锁时等待写盘线程。
     window_save: Arc<WindowSave>,
 }
@@ -58,6 +81,7 @@ impl Runtime {
             telemetry: telemetry::Telemetry::default(),
             quota_refresh: None,
             snapshot,
+            history_cache: std::collections::HashMap::new(),
             window_save: Arc::new(WindowSave::new(saved_window)),
         };
         runtime.refresh(None);
@@ -146,6 +170,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             startup_state,
+            query_date_stats,
+            query_month_usage,
             set_pinned,
             reset_window_position,
             hide_window,
@@ -440,6 +466,188 @@ fn startup_state(app: AppHandle) -> StartupState {
     StartupState { snapshot, pinned }
 }
 
+/// 查询指定本地日期的六项统计与 24 小时趋势；历史日期走只读缓存轨，不干扰当日实时账本。
+#[tauri::command]
+async fn query_date_stats(app: AppHandle, date: String) -> Result<DateStatsView, String> {
+    tauri::async_runtime::spawn_blocking(move || read_date_stats(&app, &date))
+        .await
+        .map_err(|error| format!("历史查询任务失败：{error}"))?
+}
+
+fn read_date_stats(app: &AppHandle, date: &str) -> Result<DateStatsView, String> {
+    let day = chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d")
+        .map_err(|_| "日期格式无效，应为 YYYY-MM-DD".to_string())?;
+    // `%Y-%m-%d` 也接受非零填充，这里要求与接口完全一致才放行。
+    if day.format("%Y-%m-%d").to_string() != date.trim() {
+        return Err("日期格式无效，应为 YYYY-MM-DD".into());
+    }
+    let today = Local::now().date_naive();
+    if day > today {
+        return Err("不能查看未来日期的统计".into());
+    }
+    let state = app.state::<Arc<Mutex<Runtime>>>();
+    let (path, host) = {
+        let runtime = state.lock().expect("状态锁损坏");
+        if day == today && runtime.snapshot.date == today.to_string() {
+            return Ok(DateStatsView {
+                date: runtime.snapshot.date.clone(),
+                earliest_date: runtime.snapshot.earliest_date.clone(),
+                latest_date: today.to_string(),
+                daily: runtime.snapshot.daily.clone(),
+                cost_error: runtime.snapshot.cost_error.clone(),
+            });
+        }
+        (
+            usage_path(&runtime.config),
+            runtime.config.magpie_host.clone(),
+        )
+    };
+    let metadata = std::fs::metadata(&path).ok();
+    let file_created = metadata.as_ref().and_then(|meta| meta.created().ok());
+    let file_modified = metadata.as_ref().and_then(|meta| meta.modified().ok());
+    let file_len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+    if day < today {
+        let runtime = state.lock().expect("状态锁损坏");
+        if let Some(cached) = runtime.history_cache.get(&day) {
+            if cached.host == host
+                && cached.file_created == file_created
+                && cached.file_modified == file_modified
+                && cached.file_len == file_len
+                && cached.read_at.elapsed() < Duration::from_secs(60)
+                && cached.view.cost_error.is_none()
+            {
+                let mut view = cached.view.clone();
+                view.latest_date = today.to_string();
+                return Ok(view);
+            }
+        }
+    }
+    let (mut daily, scanned_earliest) = usage::scan_day_stats(&path, day)?;
+    let period = format!("{day}..{day}");
+    let cost_error = match live::gateway_url(&host) {
+        Ok(base) => {
+            let agent = live::client(Duration::from_secs(5));
+            let url = format!("{base}/v1/magpie/usage?period={period}");
+            match live::read_json::<telemetry::Usage>(&agent, &url) {
+                Ok(usage) => telemetry::apply_day_usage(&mut daily, day, &period, &usage).err(),
+                Err(error) => Some(error),
+            }
+        }
+        Err(error) => Some(error),
+    };
+    let mut runtime = state.lock().expect("状态锁损坏");
+    let mut current_earliest = chrono::NaiveDate::parse_from_str(&runtime.snapshot.earliest_date, "%Y-%m-%d")
+        .unwrap_or(today);
+    if let Some(earliest) = scanned_earliest {
+        current_earliest = current_earliest.min(earliest);
+    }
+    let view = DateStatsView {
+        date: day.to_string(),
+        earliest_date: current_earliest.to_string(),
+        latest_date: today.to_string(),
+        daily,
+        cost_error,
+    };
+    if day < today && view.cost_error.is_none() {
+        if runtime.history_cache.len() >= 32 {
+            runtime.history_cache.clear();
+        }
+        runtime.history_cache.insert(
+            day,
+            CachedDayStats {
+                host,
+                file_created,
+                file_modified,
+                file_len,
+                read_at: Instant::now(),
+                view: view.clone(),
+            },
+        );
+    }
+    Ok(view)
+}
+
+/// 热力日历的一次单月结果；未来日期以 0 返回，由前端禁用。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MonthUsageView {
+    month: String,
+    earliest_date: String,
+    latest_date: String,
+    days: Vec<MonthDayUsage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MonthDayUsage {
+    date: String,
+    tokens: u64,
+    requests: u64,
+}
+
+/// 查询所选本地月每天的热力数据；历史缓存轨独立扫描，不占用实时账本或主游标。
+#[tauri::command]
+async fn query_month_usage(app: AppHandle, month: String) -> Result<MonthUsageView, String> {
+    tauri::async_runtime::spawn_blocking(move || read_month_usage(&app, &month))
+        .await
+        .map_err(|error| format!("月份查询任务失败：{error}"))?
+}
+
+fn read_month_usage(app: &AppHandle, month: &str) -> Result<MonthUsageView, String> {
+    let (month, start, end) = parse_month(month.trim(), Local::now().date_naive())?;
+    let state = app.state::<Arc<Mutex<Runtime>>>();
+    let path = {
+        let runtime = state.lock().expect("状态锁损坏");
+        usage_path(&runtime.config)
+    };
+    let (days, scanned_earliest) = usage::scan_month_usage(&path, start, end)?;
+    let today = Local::now().date_naive();
+    let earliest = scanned_earliest
+        .map(|date| date.min(today))
+        .unwrap_or(today);
+    Ok(MonthUsageView {
+        month,
+        earliest_date: earliest.to_string(),
+        latest_date: today.to_string(),
+        days: days
+            .into_iter()
+            .map(|day| MonthDayUsage {
+                date: day.date.to_string(),
+                tokens: day.tokens,
+                requests: day.requests,
+            })
+            .collect(),
+    })
+}
+
+/// 严格校验 `YYYY-MM` 并给出当月闭区间；格式多余零填充和未来月份都在扫描前拒绝。
+fn parse_month(
+    input: &str,
+    today: chrono::NaiveDate,
+) -> Result<(String, chrono::NaiveDate, chrono::NaiveDate), String> {
+    if input.len() != 7 || input.as_bytes().get(4) != Some(&b'-') {
+        return Err("月份格式无效，应为 YYYY-MM".into());
+    }
+    let start = chrono::NaiveDate::parse_from_str(&format!("{input}-01"), "%Y-%m-%d")
+        .map_err(|_| "月份格式无效，应为 YYYY-MM".to_string())?;
+    if start.format("%Y-%m").to_string() != input {
+        return Err("月份格式无效，应为 YYYY-MM".into());
+    }
+    let next = if start.month() == 12 {
+        chrono::NaiveDate::from_ymd_opt(start.year() + 1, 1, 1)
+    } else {
+        chrono::NaiveDate::from_ymd_opt(start.year(), start.month() + 1, 1)
+    }
+    .ok_or("月份超出支持范围")?;
+    let end = next.pred_opt().ok_or("月份超出支持范围")?;
+    let this_month = chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
+        .ok_or("无法确定当前月份")?;
+    if start > this_month {
+        return Err("不能查看未来月份的热力日历".into());
+    }
+    Ok((input.to_string(), start, end))
+}
+
 /// 切换真实置顶并保存，失败返回错误，不让图标假装成功。
 #[tauri::command]
 fn set_pinned(app: AppHandle, pinned: bool) -> Result<bool, String> {
@@ -638,5 +846,28 @@ mod tests {
         assert!(save.remember(first));
         assert!(!save.remember(first));
         assert_eq!(save.cached(), Some(first));
+    }
+
+    /// 月份严格按要求格式，未来月份与非法月份在扫描前拒绝。
+    #[test]
+    fn rejects_invalid_and_future_months_before_scanning() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 23).unwrap();
+        let (label, start, end) = parse_month("2026-02", today).unwrap();
+        assert_eq!(label, "2026-02");
+        assert_eq!(start, chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
+        assert_eq!(end, chrono::NaiveDate::from_ymd_opt(2026, 2, 28).unwrap());
+        let (_, _, leap_end) = parse_month("2024-02", today).unwrap();
+        assert_eq!(leap_end, chrono::NaiveDate::from_ymd_opt(2024, 2, 29).unwrap());
+        let future_leap = parse_month("2028-02", today).unwrap_err();
+        assert!(future_leap.contains("未来月份"));
+        let future = parse_month("2026-11", today).unwrap_err();
+        assert!(future.contains("未来月份"));
+        for invalid in ["2026-13", "2026-00", "2026-1", "2026-1-", "2026/01", "2026-01x", "12026-01", "2026-1a", ""] {
+            assert!(parse_month(invalid, today).is_err(), "{invalid} 不应通过");
+        }
+        let (_, _, december_end) = parse_month("2025-12", today).unwrap();
+        assert_eq!(december_end, chrono::NaiveDate::from_ymd_opt(2025, 12, 31).unwrap());
+        let (_, _, leap_ok) = parse_month("2024-02", today).unwrap();
+        assert_eq!(leap_ok, chrono::NaiveDate::from_ymd_opt(2024, 2, 29).unwrap());
     }
 }

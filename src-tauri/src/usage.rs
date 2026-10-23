@@ -92,6 +92,7 @@ struct Record {
     /// 子 Agent 身份。根会话请求为空；不读取正文，只用于归属与上轮指标。
     subagent: String,
     timestamp_ms: i64,
+    day: NaiveDate,
     hour: usize,
     sequence: u64,
     time: String,
@@ -275,6 +276,8 @@ pub struct SessionView {
 pub struct RouteSnapshot {
     pub revision: u64,
     pub date: String,
+    /// 日志中最早有效记录的本地日期，供前端限制历史左翻边界。
+    pub earliest_date: String,
     pub state: String,
     pub watch_label: String,
     pub magpie_host: String,
@@ -290,6 +293,9 @@ pub struct RouteSnapshot {
 /// 内存中的当日完成请求；启动流式读取历史，之后只追加新完整行。
 pub struct UsageLedger {
     day: NaiveDate,
+    /// 闭区间结束日。单日账本与 `day` 相同；月份扫描才放宽到整月。
+    end_day: NaiveDate,
+    earliest_day: Option<NaiveDate>,
     records: Vec<Record>,
     seen: HashSet<String>,
     pub revision: u64,
@@ -299,8 +305,15 @@ pub struct UsageLedger {
 impl UsageLedger {
     /// 创建指定本地日期账本，支持测试跨日重置。
     pub fn new(day: NaiveDate) -> Self {
+        Self::spanning(day, day)
+    }
+
+    /// 创建闭区间账本。实时主账本仍用单日；月份热力查询用它一次收下整月。
+    pub fn spanning(start: NaiveDate, end: NaiveDate) -> Self {
         Self {
-            day,
+            day: start,
+            end_day: end,
+            earliest_day: None,
             records: Vec::new(),
             seen: HashSet::new(),
             revision: 0,
@@ -313,8 +326,10 @@ impl UsageLedger {
         if self.day == day {
             return false;
         }
+        let earliest = self.earliest_day;
         let revision = self.revision + 1;
         *self = Self::new(day);
+        self.earliest_day = earliest;
         self.revision = revision;
         true
     }
@@ -357,7 +372,12 @@ impl UsageLedger {
             return;
         };
         let local = timestamp.with_timezone(&Local);
-        if local.date_naive() != self.day {
+        let record_day = local.date_naive();
+        self.earliest_day = Some(
+            self.earliest_day
+                .map_or(record_day, |earliest| earliest.min(record_day)),
+        );
+        if record_day < self.day || record_day > self.end_day {
             return;
         }
         let identity = format!(
@@ -389,6 +409,7 @@ impl UsageLedger {
             route_id: value.get("route_id").and_then(Value::as_i64),
             subagent: string(&value, "subagent").unwrap_or("").into(),
             timestamp_ms: timestamp.timestamp_millis(),
+            day: record_day,
             hour: local.hour() as usize,
             sequence: self.records.len() as u64,
             time: local.format("%H:%M:%S").to_string(),
@@ -617,19 +638,7 @@ impl UsageLedger {
             });
         }
         sessions.sort_by(|a, b| b.latest_sequence.cmp(&a.latest_sequence).then(a.id.cmp(&b.id)));
-        // 全局 TPS 只看最近 10 个会话，不把当天更早会话的速度混入。
-        daily.output_tokens = 0;
-        daily.generation_ms = 0.0;
-        daily.speed_samples = 0;
-        daily.tokens_per_second = None;
-        for session in sessions.iter().take(10) {
-            daily.output_tokens += session.daily.output_tokens;
-            daily.generation_ms += session.daily.generation_ms;
-            daily.speed_samples += session.daily.speed_samples;
-        }
-        if daily.generation_ms > 0.0 {
-            daily.tokens_per_second = Some(daily.output_tokens as f64 * 1000.0 / daily.generation_ms);
-        }
+        // 全局 TPS 与其余按日指标共用全部完成请求；历史与今天保持相同口径。
         let mut notes = sessions
             .first()
             .map(|s| s.notes.clone())
@@ -664,6 +673,11 @@ impl UsageLedger {
         RouteSnapshot {
             revision: self.revision,
             date: self.day.to_string(),
+            earliest_date: self
+                .earliest_day
+                .unwrap_or(self.day)
+                .min(self.day)
+                .to_string(),
             state: state.into(),
             watch_label: match state {
                 "warning" => "读取异常 · 保留有效数据",
@@ -683,6 +697,72 @@ impl UsageLedger {
                 .or_else(|| (self.malformed > 0).then(|| "日志中有无效行，已保留有效记录".into())),
         }
     }
+
+    /// 汇总该账本日期内全部有效记录（历史按日查看不截断到最近 10 个会话）。
+    pub fn day_stats(&self) -> (DailyStats, Option<NaiveDate>) {
+        let mut daily = DailyStats::default();
+        for record in &self.records {
+            daily.add(record);
+        }
+        (daily, self.earliest_day)
+    }
+
+    /// 按本地日期汇总闭区间内每一天。Token 与调用数和单日 `day_stats` 同一口径。
+    pub fn days_in_range(&self) -> (Vec<DayUsage>, Option<NaiveDate>) {
+        let mut by_day: BTreeMap<NaiveDate, DayUsage> = BTreeMap::new();
+        let mut day = self.day;
+        loop {
+            by_day.insert(day, DayUsage { date: day, tokens: 0, requests: 0 });
+            if day >= self.end_day {
+                break;
+            }
+            day = day.succ_opt().expect("日期溢出");
+        }
+        for record in &self.records {
+            if let Some(usage) = by_day.get_mut(&record.day) {
+                usage.tokens = usage.tokens.saturating_add(record.tokens);
+                usage.requests = usage.requests.saturating_add(1);
+            }
+        }
+        (by_day.into_values().collect(), self.earliest_day)
+    }
+}
+
+/// 热力日历的一天。未来日期也可以是 0，由前端禁用，不在这里省略。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DayUsage {
+    pub date: NaiveDate,
+    pub tokens: u64,
+    pub requests: u64,
+}
+
+/// 流式扫描只读日志中指定本地日期的六项统计与最早有效记录日期，不改动实时主账本。
+pub fn scan_day_stats(
+    path: &std::path::Path,
+    day: NaiveDate,
+) -> Result<(DailyStats, Option<NaiveDate>), String> {
+    let mut ledger = UsageLedger::new(day);
+    let mut cursor = crate::tail::LogCursor::default();
+    cursor.update_for_day(path, &mut ledger, day)?;
+    if cursor.missing {
+        return Err("历史日志文件未找到，无法确认所选日期统计".into());
+    }
+    Ok(ledger.day_stats())
+}
+
+/// 一次只读扫描所选本地月的每日 Token 与调用数，并返回日志中最早的有效日期。
+pub fn scan_month_usage(
+    path: &std::path::Path,
+    month_start: NaiveDate,
+    month_end: NaiveDate,
+) -> Result<(Vec<DayUsage>, Option<NaiveDate>), String> {
+    let mut ledger = UsageLedger::spanning(month_start, month_end);
+    let mut cursor = crate::tail::LogCursor::default();
+    cursor.update_for_day(path, &mut ledger, month_start)?;
+    if cursor.missing {
+        return Err("历史日志文件未找到，无法确认所选月份用量".into());
+    }
+    Ok(ledger.days_in_range())
 }
 
 /// 读取非空字符串字段；缺失和空值都保持未知。
@@ -703,6 +783,7 @@ fn finite_number(value: &Value, key: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use serde_json::json;
 
     /// 构造固定日期样本，避免测试依赖机器时区和当前日期。
@@ -743,9 +824,9 @@ mod tests {
         assert!(ledger.snapshot("h", "ready", None).daily.hourly.iter().all(|bucket| bucket.tokens == 0));
     }
 
-    /// 全局速度只纳入最近 10 个会话；第 11 个更早会话不影响结果。
+    /// 全局速度统计当天全部有效请求，和按日历史查询采用同一加权口径。
     #[test]
-    fn global_speed_uses_ten_latest_sessions() {
+    fn global_speed_uses_all_day_sessions() {
         let mut ledger = ledger();
         for id in 1..=11 {
             let mut value = fixture(id, &format!("session-{id:02}"), 200);
@@ -754,8 +835,8 @@ mod tests {
         }
         let view = ledger.snapshot("h", "ready", None);
         assert_eq!(view.sessions.len(), 11);
-        assert_eq!(view.daily.speed_samples, 10);
-        assert_eq!(view.daily.tokens_per_second, Some(50.0));
+        assert_eq!(view.daily.speed_samples, 11);
+        assert_eq!(view.daily.tokens_per_second, Some(2000.0 / 22.0));
         assert_eq!(view.sessions[10].daily.tokens_per_second, Some(500.0));
     }
 
@@ -1131,5 +1212,187 @@ mod tests {
         assert_eq!(view.notes[0].time, "--:--:--");
         assert_eq!(view.daily.requests, 0);
         assert_eq!(view.state, "warning");
+    }
+
+    /// 跨日日志能记住最早有效记录日期，且按日独立扫描不会污染实时账本，同时完整统计当天全部会话。
+    #[test]
+    fn scans_historical_day_and_tracks_earliest_date() {
+        let directory = std::env::temp_dir().join(format!("magpie-hud-day-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("usage.jsonl");
+        let day1 = DateTime::parse_from_rfc3339("2026-10-18T02:00:00Z").unwrap().with_timezone(&Local).date_naive();
+        let day2 = DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z").unwrap().with_timezone(&Local).date_naive();
+        let mut lines = Vec::new();
+        for id in 1..=11 {
+            let mut item = fixture(id, &format!("hist-{id:02}"), 200);
+            item["t"] = json!(format!("2026-10-18T02:00:{id:02}Z"));
+            item["out"] = json!(if id == 1 { 1000 } else { 100 });
+            lines.push(item.to_string());
+        }
+        lines.push(fixture(20, "today-session", 200).to_string());
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let mut live_ledger = UsageLedger::new(day2);
+        let mut cursor = crate::tail::LogCursor::default();
+        cursor.update_for_day(&path, &mut live_ledger, day2).unwrap();
+        let live_view = live_ledger.snapshot("h", "ready", None);
+        assert_eq!(live_view.date, day2.to_string());
+        assert_eq!(live_view.earliest_date, day1.to_string());
+        assert_eq!(live_view.daily.requests, 1);
+
+        let (hist_daily, earliest) = scan_day_stats(&path, day1).unwrap();
+        assert_eq!(earliest, Some(day1));
+        assert_eq!(hist_daily.requests, 11);
+        assert_eq!(hist_daily.speed_samples, 11);
+        // 历史单日汇总包含全部 11 个会话（总输出 2000 / 22s），不截断为 10 个。
+        assert!((hist_daily.tokens_per_second.unwrap() - 2000.0 / 22.0).abs() < 1e-6);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// 写一份只存在于临时目录的日志，测试结束后删除，不接触真实 Magpie 日志。
+    fn temp_log(name: &str, body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "magpie-hud-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("usage.jsonl");
+        std::fs::write(&path, body).unwrap();
+        (directory, path)
+    }
+
+    /// 一条可计入的完成记录。Token 固定为 in + out + cache_read。
+    fn month_line(stamp: &str, route: u64, session: &str, kind: Option<&str>) -> String {
+        let mut value = json!({
+            "route_id": route,
+            "t": stamp,
+            "session": session,
+            "providerAccount": "one@example.com",
+            "status": 200,
+            "in": 100,
+            "out": 20,
+            "cache_read": 5,
+            "ms": 2000,
+            "ttft_ms": 1000
+        });
+        if let Some(kind) = kind {
+            value["kind"] = json!(kind);
+        }
+        value.to_string()
+    }
+
+    /// 一次扫描整月：跨月按本地日归属，重复、分类器、匿名、坏行与超长行都不计入。
+    #[test]
+    fn month_scan_assigns_local_days_and_excludes_non_requests() {
+        let at = |year, month, day| {
+            Local
+                .with_ymd_and_hms(year, month, day, 12, 0, 0)
+                .single()
+                .unwrap()
+                .to_rfc3339()
+        };
+        let before = at(2026, 3, 20);
+        let first = at(2026, 4, 1);
+        let late = at(2026, 4, 15);
+        let after = at(2026, 5, 2);
+        let mut lines = vec![
+            month_line(&before, 1, "boundary", None),
+            month_line(&first, 2, "kept", None),
+            month_line(&first, 2, "kept", None),
+            month_line(&late, 3, "kept", None),
+            month_line(&late, 4, "classifier", Some("routing")),
+            month_line(&late, 5, "", None),
+            month_line(&after, 6, "next-month", None),
+            "{not-json".into(),
+        ];
+        lines.push(format!(
+            "{{\"route_id\":7,\"payload\":\"{}\"}}\n",
+            "x".repeat(70_000)
+        ));
+        let (directory, path) = temp_log("month", &(lines.join("\n") + "\n"));
+        let month_start = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+        let month_end = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+
+        let (days, earliest) = scan_month_usage(&path, month_start, month_end).unwrap();
+        assert_eq!(days.len(), 30);
+        assert_eq!(days.first().unwrap().date, month_start);
+        assert_eq!(days.last().unwrap().date, month_end);
+        // 三月的有效记录只用于确定最早日期，不进四月热力。
+        assert_eq!(
+            earliest,
+            Some(DateTime::parse_from_rfc3339(&before).unwrap().with_timezone(&Local).date_naive())
+        );
+        assert_eq!(days.iter().map(|day| day.requests).sum::<u64>(), 2);
+        assert_eq!(days.iter().map(|day| day.tokens).sum::<u64>(), 250);
+        let first_usage = days.iter().find(|day| day.date == NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()).unwrap();
+        let late_usage = days.iter().find(|day| day.date == NaiveDate::from_ymd_opt(2026, 4, 15).unwrap()).unwrap();
+        assert_eq!((first_usage.requests, first_usage.tokens), (1, 125));
+        assert_eq!((late_usage.requests, late_usage.tokens), (1, 125));
+        assert!(days
+            .iter()
+            .filter(|day| day.date != first_usage.date && day.date != late_usage.date)
+            .all(|day| day.requests == 0 && day.tokens == 0));
+
+        let (single, _) = scan_day_stats(&path, first_usage.date).unwrap();
+        assert_eq!((single.requests, single.tokens), (first_usage.requests, first_usage.tokens));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// UTC 时间按本地日期归属，跨时区的机器上也不会算到错误的月/日。
+    #[test]
+    fn month_scan_uses_local_date_for_utc_timestamp() {
+        let stamp = "2026-04-01T12:00:00Z";
+        let local_day = DateTime::parse_from_rfc3339(stamp).unwrap().with_timezone(&Local).date_naive();
+        let (directory, path) = temp_log("month-local", &(month_line(stamp, 1, "utc", None) + "\n"));
+        let (days, _) = scan_month_usage(
+            &path,
+            NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(days.len(), 30);
+        assert_eq!(days.iter().map(|day| day.requests).sum::<u64>(), 1);
+        let usage = days.iter().find(|day| day.date == local_day).unwrap();
+        assert_eq!((usage.requests, usage.tokens), (1, 125));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// 闰年二月必须给出 29 天，其中没有记录的日期也保留为 0。
+    #[test]
+    fn leap_february_returns_twenty_nine_days() {
+        let stamp = Local
+            .with_ymd_and_hms(2028, 2, 29, 12, 0, 0)
+            .single()
+            .unwrap()
+            .to_rfc3339();
+        let (directory, path) = temp_log("leap", &(month_line(&stamp, 1, "leap", None) + "\n"));
+        let start = NaiveDate::from_ymd_opt(2028, 2, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2028, 2, 29).unwrap();
+        let (days, earliest) = scan_month_usage(&path, start, end).unwrap();
+        assert_eq!(days.len(), 29);
+        assert_eq!(days[0].date, start);
+        assert_eq!(days[28].date, end);
+        assert_eq!(earliest, Some(end));
+        assert_eq!(days.iter().map(|item| item.requests).sum::<u64>(), 1);
+        assert_eq!(days.iter().find(|item| item.date == end).unwrap().tokens, 125);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// 文件不存在时不能把整月伪装成全 0。
+    #[test]
+    fn missing_month_log_is_an_error() {
+        let missing = std::env::temp_dir().join(format!(
+            "magpie-hud-missing-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let start = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let error = scan_month_usage(&missing, start, end).unwrap_err();
+        assert!(error.contains("未找到"));
     }
 }

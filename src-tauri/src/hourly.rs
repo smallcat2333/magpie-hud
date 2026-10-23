@@ -131,20 +131,24 @@ impl HourlyCosts {
 
     pub fn apply(&self, view: &mut RouteSnapshot, usage: &Usage) {
         if view.date != self.history.date { return; }
-        apply_gateway_series(&mut view.daily, usage);
+        apply_gateway_series_for_day(&mut view.daily, usage, Local::now().date_naive());
         for session in &mut view.sessions {
             if let Some(counter) = self.history.sessions.get(&session.id) { counter.apply(&mut session.daily); }
         }
     }
 }
 
-fn apply_gateway_series(stats: &mut DailyStats, usage: &Usage) {
+pub(crate) fn apply_gateway_series_for_day(
+    stats: &mut DailyStats,
+    usage: &Usage,
+    target_day: chrono::NaiveDate,
+) {
     let mut assigned = [false; 24];
     for item in &usage.hourly {
         let Ok(time) = DateTime::parse_from_rfc3339(&item.time) else { continue };
         let local = time.with_timezone(&Local);
-        // 网关的 time 已带本地偏移；用其自身日期与“今天”比较，避免时区二次换算。
-        if time.date_naive() != Local::now().date_naive() || !item.cost.is_finite() || item.cost < 0.0 { continue; }
+        // 网关的 time 已带本地偏移；用其自身日期与目标日期比较，避免时区二次换算。
+        if time.date_naive() != target_day || !item.cost.is_finite() || item.cost < 0.0 { continue; }
         let hour = local.hour() as usize;
         if assigned[hour] { continue; }
         let bucket = &mut stats.hourly[hour];
@@ -152,6 +156,11 @@ fn apply_gateway_series(stats: &mut DailyStats, usage: &Usage) {
         bucket.cost_partial = item.unpriced > 0;
         assigned[hour] = true;
     }
+}
+
+#[cfg(test)]
+fn apply_gateway_series(stats: &mut DailyStats, usage: &Usage) {
+    apply_gateway_series_for_day(stats, usage, Local::now().date_naive());
 }
 
 fn persist(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
@@ -240,7 +249,7 @@ mod tests {
         let usage = Usage { since: now.to_rfc3339(), calls: 2, cost: 3.5, unpriced: 0, hourly: vec![
             crate::telemetry::HourlyCost { time: now.to_rfc3339(), cost: 1.25, unpriced: 0 },
             crate::telemetry::HourlyCost { time: (now - Duration::hours(2)).to_rfc3339(), cost: 2.25, unpriced: 1 },
-        ], sessions: vec![] };
+        ], ..Default::default() };
         let mut stats = DailyStats::default();
         apply_gateway_series(&mut stats, &usage);
         assert_eq!(stats.hourly[10].cost, Some(1.25));

@@ -42,6 +42,7 @@ pub struct Quotas {
 /// 用量页包含内部路由调用；保留其费用口径，不从日志拼凑或推算模型单价。
 #[derive(Clone, Default, Deserialize)]
 pub struct Usage {
+    #[serde(default)] pub period: String,
     pub since: String,
     pub calls: u64,
     pub cost: f64,
@@ -139,6 +140,30 @@ fn fill_cost(stats: &mut crate::usage::DailyStats, calls: u64, cost: f64, unpric
     }
 }
 
+/// 将网关指定日期区间（YYYY-MM-DD..YYYY-MM-DD）的费用与 24 小时序列写入单日统计。
+pub fn apply_day_usage(
+    stats: &mut crate::usage::DailyStats,
+    day: chrono::NaiveDate,
+    expected_period: &str,
+    usage: &Usage,
+) -> Result<(), String> {
+    if usage.period != expected_period {
+        return Err(format!("Magpie 未返回所选日期费用（回显 {}）", usage.period));
+    }
+    let since_day = chrono::DateTime::parse_from_rfc3339(&usage.since)
+        .ok()
+        .map(|time| time.with_timezone(&chrono::Local).date_naive());
+    if since_day != Some(day) {
+        return Err("Magpie 返回的费用起始日期与所选日期不一致".into());
+    }
+    if !usage.cost.is_finite() || usage.cost < 0.0 || usage.unpriced > usage.calls {
+        return Err("Magpie 所选日期费用字段无效".into());
+    }
+    fill_cost(stats, usage.calls, usage.cost, usage.unpriced);
+    crate::hourly::apply_gateway_series_for_day(stats, usage, day);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,7 +173,7 @@ mod tests {
     fn cost_keeps_gateway_scope_and_cannot_leak_across_days() {
         let now = chrono::Local::now();
         let mut telemetry = Telemetry { usage: Some(Usage {
-            since: now.to_rfc3339(), calls: 5, cost: 1.25, unpriced: 2, hourly: vec![], sessions: vec![],
+            since: now.to_rfc3339(), calls: 5, cost: 1.25, unpriced: 2, ..Default::default()
         }), ..Default::default() };
         let mut view = UsageLedger::new(now.date_naive()).snapshot("h", "ready", None);
         telemetry.apply(&mut view);
@@ -190,5 +215,38 @@ mod tests {
     fn quota_missing_percent_is_unknown_instead_of_zero() {
         let quotas: Quotas = serde_json::from_str(r#"{"object":"list","data":[{"provider":"codex","name":"codex","user":"test@example.com","kind":"subscription","windows":[{"name":"5 hours"}]}]}"#).unwrap();
         assert_eq!(quotas.data[0].windows[0].remaining, None);
+    }
+
+    #[test]
+    fn historical_day_usage_validates_period_and_populates_hourly_costs() {
+        use chrono::TimeZone;
+        let target = chrono::Local.with_ymd_and_hms(2026, 10, 21, 9, 0, 0).unwrap();
+        let day = target.date_naive();
+        let period = format!("{day}..{day}");
+        let usage = Usage {
+            period: period.clone(),
+            since: target.to_rfc3339(),
+            calls: 4,
+            cost: 2.5,
+            unpriced: 1,
+            hourly: vec![HourlyCost {
+                time: target.to_rfc3339(),
+                cost: 1.25,
+                unpriced: 1,
+            }],
+            sessions: vec![],
+        };
+        let mut stats = crate::usage::DailyStats::default();
+        apply_day_usage(&mut stats, day, &period, &usage).unwrap();
+        assert_eq!(stats.cost, Some(2.5));
+        assert_eq!(stats.priced_requests, 3);
+        assert_eq!(stats.unpriced_requests, 1);
+        assert_eq!(stats.hourly[9].cost, Some(1.25));
+        assert!(stats.hourly[9].cost_partial);
+
+        let fallback = Usage { period: "30d".into(), ..usage };
+        let mut rejected = crate::usage::DailyStats::default();
+        assert!(apply_day_usage(&mut rejected, day, &period, &fallback).is_err());
+        assert_eq!(rejected.cost, None);
     }
 }

@@ -254,7 +254,8 @@
     }
     const effort = document.createElement('span');
     effort.className = 'effort';
-    effort.textContent = /^(强度待确定|强度未提供|待定)$/.test(card.effort) ? '待定' : card.effort;
+    effort.textContent = /^(强度待确定|强度未提供|待定)$/.test(card.effort) ? '待定'
+      : card.effort.replace(/^[a-z]/, letter => letter.toUpperCase());
     const intensity = card.effort.toLowerCase();
     if (['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(intensity)) effort.dataset.level = intensity;
     bottom.append(model, separator, label);
@@ -531,18 +532,17 @@
   }
 
   /** 当日输出速度为 Σout / Σ(ms−ttft_ms)，不把输入或缓存读计为输出吞吐。 */
-  function renderStats(stats, scope) {
-    text('stats-date', snapshot.date.slice(5));
+  function renderStats(stats, scope, costError = snapshot.costError, historical = false) {
     const tokens = compact(stats.tokens);
     text('request-count', `${stats.requests} 次请求`);
     metric('tokens-metric', 'daily-tokens', tokens, `Token · ${scope}\n当日 ${stats.tokens.toLocaleString('zh-CN')} Token；输入 + 输出 + 缓存读取，不含内部分类调用。`);
-    text('cost-status', snapshot.costError ? '旧读数' : '');
+    text('cost-status', costError ? (stats.cost == null ? '未读取' : '旧读数') : '');
     text('cost-unit', stats.cost == null ? '' : 'USD');
-    text('cost-coverage', stats.cost == null ? (stats.unpricedRequests ? `${stats.unpricedRequests} 条未定价` : '等待 Magpie 费用') : `${stats.pricedRequests} 条已定价${stats.unpricedRequests ? ` · ${stats.unpricedRequests} 条未定价` : ''}${snapshot.costError ? ' · 旧读数' : ''}`);
+    text('cost-coverage', stats.cost == null ? (stats.unpricedRequests ? `${stats.unpricedRequests} 条未定价` : '等待 Magpie 费用') : `${stats.pricedRequests} 条已定价${stats.unpricedRequests ? ` · ${stats.unpricedRequests} 条未定价` : ''}${costError ? ' · 旧读数' : ''}`);
     metric('cost-metric', 'daily-cost', callCost(stats.cost),
-      `费用估值 · ${scope}\n${stats.cost == null ? '未定价' : `$${stats.cost.toFixed(6)} USD`}\n${snapshot.costError || 'Magpie 当日美元等价费用，含内部分类调用；订阅账号为用量估值。'}\n${stats.pricedRequests} 次已定价，${stats.unpricedRequests} 次未定价。`);
+      `费用估值 · ${scope}\n${stats.cost == null ? '未定价' : `$${stats.cost.toFixed(6)} USD`}\n${costError || 'Magpie 当日美元等价费用，含内部分类调用；订阅账号为用量估值。'}\n${stats.pricedRequests} 次已定价，${stats.unpricedRequests} 次未定价。`);
     metric('speed-metric', 'daily-speed', Number.isFinite(stats.tokensPerSecond) ? compactFormat.format(stats.tokensPerSecond).replace('K', 'k') : '—',
-      `TPS · ${scope}\n${Number.isFinite(stats.tokensPerSecond) ? `${stats.tokensPerSecond.toFixed(3)} tok/s\n` : ''}${sessionSpeedScope(scope)}加权输出速度 = Σ输出 Token / Σ(总耗时 − 首字耗时)；${stats.speedSamples} 条有效记录，不包含等待首字的时间。`);
+      `TPS · ${scope}\n${Number.isFinite(stats.tokensPerSecond) ? `${stats.tokensPerSecond.toFixed(3)} tok/s\n` : ''}${historical ? '所选日期全部有效请求' : sessionSpeedScope(scope)}加权输出速度 = Σ输出 Token / Σ(总耗时 − 首字耗时)；${stats.speedSamples} 条有效记录，不包含等待首字的时间。`);
     const cache = stats.cacheHitRate;
     metric('cache-metric', 'daily-cache', Number.isFinite(cache) ? `${(cache * 100).toFixed(1)}%` : '—',
       `缓存命中率 · ${scope}\n${Number.isFinite(cache) ? `${(cache * 100).toFixed(3)}%` : '暂无有效缓存输入'}\n缓存读取 Token / (输入 Token + 缓存读取 Token)，按完成请求加权；不含输出与内部分类调用。`);
@@ -550,13 +550,13 @@
       `调用次数 · ${scope}\n当日 ${stats.requests} 次已结束调用，含主会话和子 Agent，不含内部分类调用。`);
     const average = stats.costPerCall;
     metric('average-metric', 'daily-average', callCost(average), `单次调用费用 · ${scope}\n${Number.isFinite(average)
-      ? `$${average.toFixed(8)} USD / 次 = Magpie 费用 / ${stats.pricedRequests} 次已定价调用（含内部分类），不计未定价调用。${snapshot.costError ? '\n费用为旧读数' : ''}`
+      ? `$${average.toFixed(8)} USD / 次 = Magpie 费用 / ${stats.pricedRequests} 次已定价调用（含内部分类），不计未定价调用。${costError ? '\n费用为旧读数' : ''}`
       : '暂无可用的已定价调用，等待 Magpie 费用读数。'}`);
     text('stats-scope', scope);
   }
 
   function sessionSpeedScope(scope) {
-    return scope === '全部会话' ? '最近 10 个会话' : '当前会话';
+    return scope === '全部会话' ? '当日全部有效请求' : '当前会话';
   }
 
   /** 日志和实时请求共用来源别名，避免同一应用被重复列出。 */
@@ -667,8 +667,11 @@
       empty.textContent = '暂无额度';
       list.append(empty);
     } else if (entries.length && empty) empty.remove();
-    const quotaFailed = snapshot.quotaError || [...quotaViews.values()].some(view => view.item.dataset.stale === 'true');
-    list.title = [quotaFailed ? '旧读数' : '', snapshot.quotaError || (readings.length ? `最近读数 ${new Date(Math.min(...readings)).toLocaleString('zh-CN')}` : '暂无额度读数')].filter(Boolean).join('\n');
+    // 整批读取失败才标整栏旧数据；单个账号 401 只标该行，不连累其它账号。
+    const quotaFailed = Boolean(snapshot.quotaError);
+    const staleRows = [...quotaViews.values()].filter(view => view.item.dataset.stale === 'true').length;
+    list.title = [quotaFailed ? '旧读数' : staleRows ? `${staleRows} 个账号读数失败` : '',
+      snapshot.quotaError || (readings.length ? `最近读数 ${new Date(Math.min(...readings)).toLocaleString('zh-CN')}` : '暂无额度读数')].filter(Boolean).join('\n');
     const freshness = byId('quota-freshness');
     freshness.hidden = !quotaFailed;
     freshness.title = list.title;
@@ -726,7 +729,7 @@
       const pace = !Number.isFinite(used) ? 'unknown' : difference > 5 ? 'ahead' : difference < -5 ? 'within' : 'balanced';
       view.marker.dataset.pace = pace;
       const comparison = pace === 'ahead' ? '用量高于时间进度超过 5 个百分点' : pace === 'within' ? '用量低于时间进度超过 5 个百分点' : pace === 'balanced' ? '用量与时间进度相差不超过 5 个百分点' : '用量未知';
-      const hint = `细竖线：周期已过 ${elapsed.toFixed(1)}%；色条：已用额度；${comparison}`;
+      const hint = `细竖线：周期已过 ${elapsed.toFixed(1)}%${view.monthEstimated ? '（按一个月估算：从下次重置时间倒推一个日历月）' : ''}；色条：已用额度；${comparison}`;
       view.marker.title = `${view.item.title}\n${hint}`;
       view.track.title = view.marker.title;
       view.track.setAttribute('aria-description', hint);
@@ -812,7 +815,15 @@
 
   /** 更新同一额度项的数值和提示，不改变其在列表中的位置。 */
   function updateQuotaItem(view, { card, models, quota, span, windowName }) {
-    view.item.dataset.stale = String(Boolean(snapshot.quotaError || quota.error));
+    view.item.dataset.stale = String(Boolean(quota.error));
+    let stale = view.item.querySelector('.quota-stale');
+    if (quota.error && !stale) {
+      stale = document.createElement('span');
+      stale.className = 'quota-stale';
+      stale.textContent = '旧读数';
+      view.account.after(stale);
+    } else if (!quota.error && stale) stale.remove();
+    if (stale) stale.title = quota.error;
     const family = quotaIcon(quota.provider);
     if (family && view.image.getAttribute('src') !== `icons/${family}.svg`) view.image.src = `icons/${family}.svg`;
     view.image.hidden = !family;
@@ -823,9 +834,21 @@
     const resetTime = span?.resetsAt && !Number.isNaN(Date.parse(span.resetsAt)) ? new Date(span.resetsAt) : null;
     const credits = /credits?|积分/i.test(`${span?.name || ''} ${span?.unit || ''}`);
     const period = windowRank(span);
-    // 月份天数不固定，不能用额度排序的 30 天近似值冒充时间进度。
-    const calendarMonth = /months?|monthly|月/i.test(span?.name || '');
-    view.periodMs = !credits && !span?.unlimited && !calendarMonth && Number.isFinite(period) ? period * 60_000 : NaN;
+    // 月窗口按下次重置时间倒推一个日历月；月末夹到上月最后一天，并明确标为估算。
+    const calendarMonth = /^(months?|monthly|月|每月|1\s*(months?|月))$/i.test((span?.name || '').trim());
+    view.monthEstimated = calendarMonth;
+    let monthPeriod = NaN;
+    if (calendarMonth && resetTime) {
+      const start = new Date(resetTime);
+      const day = start.getUTCDate();
+      start.setUTCDate(1);
+      start.setUTCMonth(start.getUTCMonth() - 1);
+      const lastDay = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 0)).getUTCDate();
+      start.setUTCDate(Math.min(day, lastDay));
+      monthPeriod = resetTime.getTime() - start.getTime();
+    }
+    view.periodMs = !credits && !span?.unlimited
+      ? calendarMonth ? monthPeriod : !/months?|月/i.test(span?.name || '') && Number.isFinite(period) ? period * 60_000 : NaN : NaN;
     view.resetAt = resetTime ? resetTime.getTime() : NaN;
     if (!Number.isFinite(view.periodMs) || !Number.isFinite(view.resetAt)) view.track.removeAttribute('aria-description');
     let remainingCredits = null;
@@ -895,10 +918,10 @@
     byId('watch-label').title = snapshot.error || snapshot.watchLabel;
     text('router-host', snapshot.magpieHost);
     renderSources(sessions);
-    renderStats(session ? session.daily : snapshot.daily, session ? session.label : '全部会话');
-    window.dispatchEvent(new CustomEvent('hud-hourly-update', { detail: {
-      hourly: (session ? session.daily : snapshot.daily).hourly,
-      date: snapshot.date, scope: session ? session.label : '全部会话', error: snapshot.costError,
+    window.dispatchEvent(new CustomEvent('hud-live-stats', { detail: {
+      daily: session ? session.daily : snapshot.daily,
+      date: snapshot.date, earliestDate: snapshot.earliestDate, host: snapshot.magpieHost,
+      scope: session ? session.label : '全部会话', costError: snapshot.costError,
     } }));
     renderQuotas(session ? [session] : snapshot.sessions, forceQuotaOrder);
     if (hud.dataset.layout === 'tall') {
@@ -1007,16 +1030,15 @@
       }
       const stacked = router.top >= icon.bottom;
       index += 1;
-      // 上方来源走外弧接较低端口，下方来源走内弧接较高端口，形成互不相交的嵌套曲线。
-      const port = (stacked ? sources.length + 1 - index : index) / (sources.length + 1);
-      const x = (stacked ? icon.left + 3 : icon.right) - bounds.left;
-      const y = (stacked ? icon.bottom - 5 : icon.top + icon.height / 2) - bounds.top;
-      const endX = router.left - bounds.left;
-      const endY = router.top + router.height * port - bounds.top;
-      const bendX = 6 + (index - 1) * 10;
-      const corner = Math.min(32, (endY - y) / 3);
+      // 上下排列直接从图标下沿接入 Magpie 顶沿，允许交叉，不为绕线预留左侧走廊。
+      const port = index / (sources.length + 1);
+      const x = (stacked ? icon.left + icon.width / 2 : icon.right) - bounds.left;
+      const y = (stacked ? icon.bottom : icon.top + icon.height / 2) - bounds.top;
+      const endX = (stacked ? router.left + router.width * port : router.left) - bounds.left;
+      const endY = (stacked ? router.top : router.top + router.height * port) - bounds.top;
+      const bend = Math.max(10, Math.abs(endY - y) * .5);
       path.setAttribute('d', stacked
-        ? `M${x} ${y}C${bendX} ${y} ${bendX} ${y + corner / 2} ${bendX} ${y + corner}C${bendX} ${y + corner} ${bendX} ${endY - corner} ${bendX} ${endY - corner}C${bendX} ${endY} ${endX - 18} ${endY} ${endX} ${endY}`
+        ? `M${x} ${y}C${x} ${y + bend} ${endX} ${endY - bend} ${endX} ${endY}`
         : `M${x} ${y}C${x + (endX - x) * .5} ${y} ${endX - 12} ${endY} ${endX} ${endY}`);
       const flowing = entry.dataset.active === 'true';
       if (path.dataset.active !== String(flowing)) {
@@ -1174,6 +1196,31 @@
     window.addEventListener('blur', () => syncFocus(false));
     syncFocus(document.hasFocus());
     selector.addEventListener('change', () => { selectedCard = null; renderedIds.clear(); quotaOrderTimer = clearTimeout(quotaOrderTimer); render(false); });
+    // 悬停滚轮按选项顺序切换；累积触控板细小增量并限速，边界停止，不循环。
+    let wheelDelta = 0;
+    let wheelTime = 0;
+    let wheelSwitch = -Infinity;
+    selector.title = '滚轮上下切换会话';
+    selector.addEventListener('wheel', event => {
+      if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey
+          || !event.deltaY || Math.abs(event.deltaX) > Math.abs(event.deltaY)
+          || selector.disabled || selector.options.length < 2) return;
+      event.preventDefault();
+      const now = performance.now();
+      const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? selector.clientHeight : 1);
+      if (now - wheelTime > 180 || Math.sign(delta) !== Math.sign(wheelDelta)) wheelDelta = 0;
+      wheelTime = now;
+      if (now - wheelSwitch < 140) return;
+      wheelDelta += delta;
+      if (Math.abs(wheelDelta) < 32) return;
+      const index = Math.max(0, Math.min(selector.options.length - 1, selector.selectedIndex + Math.sign(wheelDelta)));
+      wheelDelta = 0;
+      if (index === selector.selectedIndex) return;
+      wheelSwitch = now;
+      selector.selectedIndex = index;
+      selector.dispatchEvent(new Event('change', { bubbles: true }));
+    }, { passive: false });
+    selector.addEventListener('mouseleave', () => { wheelDelta = 0; wheelTime = 0; });
     routeList.addEventListener('scroll', () => requestDraw(), { passive: true });
     byId('source-node').addEventListener('scroll', () => requestDraw(), { passive: true });
     setInterval(() => { updateCardTimes(); quotaCarousel(); updateQuotaClocks(); }, 1000);
@@ -1233,6 +1280,14 @@
       if (event.button === 0 && !event.target.closest('button,select,label')) window.__TAURI__.webviewWindow.getCurrentWebviewWindow().startDragging().catch(reportError);
     });
   }
+
+  window.addEventListener('hud-stats-view', event => {
+    const { daily, scope, date, costError, historical } = event.detail;
+    renderStats(daily, scope, costError, historical);
+    window.dispatchEvent(new CustomEvent('hud-hourly-update', { detail: {
+      hourly: daily.hourly, date, scope, error: costError,
+    } }));
+  });
 
   // 独立浏览器验证可通过已声明事件注入脱敏 fixture；产品从不自行生成演示数据。
   window.addEventListener('hud-preview-snapshot', event => { if (!window.__TAURI__) acceptSnapshot(event.detail, true); });

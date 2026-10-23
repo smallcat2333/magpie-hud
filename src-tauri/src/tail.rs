@@ -25,7 +25,16 @@ pub struct LogCursor {
 impl LogCursor {
     /// 处理文件的新完整行；返回是否观察到字节、日期或文件存在状态变化。
     pub fn update(&mut self, path: &Path, ledger: &mut UsageLedger) -> Result<bool, String> {
-        let day = Local::now().date_naive();
+        self.update_for_day(path, ledger, Local::now().date_naive())
+    }
+
+    /// 按指定本地日期流式读取日志，供当日实时游标与历史单日回溯共用。
+    pub fn update_for_day(
+        &mut self,
+        path: &Path,
+        ledger: &mut UsageLedger,
+        day: NaiveDate,
+    ) -> Result<bool, String> {
         let day_changed = self.day != Some(day);
         if day_changed {
             ledger.change_day(day);

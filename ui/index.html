@@ -9,7 +9,9 @@
   <link rel="stylesheet" href="hud.css?v=0.0.28-20261023-quota-inline">
   <script src="motion.js?v=0.0.28-20261023-digit-roll" defer></script>
   <script src="hourly.js?v=0.0.28-20261022-endpoint-motion" defer></script>
-  <script src="hud.js?v=0.0.28-20261023-quota-inline" defer></script>
+  <link rel="stylesheet" href="dates.css?v=20261023-deeper-heat">
+  <script src="dates.js?v=20261023-deeper-heat" defer></script>
+  <script src="hud.js?v=0.0.28-20261023-deeper-heat" defer></script>
 </head>
 <body>
 <main class="hud" id="hud" data-state="waiting" data-sources="compact" data-focus="true">
@@ -30,10 +32,18 @@
   <div class="content">
     <aside class="sidebar" aria-label="统计与用量">
     <section class="daily" aria-label="当日统计">
-      <div class="daily-heading"><strong>当日</strong><time id="stats-date">—</time></div>
+      <div class="daily-heading">
+        <div id="stats-date-nav" class="stats-date-nav" role="group" aria-label="统计日期，左右方向键切换，Home 回今天">
+          <button id="stats-prev" type="button" aria-label="查看前一天统计" disabled><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m10 3-5 5 5 5"/></svg></button>
+          <button id="stats-date-label" class="stats-date-label" type="button" aria-label="打开用量热力日历" aria-haspopup="dialog" aria-expanded="false" aria-controls="stats-calendar"><time id="stats-date">—</time></button>
+          <button id="stats-next" type="button" aria-label="查看后一天统计" disabled><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg></button>
+          <button id="stats-today" type="button" hidden>回今天</button>
+        </div>
+      </div>
+      <div class="stats-date-status-row"><p id="stats-date-status" class="stats-date-status" role="status" hidden></p><button id="stats-retry" type="button" hidden>重试</button></div>
       <dl>
         <div class="metric" id="tokens-metric" tabindex="0"><dt>Token</dt><dd id="daily-tokens">—</dd><small id="request-count">等待记录</small></div>
-        <div class="metric" id="speed-metric" tabindex="0"><dt>TPS <span>tok/s</span></dt><dd id="daily-speed">—</dd><small>最近 10 个会话</small></div>
+        <div class="metric" id="speed-metric" tabindex="0"><dt>TPS <span>tok/s</span></dt><dd id="daily-speed">—</dd><small>当日全部有效请求</small></div>
         <div class="metric" id="cost-metric" tabindex="0"><dt>费用估值 <span id="cost-unit"></span> <span id="cost-status" role="status"></span></dt><dd id="daily-cost">未定价</dd><small id="cost-coverage">等待 Magpie 费用</small></div>
         <div class="metric secondary-metric" id="cache-metric" tabindex="0"><dt><span class="label-wide">缓存命中</span><span class="label-compact">缓存</span></dt><dd id="daily-cache">—</dd></div>
         <div class="metric secondary-metric" id="calls-metric" tabindex="0"><dt><span class="label-wide">调用次数</span><span class="label-compact">调用</span></dt><dd id="daily-calls">0</dd></div>
@@ -50,7 +60,7 @@
       <table id="hourly-table" class="hourly-table"><caption>每小时明细</caption><thead><tr><th>时段</th><th>Token</th><th>USD</th></tr></thead><tbody></tbody></table>
     </section>
     <section class="quota" aria-label="账号用量">
-      <div class="quota-heading"><h2>用量</h2><span id="quota-freshness" hidden>旧数据</span></div>
+      <div class="quota-heading"><h2 id="quota-title">用量</h2><span id="quota-freshness" hidden>旧数据</span></div>
       <div id="quota-list" class="quota-list"><p class="quota-empty">等待当前会话的额度</p></div>
     </section>
     </aside>
@@ -64,7 +74,7 @@
       <svg class="inbound" viewBox="0 0 48 100" preserveAspectRatio="none" aria-hidden="true"><path class="route-track" d="M2 60C22 60 26 42 46 42"/><path class="route-active" id="inbound-active" d="M2 60C22 60 26 42 46 42"/></svg>
       <div class="router-node" tabindex="0" aria-label="本机 Magpie 路由器">
         <div class="router-emblem"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg></div>
-        <strong>magpie</strong><small id="session-count">0会话</small><span id="router-host">127.0.0.1:3425</span>
+        <strong>magpie</strong><span class="stats-live-label">实时路由</span><small id="session-count">0会话</small><span id="router-host">127.0.0.1:3425</span>
       </div>
       </div>
       <div class="route-area" id="route-area">
@@ -78,6 +88,23 @@
     <div class="note-row"><time id="line2-time">--:--:--</time><span class="note-kind" id="line2-kind">来源</span><p id="line2-text">只读 usage.jsonl</p></div>
   </section>
 </main>
+<div id="stats-calendar" class="stats-calendar" role="dialog" aria-modal="false" aria-labelledby="calendar-title" hidden>
+  <div class="calendar-heading">
+    <strong id="calendar-title">用量热力日历</strong>
+    <button id="calendar-close" type="button" aria-label="关闭日历">×</button>
+  </div>
+  <div class="calendar-month-nav">
+    <button id="calendar-prev" type="button" aria-label="上个月">‹</button>
+    <strong id="calendar-month"></strong>
+    <button id="calendar-next" type="button" aria-label="下个月">›</button>
+  </div>
+  <div class="calendar-weekdays" aria-hidden="true"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>
+  <div id="calendar-days" class="calendar-days" role="group" aria-label="按日期查看 Token 用量"></div>
+  <p id="calendar-readout" class="calendar-readout" role="status"></p>
+  <div class="calendar-legend" aria-label="色块由浅至深表示 Token 用量从少到多，无调用日期无底色"><span>Token 少</span><i data-heat="0"></i><i data-heat="1"></i><i data-heat="2"></i><i data-heat="3"></i><i data-heat="4"></i><span>多</span></div>
+  <div class="calendar-footer"><span id="calendar-summary"></span><button id="calendar-retry" type="button" hidden>重试</button><button id="calendar-today" type="button">回今天</button></div>
+  <table id="calendar-table" class="calendar-table"><caption>每日 Token 与调用明细</caption><thead><tr><th>日期</th><th>Token</th><th>调用</th></tr></thead><tbody></tbody></table>
+</div>
 <div class="resize-edge north" data-resize="North" aria-hidden="true"></div>
 <div class="resize-edge south" data-resize="South" aria-hidden="true"></div>
 <div class="resize-edge east" data-resize="East" aria-hidden="true"></div>
