@@ -285,7 +285,13 @@
     clock.title = card.updatedAt ? `最近请求活动 ${new Date(card.updatedAt).toLocaleString('zh-CN', { hour12: false })}` : '更新时间未提供';
     const headingAccount = label.cloneNode(true);
     headingAccount.classList.add('card-heading-account');
-    copy.append(headingAccount, clock);
+    headingAccount.textContent = /^(正在选择账号|账号未提供)$/.test(card.account) ? '待定' : card.account;
+    const headingDivider = document.createElement('span');
+    headingDivider.className = 'card-heading-divider';
+    headingDivider.textContent = '|';
+    headingDivider.setAttribute('aria-hidden', 'true');
+    top.append(headingDivider, headingAccount);
+    copy.append(clock);
     button.append(icon, copy, metrics);
     button.addEventListener('click', () => {
       selectedCard = card.id;
@@ -509,7 +515,7 @@
 
   /** 六项数值和可聚焦区域共用完整说明，避免数字节点自己的 title 遮住详情。 */
   function metric(id, valueId, value, detail) {
-    window.hudMotion.flip(byId(valueId), value);
+    window.hudMotion.roll(byId(valueId), value);
     const element = byId(id);
     element.title = detail;
     element.setAttribute('aria-label', detail);
@@ -645,6 +651,7 @@
     freshness.hidden = !quotaFailed;
     freshness.title = list.title;
     list.scrollTop = scroll;
+    updateQuotaClocks();
     window.hudMotion.layout(before, [...quotaViews.values()].map(view => view.item), node => node.dataset.quotaKey);
   }
 
@@ -661,6 +668,22 @@
     const scale = /^(months?|月)$/.test(unit) ? 43200 : /^(weeks?|w|周)$/.test(unit) ? 10080
       : /^(days?|d|天)$/.test(unit) ? 1440 : /^(hours?|hrs?|h|小时)$/.test(unit) ? 60 : 1;
     return Number(match[1]) * scale;
+  }
+
+  /** 固定周期的时间进度只在本地推进，不触发额度接口或重建卡片。 */
+  function updateQuotaClocks() {
+    const now = Date.now();
+    for (const view of quotaViews.values()) {
+      const { periodMs, resetAt } = view;
+      view.marker.hidden = !Number.isFinite(periodMs) || periodMs <= 0 || !Number.isFinite(resetAt);
+      if (view.marker.hidden) continue;
+      const elapsed = Math.min(100, Math.max(0, (1 - (resetAt - now) / periodMs) * 100));
+      view.marker.style.left = `clamp(0px, ${elapsed}%, calc(100% - 1px))`;
+      const hint = `细竖线：周期已过 ${elapsed.toFixed(1)}%；色条：已用额度`;
+      view.marker.title = `${view.item.title}\n${hint}`;
+      view.track.title = view.marker.title;
+      view.track.setAttribute('aria-description', hint);
+    }
   }
 
   /** 额度使用供应商品牌，不根据供应商背后的模型猜测图标。 */
@@ -704,11 +727,15 @@
     track.setAttribute('role', 'progressbar');
     const fill = document.createElement('span');
     fill.className = 'quota-fill';
-    track.append(fill);
+    const marker = document.createElement('span');
+    marker.className = 'quota-time-marker';
+    marker.hidden = true;
+    marker.setAttribute('aria-hidden', 'true');
+    track.append(fill, marker);
     const value = document.createElement('strong');
     row.append(label, track, value);
     item.append(icon, header, row);
-    return { item, icon, image, fallback, account, reset, label, track, fill, value };
+    return { item, icon, image, fallback, account, reset, label, track, fill, marker, value };
   }
 
   /** 重置倒计时使用两级单位；不足一分钟时不显示负数或虚假的零分钟。 */
@@ -734,6 +761,12 @@
     view.account.title = card.account;
     const resetTime = span?.resetsAt && !Number.isNaN(Date.parse(span.resetsAt)) ? new Date(span.resetsAt) : null;
     const credits = /credits?|积分/i.test(`${span?.name || ''} ${span?.unit || ''}`);
+    const period = windowRank(span);
+    // 月份天数不固定，不能用额度排序的 30 天近似值冒充时间进度。
+    const calendarMonth = /months?|monthly|月/i.test(span?.name || '');
+    view.periodMs = !credits && !span?.unlimited && !calendarMonth && Number.isFinite(period) ? period * 60_000 : NaN;
+    view.resetAt = resetTime ? resetTime.getTime() : NaN;
+    if (!Number.isFinite(view.periodMs) || !Number.isFinite(view.resetAt)) view.track.removeAttribute('aria-description');
     let remainingCredits = null;
     if (credits && Number.isFinite(span.limit)) {
       if (Number.isFinite(span.amount)) remainingCredits = Math.max(0, span.limit - span.amount);
@@ -1041,7 +1074,7 @@
     syncFocus(document.hasFocus());
     selector.addEventListener('change', () => { selectedCard = null; renderedIds.clear(); quotaOrderTimer = clearTimeout(quotaOrderTimer); render(false); });
     routeList.addEventListener('scroll', () => requestDraw(), { passive: true });
-    setInterval(updateCardTimes, 1000);
+    setInterval(() => { updateCardTimes(); updateQuotaClocks(); }, 1000);
     new ResizeObserver(() => render(false)).observe(hud);
     new ResizeObserver(() => requestDraw()).observe(document.querySelector('.routing'));
     document.querySelector('.content').addEventListener('scroll', () => requestDraw(), { passive: true });

@@ -74,28 +74,47 @@
     return changed;
   }
 
-  function flip(node, value) {
+  function roll(node, value) {
     const previous = node.dataset.motionValue ?? node.textContent;
     node.dataset.motionValue = value;
     if (previous === value) return;
     node.getAnimations({ subtree: true }).forEach(animation => animation.cancel());
     node.textContent = value;
     if (!enabled() || !previous || previous === '—') return;
-    const old = document.createElement('span');
-    old.className = 'metric-outgoing';
-    old.textContent = previous;
-    old.setAttribute('aria-hidden', 'true');
-    const next = document.createElement('span');
-    next.className = 'metric-incoming';
-    next.textContent = value;
-    node.replaceChildren(old, next);
-    const outgoing = animate(old, [{ transform: 'perspective(160px) rotateX(0)', opacity: 1 }, { transform: 'perspective(160px) rotateX(80deg) translateY(-5px)', opacity: 0 }], 160);
-    outgoing.effect.updateTiming({ fill: 'forwards' });
-    const animation = animate(next, [{ transform: 'perspective(160px) rotateX(-80deg) translateY(5px)', opacity: 0 }, { transform: 'perspective(160px) rotateX(0)', opacity: 1 }], 300);
-    const finish = () => { if (next.isConnected && node.dataset.motionValue === value) node.replaceChildren(document.createTextNode(value)); };
-    animation.onfinish = finish;
-    animation.oncancel = finish;
-    setTimeout(finish, 340);
+    const reel = document.createElement('span');
+    reel.className = 'metric-reel';
+    reel.setAttribute('aria-hidden', 'true');
+    const label = document.createElement('span');
+    label.className = 'metric-readable';
+    label.textContent = value;
+    const offset = previous.length - value.length;
+    [...value].forEach((character, index) => {
+      const before = previous[index + offset] || '';
+      if (before === character || !/\d/.test(character)) {
+        reel.append(document.createTextNode(character));
+        return;
+      }
+      const cell = document.createElement('span');
+      cell.className = 'metric-digit';
+      const old = document.createElement('span');
+      old.className = 'metric-digit-old';
+      old.textContent = before;
+      const next = document.createElement('span');
+      next.className = 'metric-digit-new';
+      next.textContent = character;
+      cell.append(old, next);
+      reel.append(cell);
+    });
+    node.replaceChildren(reel, label);
+    reel.querySelectorAll('.metric-digit').forEach(cell => {
+      const old = cell.querySelector('.metric-digit-old');
+      const next = cell.querySelector('.metric-digit-new');
+      const outgoing = animate(old, [{ transform: 'translateY(0)' }, { transform: 'translateY(100%)' }], 360);
+      outgoing.effect.updateTiming({ fill: 'forwards' });
+      animate(next, [{ transform: 'translateY(-100%)' }, { transform: 'translateY(0)' }], 360);
+    });
+    const finish = () => { if (reel.isConnected) node.replaceChildren(document.createTextNode(value)); };
+    setTimeout(finish, 400);
   }
 
   function settle() {
@@ -110,5 +129,5 @@
   }
   reduced.addEventListener('change', () => { if (reduced.matches) settle(); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) settle(); });
-  window.hudMotion = { enabled, animate, capture, layout, flip };
+  window.hudMotion = { enabled, animate, capture, layout, roll };
 })();

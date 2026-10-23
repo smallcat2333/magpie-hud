@@ -1,6 +1,6 @@
 [package]
 name = "magpie-hud"
-version = "0.0.27"
+version = "0.0.28"
 description = "只读监视 Magpie 路由结果的 Windows 悬浮窗"
 authors = ["smallcat_SY"]
 edition = "2021"
