@@ -187,7 +187,10 @@ impl LiveState {
             if route.is_some_and(|r| r.kind == "routing") {
                 continue;
             }
-            // concurrency 是活跃依据；路由尚未到齐时只显示会话级等待，不猜账号或子 Agent。
+            // concurrency 不含子 Agent 身份；等 trace 到齐再挂卡，不能把未知请求先当根请求。
+            if route.is_none() {
+                continue;
+            }
             let child = route.map(|r| r.subagent_id.trim()).filter(|id| !id.is_empty());
             let session_id = if active.session.is_empty() {
                 route.map(|r| r.session.as_str()).unwrap_or("")
@@ -799,12 +802,8 @@ mod tests {
             started: now.to_rfc3339(), ms: 120_000, ..Default::default() });
         let mut pending = baseline.clone();
         live.apply(&mut pending);
-        let card = &pending.sessions[0].routes[0];
-        assert_eq!(card.state, "waiting");
-        assert_eq!(card.detail, "请求已开始 · 等待路由信息");
-        assert_eq!(card.route_id, None);
-        assert_eq!(card.tokens, None);
-        assert_eq!(pending.watch_label, "1 个会话请求中");
+        assert_eq!(pending.sessions[0].routes, baseline.sessions[0].routes);
+        assert_eq!(pending.sessions[0].routes[0].state, "success");
         assert_eq!(pending.daily, baseline.daily);
 
         live.activity.active[0].route = 10;
@@ -915,7 +914,7 @@ mod tests {
         }
     }
 
-    /// 未知路由先只挂会话等待；身份补全后归位子 Agent，不残留伪根请求。
+    /// 未知身份不挂伪根请求；trace 到齐后首次直接作为子 Agent 出现。
     #[test]
     fn pending_identity_moves_to_child_when_trace_arrives() {
         let now = Local::now();
@@ -925,13 +924,18 @@ mod tests {
             started: now.to_rfc3339(), phase: "upstream".into(), ..Default::default() });
         let mut pending = baseline.clone();
         live.apply(&mut pending);
-        assert_eq!(pending.sessions[0].routes[0].state, "waiting");
+        assert!(pending.sessions.is_empty());
         live.routes.insert(10, LiveRoute { id: 10, session: "alpha".into(), subagent_id: "child-one".into(), ..Default::default() });
         let mut known = baseline.clone();
         live.apply(&mut known);
         assert!(known.sessions[0].routes.is_empty());
         assert_eq!(known.sessions[0].subagents[0].state, "running");
         assert_eq!(known.sessions[0].subagents[0].subagent_id.as_deref(), Some("child-one"));
+        live.routes.get_mut(&10).unwrap().subagent_id.clear();
+        let mut root = baseline.clone();
+        live.apply(&mut root);
+        assert_eq!(root.sessions[0].routes[0].state, "running");
+        assert!(root.sessions[0].subagents.is_empty());
         live.routes.get_mut(&10).unwrap().kind = "routing".into();
         let mut internal = baseline;
         live.apply(&mut internal);
@@ -998,7 +1002,7 @@ mod tests {
         assert!(finished.sessions.iter().flat_map(|session| &session.routes).all(|card| !card.metrics_are_previous));
     }
 
-    /// 子请求挂在父会话下；路由身份未知时给会话级等待，不借用根卡或子项的指标。
+    /// 子请求挂在父会话下；未知身份不覆盖已完成根卡或借用任何指标。
     #[test]
     fn active_children_mount_without_replacing_completed_root() {
         let now = Local::now();
@@ -1020,16 +1024,20 @@ mod tests {
             live.activity.active.push(Active { id, session: "alpha".into(), agent: "test".into(),
                 started: now.to_rfc3339(), phase: "upstream".into(), route, ..Default::default() });
         }
+        let unresolved = std::mem::take(&mut live.activity.active);
+        live.activity.active.push(Active { id: 104, session: "alpha".into(), agent: "test".into(),
+            started: now.to_rfc3339(), phase: "upstream".into(), route: 99, ..Default::default() });
+        let mut pending = baseline.clone();
+        live.apply(&mut pending);
+        assert_eq!(pending.sessions[0].routes, baseline.sessions[0].routes);
+        assert!(pending.sessions[0].subagents.is_empty());
+        live.activity.active = unresolved;
         let mut view = baseline.clone();
         live.apply(&mut view);
         let session = view.sessions.iter().find(|session| session.id == "alpha").unwrap();
         assert_eq!(session.routes.len(), 1);
-        let pending = &session.routes[0];
-        assert_eq!(pending.state, "waiting");
-        assert_eq!(pending.detail, "请求已开始 · 等待路由信息");
-        assert_eq!(pending.account, "正在选择账号");
-        assert!(pending.tokens.is_none());
-        assert!(pending.subagent_id.is_none());
+        assert_eq!(session.routes, baseline.sessions.iter().find(|session| session.id == "alpha").unwrap().routes);
+        assert_eq!(session.routes[0].state, "success");
         assert_eq!(session.subagents.len(), 2);
         let known = session.subagents.iter().find(|card| card.subagent_id.as_deref() == Some("child-aaaaaaaa")).unwrap();
         assert_eq!(known.route_id, Some(23));
