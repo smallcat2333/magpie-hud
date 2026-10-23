@@ -61,8 +61,8 @@
 .quota-meta,.quota-window{grid-column:2}
 /* 细线对比周期时间与已用比例，伸出色条上下各 2px。 */
 .quota-track{position:relative;overflow:visible}
-.quota-fill{border-radius:4px;max-width:100%}
-.quota-time-marker{position:absolute;top:-2px;bottom:-2px;width:1px;background:var(--ink);box-shadow:0 0 0 1px rgb(23 25 30/.5);z-index:1}
+.quota-fill{border-radius:4px;max-width:100%;transition:background-color 480ms ease}
+.quota-time-marker{position:absolute;top:-2px;bottom:-2px;width:1px;background:var(--ink);box-shadow:0 0 0 1px rgb(23 25 30/.5);z-index:1;transition:background-color 480ms ease}
 .quota-time-marker[data-pace="balanced"]{background:var(--muted)}
 .quota-time-marker[data-pace="within"]{background:var(--completed)}
 .quota-time-marker[data-pace="ahead"]{background:#ff9a3c}
@@ -100,6 +100,18 @@
 .hud[data-layout="wide"][data-sources="multiple"] .inbound{width:38px;height:25px;margin-left:24px;transform:rotate(60deg)}
 .hud[data-layout="wide"][data-sources="multiple"] .router-node{justify-self:center;width:100%}
 }
+/* 来源共用稳定中转布局，每个图标独立接入 Magpie。 */
+@media(min-width:1001px){.hud[data-layout="wide"][data-sources] .routing{grid-template-columns:188px minmax(0,1fr)}}
+@media(max-width:1000px){.hud[data-layout="wide"][data-sources] .routing{grid-template-columns:172px minmax(0,1fr)}}
+.hud[data-layout="wide"][data-sources] .transit{grid-template-columns:minmax(0,1fr);grid-template-rows:auto 25px auto;align-content:center;justify-items:end;padding-left:42px;padding-right:8px}
+.hud[data-layout="wide"][data-sources] .router-node{grid-column:1;grid-row:3;justify-self:center;width:100%}
+.transit{position:relative}
+.source-lines{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:hidden}
+.transit>.inbound{display:none!important}
+.source-node{grid-column:1;grid-row:1;position:relative;z-index:1}
+.router-node{grid-column:3;grid-row:1}
+.hud[data-layout="wide"][data-sources="compact"] .router-node{grid-column:1;grid-row:3}
+@media(max-width:1000px){.hud[data-layout="wide"][data-sources="multiple"] .router-node{grid-column:1;grid-row:3}}
 /* 按卡片可用宽度显示时间和组路径，窄卡不挤压模型、状态与指标。 */
 .routes{container-type:inline-size}
 .card-time,.card-route-groups,.card-heading-account,.card-heading-divider,.subagent-created{display:none}
@@ -134,5 +146,5 @@
 .metric-readable{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 .motion-exit{contain:layout style;pointer-events:none!important}
 /* 状态流动保持原速；减少动态效果只关闭入场强调，不改变持续状态动画的节奏。 */
-@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}.quota-fill,.quota-time-marker{transition:none}}
 @media(forced-colors:active){.hud,.sidebar,.daily,.quota,.route-card{border-color:CanvasText;background:Canvas}.branch,.route-active{stroke:Highlight}.quota-track{border:1px solid CanvasText}.quota-fill{background:Highlight}.request-spinner{color:Highlight}.route-card::before{background:Highlight}.route-card.failed{border-style:dashed}}

@@ -386,12 +386,14 @@ fn start_live(app: AppHandle) {
         let mut titles = live::Titles::default();
         let mut child_titles = live::ChildTitles::default();
         let mut names = std::collections::HashMap::new();
+        let mut aliases = std::collections::HashMap::new();
         let mut child_labels = std::collections::HashMap::new();
         let mut last_titles = Instant::now() - Duration::from_secs(3);
         let mut last_children = Instant::now() - Duration::from_secs(8);
         loop {
             if last_titles.elapsed() >= Duration::from_secs(2) {
                 names = titles.scan(&live::desktop_roots());
+                aliases = titles.aliases();
                 last_titles = Instant::now();
             }
             if last_children.elapsed() >= Duration::from_secs(8) {
@@ -406,6 +408,7 @@ fn start_live(app: AppHandle) {
             {
                 let mut runtime = shared.lock().expect("状态锁损坏");
                 runtime.live.names = names.clone();
+                runtime.live.aliases = aliases.clone();
                 runtime.live.child_labels = child_labels.clone();
                 match result {
                     Ok(activity) => { runtime.live.activity = activity; runtime.live.error = None; }

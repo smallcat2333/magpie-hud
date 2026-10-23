@@ -14,6 +14,8 @@
   let renderedIds = new Set();
   let frame = 0;
   const branchViews = new Map();
+  const sourceViews = new Map();
+  const sourceBranches = new Map();
   const quotaViews = new Map();
   const subagentNumbers = new Map();
   const childPresence = new Map();
@@ -557,14 +559,33 @@
     return scope === '全部会话' ? '最近 10 个会话' : '当前会话';
   }
 
+  /** 日志和实时请求共用来源别名，避免同一应用被重复列出。 */
+  function sourceName(agent) {
+    const name = String(agent || '').trim();
+    const key = name.toLowerCase().replace(/[\s_-]/g, '');
+    if (key === 'claudedesktop') return 'Claude Desktop';
+    if (key === 'claude' || key === 'claudecode') return 'Claude Code';
+    return name || 'Agent 未提供';
+  }
+
   /** 来源按真实 Agent 合并，最多两个时与 Magpie 纵向排列，给会话留出宽度。 */
   function renderSources(sessions) {
-    const agents = new Set(sessions.map(item => item.agent));
+    const agents = new Map();
+    for (const session of sessions) {
+      const agent = sourceName(session.agent);
+      agents.set(agent, Boolean(agents.get(agent)) || sessionIsActive(session));
+    }
     const list = byId('source-list');
-    list.replaceChildren();
-    for (const agent of agents) {
-      const entry = document.createElement('div');
+    for (const [agent, entry] of sourceViews) {
+      if (!agents.has(agent)) { entry.remove(); sourceViews.delete(agent); }
+    }
+    for (const [agent, active] of agents) {
+      let entry = sourceViews.get(agent);
+      if (entry) { entry.dataset.active = String(active); continue; }
+      entry = document.createElement('div');
       entry.className = 'source-entry';
+      entry.dataset.source = agent;
+      entry.dataset.active = String(active);
       const heading = document.createElement('div');
       heading.className = 'source-heading';
       const icon = document.createElement('span');
@@ -581,9 +602,12 @@
       name.title = agent;
       heading.append(icon, name);
       entry.append(heading);
+      if (!sourceViews.size) list.replaceChildren();
+      sourceViews.set(agent, entry);
       list.append(entry);
     }
     if (!agents.size) list.textContent = '等待请求';
+    list.dataset.count = String(agents.size);
     hud.dataset.sources = agents.size <= 2 ? 'compact' : 'multiple';
   }
 
@@ -610,29 +634,27 @@
       const quota = candidates[0];
       const read = quota.readAt || quota.asOf;
       if (read && !Number.isNaN(Date.parse(read))) readings.push(new Date(read));
-      const shortest = quota.windows.length ? quota.windows.reduce((best, span) => windowRank(span) < windowRank(best) ? span : best) : null;
-      const windows = [shortest];
-      windows.forEach((span, index) => {
-        const windowName = span?.name === '5 hours' ? '5h' : ['7 days', 'Weekly'].includes(span?.name) ? '周' : span?.name || '额度';
-        entries.push({ key, index, card, models, quota, span, windowName });
-      });
+      const windows = quota.windows.length ? [...quota.windows].sort((a, b) => windowRank(a) - windowRank(b)) : [null];
+      entries.push({ key, card, models, quota, windows });
     }
-    const orderKey = entries.map(entry => `${entry.key}|${entry.index}`).join('\n');
+    const orderKey = entries.map(entry => entry.key).join('\n');
     if (!forceOrder && quotaRenderKey && orderKey !== quotaRenderKey) {
       const ranks = new Map(quotaRenderKey.split('\n').map((key, index) => [key, index]));
-      entries.sort((a, b) => (ranks.get(`${a.key}|${a.index}`) ?? Infinity) - (ranks.get(`${b.key}|${b.index}`) ?? Infinity));
+      entries.sort((a, b) => (ranks.get(a.key) ?? Infinity) - (ranks.get(b.key) ?? Infinity));
     } else quotaRenderKey = orderKey;
-    const next = new Map(entries.map(entry => [`${entry.key}|${entry.index}`, entry]));
+    const next = new Map(entries.map(entry => [entry.key, entry]));
     for (const [key, view] of quotaViews) {
       if (!next.has(key)) { view.item.remove(); quotaViews.delete(key); }
     }
     let previous = null;
     for (const entry of entries) {
-      const itemKey = `${entry.key}|${entry.index}`;
-      const view = quotaViews.get(itemKey) || createQuotaItem(entry);
+      const itemKey = entry.key;
+      const view = quotaViews.get(itemKey) || createQuotaItem();
       quotaViews.set(itemKey, view);
       view.item.dataset.quotaKey = itemKey;
-      updateQuotaItem(view, entry);
+      view.entry = entry;
+      view.carouselStart ??= performance.now();
+      updateQuotaWindow(view);
       if (view.item.parentElement !== list || view.item.previousElementSibling !== previous) {
         list.insertBefore(view.item, previous ? previous.nextSibling : list.firstChild);
       }
@@ -661,13 +683,33 @@
     if (/^(weekly|week|周|每周)$/.test(name)) return 7 * 1440;
     if (/^(daily|day|日|每天)$/.test(name)) return 1440;
     if (/^(monthly|month|月|每月)$/.test(name)) return 30 * 1440;
-    const match = name.match(/(\d+(?:\.\d+)?)\s*(minutes?|mins?|m|分钟|hours?|hrs?|h|小时|days?|d|天|weeks?|w|周|months?|月)\b/i)
+    const match = name.match(/(\d+(?:\.\d+)?)\s*(months?|weeks?|minutes?|mins?|hours?|hrs?|days?|[mhdw])\b/i)
       || name.match(/(\d+(?:\.\d+)?)\s*(分钟|小时|天|周|月)/);
     if (!match) return Infinity;
     const unit = match[2];
     const scale = /^(months?|月)$/.test(unit) ? 43200 : /^(weeks?|w|周)$/.test(unit) ? 10080
       : /^(days?|d|天)$/.test(unit) ? 1440 : /^(hours?|hrs?|h|小时)$/.test(unit) ? 60 : 1;
     return Number(match[1]) * scale;
+  }
+
+  /** 在同一根条内切换窗口，账号行与色条节点始终复用。 */
+  function updateQuotaWindow(view, now = performance.now()) {
+    const { windows } = view.entry;
+    const phase = (now - view.carouselStart) % (20_000 + (windows.length - 1) * 5_000);
+    const index = phase < 20_000 ? 0 : 1 + Math.floor((phase - 20_000) / 5_000);
+    const span = windows[index];
+    const name = span?.name || '额度';
+    const windowName = /^5\s*(hours?|h)$/i.test(name) ? '5h'
+      : /^(weekly|week|7 days|周|每周)$/i.test(name) ? '周'
+        : /^(monthly|month|月|每月)$/i.test(name) ? '月' : name;
+    view.windowIndex = index;
+    updateQuotaItem(view, { ...view.entry, span, windowName });
+  }
+
+  /** 本地轮播不重排列表，也不触发接口请求。 */
+  function quotaCarousel() {
+    const now = performance.now();
+    for (const view of quotaViews.values()) updateQuotaWindow(view, now);
   }
 
   /** 固定周期的时间进度只在本地推进，不触发额度接口或重建卡片。 */
@@ -678,7 +720,7 @@
       view.marker.hidden = !Number.isFinite(periodMs) || periodMs <= 0 || !Number.isFinite(resetAt);
       if (view.marker.hidden) continue;
       const elapsed = Math.min(100, Math.max(0, (1 - (resetAt - now) / periodMs) * 100));
-      view.marker.style.left = `clamp(0px, ${elapsed}%, calc(100% - 1px))`;
+      slideQuota(view.marker, 'left', elapsed);
       const used = view.track.dataset.unknown === 'false' ? Number(view.fill.dataset.percent) : NaN;
       const difference = used - elapsed;
       const pace = !Number.isFinite(used) ? 'unknown' : difference > 5 ? 'ahead' : difference < -5 ? 'within' : 'balanced';
@@ -754,6 +796,20 @@
     return minutes ? `${minutes}m` : '<1m';
   }
 
+  /** 色条和周期线从当前位置滑到新位置；减少动态时直接落位。 */
+  function slideQuota(node, property, percent) {
+    const shown = property === 'width' ? percent.toFixed(1) : percent.toFixed(2);
+    const target = property === 'width' ? `${shown}%` : `clamp(0px, ${shown}%, calc(100% - 1px))`;
+    if (node.dataset.shown === shown) return;
+    const first = node.dataset.shown === undefined;
+    node.dataset.shown = shown;
+    if (!window.hudMotion.enabled() || first) { node.style[property] = target; return; }
+    const previous = getComputedStyle(node)[property];
+    node.getAnimations().forEach(animation => animation.cancel());
+    node.style[property] = target;
+    window.hudMotion.animate(node, [{ [property]: previous }, { [property]: target }], 480);
+  }
+
   /** 更新同一额度项的数值和提示，不改变其在列表中的位置。 */
   function updateQuotaItem(view, { card, models, quota, span, windowName }) {
     view.item.dataset.stale = String(Boolean(snapshot.quotaError || quota.error));
@@ -793,17 +849,12 @@
       view.track.setAttribute('aria-valuemin', '0');
       view.track.setAttribute('aria-valuemax', '100');
       view.track.setAttribute('aria-valuenow', String(percent));
-      const previous = Number(view.fill.dataset.percent || 0);
-      view.fill.style.width = `${percent}%`;
       view.fill.dataset.percent = String(percent);
-      if (percent > 0 && Math.abs(previous - percent) > .01 && window.hudMotion.enabled()) {
-        view.fill.getAnimations().forEach(animation => animation.cancel());
-        view.fill.style.transformOrigin = 'left center';
-        window.hudMotion.animate(view.fill, [{ transform: `scaleX(${previous / percent})` }, { transform: 'scaleX(1)' }], 460);
-      }
+      slideQuota(view.fill, 'width', percent);
     } else {
-      view.fill.style.width = '0';
+      slideQuota(view.fill, 'width', 0);
       view.fill.dataset.percent = '0';
+      view.track.removeAttribute('aria-valuenow');
     }
     const severity = percent === null ? 'unknown' : used > 98 ? 'critical' : used > 80 ? 'warning' : 'normal';
     view.track.parentElement.dataset.severity = severity;
@@ -904,7 +955,7 @@
     }
     renderSources(sessions);
     text('session-count', session ? session.label : `${visibleSessions.length}会话, 显示${sessions.length}个`);
-    byId('source-node').title = [...new Set(sessions.map(item => item.agent))].join('\n');
+    byId('source-node').title = [...new Set(sessions.map(item => sourceName(item.agent)))].join('\n');
     routeList.scrollTop = oldScroll;
     byId('empty-route').hidden = sessions.length > 0;
     const inbound = byId('inbound-active');
@@ -934,8 +985,53 @@
     return Math.max(3, Math.floor((available + 9) / (tall ? 105 : 77)));
   }
 
+  /** 各来源独立连入路由器，复用线节点以保持流动动画相位。 */
+  function drawSourceLines() {
+    const layer = byId('source-lines');
+    const bounds = document.querySelector('.transit').getBoundingClientRect();
+    const router = document.querySelector('.router-emblem').getBoundingClientRect();
+    layer.setAttribute('viewBox', `0 0 ${bounds.width} ${bounds.height}`);
+    const present = new Set();
+    let index = 0;
+    const sources = [...sourceViews].sort((a, b) => a[1].getBoundingClientRect().top - b[1].getBoundingClientRect().top);
+    for (const [agent, entry] of sources) {
+      const icon = entry.querySelector('.source-icon').getBoundingClientRect();
+      if (!icon.width || icon.bottom <= bounds.top || icon.top >= bounds.bottom) continue;
+      present.add(agent);
+      let path = sourceBranches.get(agent);
+      if (!path) {
+        path = document.createElementNS(namespace, 'path');
+        path.dataset.source = agent;
+        sourceBranches.set(agent, path);
+        layer.append(path);
+      }
+      const stacked = router.top >= icon.bottom;
+      index += 1;
+      // 上方来源走外弧接较低端口，下方来源走内弧接较高端口，形成互不相交的嵌套曲线。
+      const port = (stacked ? sources.length + 1 - index : index) / (sources.length + 1);
+      const x = (stacked ? icon.left + 3 : icon.right) - bounds.left;
+      const y = (stacked ? icon.bottom - 5 : icon.top + icon.height / 2) - bounds.top;
+      const endX = router.left - bounds.left;
+      const endY = router.top + router.height * port - bounds.top;
+      const bendX = 6 + (index - 1) * 10;
+      const corner = Math.min(32, (endY - y) / 3);
+      path.setAttribute('d', stacked
+        ? `M${x} ${y}C${bendX} ${y} ${bendX} ${y + corner / 2} ${bendX} ${y + corner}C${bendX} ${y + corner} ${bendX} ${endY - corner} ${bendX} ${endY - corner}C${bendX} ${endY} ${endX - 18} ${endY} ${endX} ${endY}`
+        : `M${x} ${y}C${x + (endX - x) * .5} ${y} ${endX - 12} ${endY} ${endX} ${endY}`);
+      const flowing = entry.dataset.active === 'true';
+      if (path.dataset.active !== String(flowing)) {
+        path.setAttribute('class', `route-active${flowing ? ' flowing' : ''}`);
+        path.dataset.active = String(flowing);
+      }
+    }
+    for (const [agent, path] of sourceBranches) {
+      if (!present.has(agent)) { path.remove(); sourceBranches.delete(agent); }
+    }
+  }
+
   /** 用实际路由块位置画贝塞尔分支，列表滚动和窗口大小变化后重新对齐。 */
   function drawLines(newIds = []) {
+    drawSourceLines();
     const layer = lineLayer.getBoundingClientRect();
     const router = document.querySelector('.router-emblem').getBoundingClientRect();
     const node = document.querySelector('.router-node').getBoundingClientRect();
@@ -1079,7 +1175,8 @@
     syncFocus(document.hasFocus());
     selector.addEventListener('change', () => { selectedCard = null; renderedIds.clear(); quotaOrderTimer = clearTimeout(quotaOrderTimer); render(false); });
     routeList.addEventListener('scroll', () => requestDraw(), { passive: true });
-    setInterval(() => { updateCardTimes(); updateQuotaClocks(); }, 1000);
+    byId('source-node').addEventListener('scroll', () => requestDraw(), { passive: true });
+    setInterval(() => { updateCardTimes(); quotaCarousel(); updateQuotaClocks(); }, 1000);
     new ResizeObserver(() => render(false)).observe(hud);
     new ResizeObserver(() => requestDraw()).observe(document.querySelector('.routing'));
     document.querySelector('.content').addEventListener('scroll', () => requestDraw(), { passive: true });

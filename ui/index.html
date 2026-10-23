@@ -6,10 +6,10 @@
   <meta name="color-scheme" content="dark">
   <title>Magpie HUD V.0.0.28(2026/10/23)</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="hud.css?v=0.0.28-20261023-pace-tolerance">
+  <link rel="stylesheet" href="hud.css?v=0.0.28-20261023-quota-inline">
   <script src="motion.js?v=0.0.28-20261023-digit-roll" defer></script>
   <script src="hourly.js?v=0.0.28-20261022-endpoint-motion" defer></script>
-  <script src="hud.js?v=0.0.28-20261023-pace-tolerance" defer></script>
+  <script src="hud.js?v=0.0.28-20261023-quota-inline" defer></script>
 </head>
 <body>
 <main class="hud" id="hud" data-state="waiting" data-sources="compact" data-focus="true">
@@ -57,6 +57,7 @@
     <section class="routing" aria-label="Agent 经 magpie 路由到会话账号">
       <svg id="route-lines" class="route-lines" aria-hidden="true"></svg>
       <div class="transit">
+      <svg id="source-lines" class="source-lines" aria-hidden="true"></svg>
       <div class="source-node" tabindex="0" id="source-node">
         <div id="source-list" class="source-list"><div class="source-entry"><div class="source-heading"><span class="source-icon"><img src="icons/claude-color.svg" alt=""></span><strong>等待请求</strong></div></div></div>
       </div>

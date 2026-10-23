@@ -137,6 +137,9 @@ pub struct LiveState {
     routes: BTreeMap<i64, LiveRoute>,
     pub activity: Activity,
     pub names: HashMap<String, String>,
+    /// 同一 Desktop 会话的历史 CLI ID 映射到当前规范 ID；只来自标题元数据里的显式关联。
+    /// 显示名相同但无此关联的独立会话不会被合并。
+    pub aliases: HashMap<String, String>,
     /// 子 Agent 可读短标签，键是精确的 (父会话, 子 ID)。
     pub child_labels: HashMap<(String, String), String>,
     pub error: Option<String>,
@@ -293,8 +296,8 @@ impl LiveState {
             }
             if let Some(session) = view.sessions.iter_mut().find(|s| s.id == session_id) {
                 if active_sessions.insert(session_id.to_owned()) {
-                    // 父会话自己的进行中请求替换已完成根卡片，只留仍有失败依据的旧账号。
-                    session.routes.retain(|c| c.state == "failed");
+                    // 父会话自己的进行中请求直接盖住同会话更早的根卡片，不再并列旧的失败或取消尝试。
+                    session.routes.clear();
                     session.agent = display_agent(&active.agent);
                     session.request = active.model.clone();
                     session.notes = [note, second];
@@ -331,19 +334,130 @@ impl LiveState {
         }
         // 稳定排序保持原完成顺序，活跃会话始终优先可见。
         view.sessions.sort_by_key(|s| !(active_sessions.contains(&s.id) || child_sessions.contains(&s.id)));
+        let aliases_changed = self.suppress_alias_roots(view);
         if let Some(session) = view.sessions.first() {
             view.notes = session.notes.clone();
         }
-        let shown = active_sessions.union(&child_sessions).count();
+        // 别名行被隐藏后，活跃计数仍按实际可见会话统计，避免“N 个请求中”虚高。
+        let visible: HashSet<_> = view.sessions.iter().map(|session| session.id.as_str()).collect();
+        let shown = active_sessions.union(&child_sessions).filter(|id| visible.contains(id.as_str())).count();
         if shown > 0 && view.state != "warning" {
             view.state = "ready".into();
             view.watch_label = format!("{shown} 个会话请求中");
+        } else if aliases_changed && shown == 0 && view.state != "warning" && view.state != "missing" {
+            view.watch_label = if view.sessions.is_empty() { "等待今日记录".into() } else { "当日记录 · 只读监视".into() };
         }
         if let Some(error) = &self.error {
             view.state = "warning".into();
             view.watch_label = "实时连接中断 · 保留完成记录".into();
             view.error = Some(error.clone());
         }
+    }
+
+    /// 同一 Desktop 会话可能轮换 CLI ID：当前 ID 成功后，历史 ID 的取消/失败根卡
+    /// 仍在账本里各自成行。只按标题元数据的显式关联归并，不以显示名相同推断。
+    /// 当前规范 ID 的新成功根或进行中根是权威展示，会盖住历史别名里更早的根；
+    /// 历史别名自己的进行中根只覆盖其它历史别名，不反压当前 ID 的成功。
+    /// 没有其它可见内容的空别名行被移除，额度来源并入存活行，统计口径不变。
+    fn suppress_alias_roots(&self, view: &mut RouteSnapshot) -> bool {
+        if self.aliases.is_empty() {
+            return false;
+        }
+        let mut groups = HashMap::<String, Vec<usize>>::new();
+        for (index, session) in view.sessions.iter().enumerate() {
+            groups.entry(self.canonical(&session.id).to_owned()).or_default().push(index);
+        }
+        let mut hidden: HashMap<usize, HashSet<String>> = HashMap::new();
+        for (canonical, members) in groups.iter().filter(|(_, members)| members.len() > 1) {
+            let canonical_index = members.iter().copied().find(|index| view.sessions[*index].id == *canonical);
+            let priors: Vec<_> = members.iter().copied()
+                .filter(|index| Some(*index) != canonical_index).collect();
+            // 当前 ID 的成功/活跃根：按完成时刻覆盖历史别名的更早根。
+            let canonical_marks: Vec<_> = canonical_index.into_iter()
+                .flat_map(|index| view.sessions[index].routes.iter())
+                .filter(|card| matches!(card.state.as_str(), "success" | "recovered" | "running" | "waiting"))
+                .filter_map(root_mark).collect();
+            for &prior in &priors {
+                for card in &view.sessions[prior].routes {
+                    if canonical_marks.iter().any(|mark| root_mark(card).is_some_and(|time| time < *mark)) {
+                        hidden.entry(prior).or_default().insert(card.id.clone());
+                    }
+                }
+            }
+            // 历史别名之间的进行中根覆盖更早的根；成功行是另一条结论，不在此被删除。
+            for &source in &priors {
+                let active: Vec<_> = view.sessions[source].routes.iter()
+                    .filter(|card| matches!(card.state.as_str(), "running" | "waiting"))
+                    .filter_map(root_mark).collect();
+                for &target in &priors {
+                    if target == source {
+                        continue;
+                    }
+                    for card in &view.sessions[target].routes {
+                        if !matches!(card.state.as_str(), "success" | "recovered" | "running" | "waiting")
+                            && active.iter().any(|mark| root_mark(card).is_some_and(|time| time < *mark)) {
+                            hidden.entry(target).or_default().insert(card.id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if hidden.is_empty() {
+            return false;
+        }
+        for (index, ids) in &hidden {
+            view.sessions[*index].routes.retain(|card| !ids.contains(&card.id));
+        }
+        // 先收集历史别名的额度来源，再移除空行；统计与子 Agent 身份不搬移。
+        // 即使别名行仍有子 Agent 内容而保留，额度来源也归到当前 ID，避免账号额度随旧行漂移。
+        let mut quota_moves = Vec::new();
+        let mut removed = HashSet::new();
+        for members in groups.values() {
+            if members.len() < 2 {
+                continue;
+            }
+            let canonical = self.canonical(&view.sessions[members[0]].id).to_owned();
+            let Some(keeper) = members.iter().copied().find(|index| view.sessions[*index].id == canonical) else { continue };
+            for index in members.iter().copied().filter(|index| *index != keeper) {
+                let session = &view.sessions[index];
+                if hidden.contains_key(&index) {
+                    quota_moves.push((keeper, index, session.quota_routes.clone()));
+                }
+                if hidden.contains_key(&index) && session.routes.is_empty()
+                    && session.subagents.is_empty() && session.completed_subagents.is_empty() {
+                    removed.insert(index);
+                }
+            }
+        }
+        // 有子 Agent 内容的别名行不会被移除，额度来源仍并入当前 ID，旧行不再保留副本。
+        for (keeper, source, quota_routes) in quota_moves {
+            for card in quota_routes {
+                let duplicate = view.sessions[keeper].quota_routes.iter().position(|existing| {
+                    existing.provider.eq_ignore_ascii_case(&card.provider) && existing.account == card.account
+                });
+                match duplicate {
+                    // 同一账号以日志追加顺序的新旧为准，保留较新的一条。
+                    Some(index) if card.updated_at.as_deref() > view.sessions[keeper].quota_routes[index].updated_at.as_deref() => {
+                        view.sessions[keeper].quota_routes[index] = card;
+                    }
+                    Some(_) => {}
+                    None => view.sessions[keeper].quota_routes.push(card),
+                }
+            }
+            if !removed.contains(&source) {
+                view.sessions[source].quota_routes.clear();
+            }
+        }
+        if !removed.is_empty() {
+            view.sessions = view.sessions.drain(..).enumerate()
+                .filter_map(|(index, session)| (!removed.contains(&index)).then_some(session)).collect();
+        }
+        true
+    }
+
+    /// 历史 CLI ID 归到标题元数据声明的当前 ID；没有显式关联时保持自身。
+    fn canonical<'a>(&'a self, id: &'a str) -> &'a str {
+        self.aliases.get(id).map(String::as_str).unwrap_or(id)
     }
 
     /// 未找到标题时明确未命名；UUID 只保留在数据身份与悬停提示中。
@@ -438,6 +552,12 @@ fn updated_at(start: DateTime<chrono::FixedOffset>, elapsed_ms: u64) -> String {
     (start + chrono::Duration::milliseconds(elapsed_ms.min(i64::MAX as u64) as i64))
         .with_timezone(&chrono::Utc)
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// 根卡的请求时序标记：完成卡是真实完成时刻，活跃卡是 start + 已用时长。
+/// 同一 Desktop 会话跨 CLI ID 只比较这个时刻，旧快照或无更新时间时不隐藏。
+fn root_mark(card: &RouteCard) -> Option<DateTime<chrono::FixedOffset>> {
+    DateTime::parse_from_rfc3339(card.updated_at.as_deref()?).ok()
 }
 
 /// 来源文案与日志口径一致。
@@ -627,6 +747,8 @@ struct DesktopTitle {
 #[derive(Default)]
 pub struct Titles {
     files: HashMap<PathBuf, (std::time::SystemTime, u64, DesktopTitle)>,
+    /// 显式 CLI ID 关联；与显示名无关，只描述同一个 Desktop 会话的身份轮换。
+    aliases: HashMap<String, String>,
 }
 
 impl Titles {
@@ -669,6 +791,7 @@ impl Titles {
             }
         }
         self.files.retain(|path, _| found.contains(path));
+        self.aliases = alias_links(self.files.values().map(|(_, _, title)| title));
         let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| {
             PathBuf::from(std::env::var_os("USERPROFILE").expect("缺少用户目录")).join(".codex")
         }).join("session_index.jsonl");
@@ -690,6 +813,49 @@ impl Titles {
         }
         result.into_iter().filter(|(_, (_, name))| !name.is_empty()).map(|(id, (_, name))| (id, name)).collect()
     }
+
+    /// 最近一次扫描得到的显式 CLI 身份关联；只做展示归一，不改变账本或统计。
+    pub fn aliases(&self) -> HashMap<String, String> {
+        self.aliases.clone()
+    }
+}
+
+/// 同一 Desktop 会话的显式 ID 关联：当前 CLI ID、未归档 ID、清空前的 ID 和
+/// 历史 CLI ID 都归到 `cliSessionId`；没有当前 ID 时依次用未归档 ID 和
+/// `local_` 会话 ID。一个 ID 被多个 Desktop 会话声明时视为冲突，不猜测归属；
+/// 显示名不参与判断。
+fn alias_links<'a>(titles: impl Iterator<Item = &'a DesktopTitle>) -> HashMap<String, String> {
+    let mut claims = HashMap::<&str, HashSet<&str>>::new();
+    let mut canonical_ids = HashSet::<&str>::new();
+    let mut rows = Vec::new();
+    for title in titles {
+        let canonical = [&title.cli_session_id, &title.unarchived_cli_session_id].into_iter()
+            .map(String::as_str).find(|id| !id.is_empty())
+            .or_else(|| title.session_id.strip_prefix("local_"))
+            .unwrap_or("");
+        if canonical.is_empty() || !safe_session_id(canonical) {
+            continue;
+        }
+        canonical_ids.insert(canonical);
+        rows.push((canonical, title));
+    }
+    for (canonical, title) in rows {
+        for alias in [&title.unarchived_cli_session_id, &title.pre_clear_cli_session_id]
+            .into_iter().chain(title.prior_cli_session_ids.iter())
+        {
+            // 一个 ID 同时是另一个 Desktop 会话的当前 ID 时，说明身份已被重新分配给
+            // 独立会话，不能再当历史别名归并。
+            if alias.is_empty() || alias == canonical || !safe_session_id(alias) || canonical_ids.contains(alias.as_str()) {
+                continue;
+            }
+            claims.entry(alias.as_str()).or_default().insert(canonical);
+        }
+    }
+    claims.into_iter().filter_map(|(alias, canonicals)| {
+        let mut canonicals = canonicals.into_iter();
+        let canonical = canonicals.next()?;
+        canonicals.next().is_none().then(|| (alias.to_owned(), canonical.to_owned()))
+    }).collect()
 }
 
 /// 精确身份映射，同级重名争议留空；不依赖 UUID 前缀猜测。
@@ -1105,8 +1271,14 @@ mod tests {
         ledger.ingest(later.to_string().as_bytes());
         let mut after = ledger.snapshot("h", "ready", None);
         live.apply(&mut after);
-        assert!(after.sessions[0].routes.iter().any(|card| card.state == "failed" && card.account == "later@example.com"));
-        assert_eq!(after.sessions[0].routes.iter().filter(|card| card.state == "running").count(), 1);
+        // 进行中的根请求盖住同会话全部旧尝试，包括刚落盘的失败行，避免运行中与失败卡并列。
+        assert_eq!(after.sessions[0].routes.len(), 1);
+        assert_eq!(after.sessions[0].routes[0].state, "running");
+        // 请求结束后账本的最新失败卡重新出现，失败证据不丢。
+        live.activity.active.clear();
+        let mut settled = ledger.snapshot("h", "ready", None);
+        live.apply(&mut settled);
+        assert!(settled.sessions[0].routes.iter().any(|card| card.state == "failed" && card.account == "later@example.com"));
     }
 
     /// 标签只认精确父会话和子 ID；坏文件保留上次有效描述，进行中和完成行都使用它。
@@ -1225,6 +1397,202 @@ mod tests {
                 }).is_none(), "conflicting identity must remain unknown, with model {model:?}");
             }
         }
+    }
+
+    /// 同一 Desktop 会话轮换 CLI ID 后，当前 ID 的新成功根隐藏历史 ID 的更早取消；
+    /// 只按显式关联归并，保留统计和额度路由。
+    #[test]
+    fn alias_roots_hide_older_cancelled_rows_from_prior_cli_ids() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        let current = "092398da-37c9-43d9-bf87-3ae8e5d8ec16";
+        let prior = ["57594e5e-f162-433e-870a-dc6dd3b9c37c", "2cceaf1c-1d50-43e2-ab93-c7ad4c3098d8"];
+        let mut record = |route_id, session: &str, account: &str, status, seconds: i64| {
+            let time = now - chrono::Duration::seconds(seconds);
+            let row = serde_json::json!({"route_id":route_id,"t":time.to_rfc3339(),"session":session,
+                "providerAccount":account,"provider":"codex","model":"gpt-test",
+                "status":status,"in":100,"out":100,"ms":1000});
+            ledger.ingest(row.to_string().as_bytes());
+        };
+        record(1, prior[0], "first@example.com", 499, 90);
+        record(2, prior[1], "second@example.com", 499, 60);
+        record(3, current, "current@example.com", 200, 10);
+        let baseline = ledger.snapshot("h", "ready", None);
+        assert!(baseline.sessions.iter().any(|session| session.id == prior[0]));
+        assert!(baseline.sessions.iter().any(|session| session.id == prior[1]));
+
+        let mut live = LiveState::default();
+        live.names.insert(current.into(), "VACS / ID 提取".into());
+        for id in prior { live.names.insert(id.into(), "VACS / ID 提取".into()); }
+        for id in prior { live.aliases.insert(id.into(), current.into()); }
+        let mut view = baseline.clone();
+        live.apply(&mut view);
+        assert!(view.sessions.iter().all(|session| session.id != prior[0]));
+        assert!(view.sessions.iter().all(|session| session.id != prior[1]));
+        let first = view.sessions.iter().find(|session| session.id == current).unwrap();
+        let shown = first.clone();
+        assert_eq!(shown.routes.len(), 1);
+        assert_eq!(shown.routes[0].state, "success");
+        // 展示归一不得改变当日统计或额度来源。
+        assert_eq!(view.daily, baseline.daily);
+        let quota_accounts = |sessions: &[SessionView]| {
+            let mut accounts: Vec<_> = sessions.iter().flat_map(|session| session.quota_routes.iter())
+                .map(|card| (card.provider.clone(), card.account.clone())).collect();
+            accounts.sort();
+            accounts
+        };
+        assert_eq!(quota_accounts(&view.sessions), quota_accounts(&baseline.sessions));
+        assert_eq!(first.quota_routes.len(), 3, "隐藏别名的额度来源并入当前行");
+        let total: u64 = baseline.sessions.iter().map(|session| session.daily.requests).sum();
+        assert_eq!(total, 3);
+        // 展示行消失不会改写每个会话自己的统计或全局统计。
+        assert_eq!(first.daily, baseline.sessions.iter().find(|session| session.id == current).unwrap().daily);
+    }
+
+    /// 显示名相同但没有显式 CLI 关联的独立 Desktop 会话必须保留；活跃根卡也不被旧成功隐藏。
+    #[test]
+    fn alias_suppression_keeps_independent_sessions_and_active_roots() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        let current = "11111111-1111-4111-8111-111111111111";
+        let unrelated = "22222222-2222-4222-8222-222222222222";
+        let prior = "33333333-3333-4333-8333-333333333333";
+        for (route_id, session, status, seconds) in [
+            (1, unrelated, 499, 80), (2, prior, 499, 60), (3, current, 200, 10),
+        ] {
+            let time = now - chrono::Duration::seconds(seconds);
+            let row = serde_json::json!({"route_id":route_id,"t":time.to_rfc3339(),"session":session,
+                "providerAccount":"one@example.com","provider":"codex","model":"gpt-test",
+                "status":status,"in":10,"out":10,"ms":1000});
+            ledger.ingest(row.to_string().as_bytes());
+        }
+        let baseline = ledger.snapshot("h", "ready", None);
+        let mut live = LiveState::default();
+        live.aliases.insert(prior.into(), current.into());
+        for id in [current, unrelated, prior] { live.names.insert(id.into(), "同名 / 会话".into()); }
+        let mut view = baseline.clone();
+        live.apply(&mut view);
+        // 无显式关联的同名会话保留自己的取消卡。
+        assert!(view.sessions.iter().any(|session| session.id == unrelated
+            && session.routes.iter().any(|card| card.state == "cancelled")));
+        assert!(view.sessions.iter().all(|session| session.id != prior));
+
+        // 历史 ID 上仍有进行中的根请求时，进行中的行保留；当前 ID 的成功不会被反压。
+        live.routes.insert(80, LiveRoute { id: 80, session: prior.into(), first_text: Some(1), ..Default::default() });
+        live.activity.active.push(Active { id: 8, session: prior.into(), agent: "claude-desktop".into(),
+            started: now.to_rfc3339(), phase: "upstream".into(), route: 80, ..Default::default() });
+        let mut active = baseline.clone();
+        live.apply(&mut active);
+        let running = active.sessions.iter().find(|session| session.id == prior).unwrap();
+        assert_eq!(running.routes.len(), 1);
+        assert_eq!(running.routes[0].state, "running");
+        assert!(active.sessions.iter().any(|session| session.id == current));
+        assert_eq!(active.daily, baseline.daily);
+    }
+
+    /// 子 Agent 身份仍挂在各自的父会话下；别名只隐藏没有其它可见内容的旧式根行。
+    #[test]
+    fn alias_suppression_preserves_child_identity_and_content() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        let current = "44444444-4444-4444-8444-444444444444";
+        let prior = "55555555-5555-4555-8555-555555555555";
+        for (route_id, session, subagent, account, status, seconds) in [
+            (1, current, "", "current@example.com", 200, 30),
+            (2, prior, "child-prior", "child@example.com", 200, 40),
+            (3, prior, "", "prior@example.com", 499, 50),
+        ] {
+            let time = now - chrono::Duration::seconds(seconds);
+            let row = serde_json::json!({"route_id":route_id,"t":time.to_rfc3339(),"session":session,
+                "subagent":subagent,"providerAccount":account,"provider":"codex",
+                "model":"gpt-test","status":status,"in":10,"out":10,"ms":1000});
+            ledger.ingest(row.to_string().as_bytes());
+        }
+        let baseline = ledger.snapshot("h", "ready", None);
+        let mut live = LiveState::default();
+        live.aliases.insert(prior.into(), current.into());
+        let mut view = baseline.clone();
+        live.apply(&mut view);
+        // 旧别名仍有子 Agent 完成记录，保留整行与其子身份；比规范行成功更早的取消根被盖住。
+        let old = view.sessions.iter().find(|session| session.id == prior).unwrap();
+        assert_eq!(old.completed_subagents.len(), 1);
+        assert_eq!(old.completed_subagents[0].subagent_id.as_deref(), Some("child-prior"));
+        assert!(old.routes.is_empty());
+        let shown = view.sessions.iter().find(|session| session.id == current).unwrap();
+        assert!(shown.completed_subagents.is_empty());
+        assert_eq!(view.daily, baseline.daily);
+        // 别名行因子 Agent 内容保留时，额度来源仍并入当前 ID，不随旧行漂移。
+        let accounts = |session: &SessionView| {
+            let mut accounts: Vec<_> = session.quota_routes.iter().map(|card| card.account.clone()).collect();
+            accounts.sort();
+            accounts
+        };
+        assert_eq!(accounts(shown), vec!["child@example.com", "current@example.com", "prior@example.com"]);
+        assert!(accounts(old).is_empty(), "保留的子 Agent 行不再持有已并入当前 ID 的额度来源");
+    }
+
+    /// 标题元数据里的显式 CLI 关联形成别名映射；同名、冲突声明与无当前 ID 时都不猜。
+    #[test]
+    fn title_aliases_follow_explicit_metadata_only() {
+        let title = |session: &str, cli: &str, prior: &[&str]| DesktopTitle {
+            session_id: session.into(), cli_session_id: cli.into(),
+            prior_cli_session_ids: prior.iter().map(|id| (*id).to_string()).collect(),
+            title: "VACS / ID 提取".into(), ..Default::default()
+        };
+        let current = "092398da-37c9-43d9-bf87-3ae8e5d8ec16";
+        let prior = "57594e5e-f162-433e-870a-dc6dd3b9c37c";
+        let same_title = "66666666-6666-4666-8666-666666666666";
+        let aliases = alias_links([
+            title("local_05b47592-aab9-4657-86df-9c6cdbb8b1a1", current, &[prior]),
+            title(&format!("local_{same_title}"), same_title, &[]),
+        ].iter());
+        assert_eq!(aliases.get(prior).map(String::as_str), Some(current));
+        assert_eq!(aliases.len(), 1, "同名独立会话不应产生关联");
+        // 同一历史 ID 被两个 Desktop 会话声明：冲突，不归并。
+        let conflict = alias_links([
+            title("local_77777777-7777-4777-8777-777777777777", current, &[prior]),
+            title("local_88888888-8888-4888-8888-888888888888", same_title, &[prior]),
+        ].iter());
+        assert!(conflict.is_empty());
+        // 历史 ID 已经是另一个独立 Desktop 会话的当前 ID：身份已重新分配，不归并。
+        let reassigned = alias_links([
+            title("local_77777777-7777-4777-8777-777777777777", current, &[prior]),
+            title("local_88888888-8888-4888-8888-888888888888", prior, &[]),
+        ].iter());
+        assert!(reassigned.is_empty());
+        // 没有当前 CLI ID 时退回 local_ 会话 ID。
+        let fallback = alias_links([title("local_99999999-9999-4999-8999-999999999999", "", &[prior])].iter());
+        assert_eq!(fallback.get(prior).map(String::as_str), Some("99999999-9999-4999-8999-999999999999"));
+        // 当前 ID 为空但存在未归档 ID 时，用它作为规范身份，未归档 ID 不再自映射。
+        let unarchived = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let fallback = alias_links([DesktopTitle {
+            session_id: "local_99999999-9999-4999-8999-999999999999".into(),
+            unarchived_cli_session_id: unarchived.into(),
+            prior_cli_session_ids: vec![prior.into()], title: "VACS / ID 提取".into(), ..Default::default()
+        }].iter());
+        assert_eq!(fallback.get(prior).map(String::as_str), Some(unarchived));
+        assert!(!fallback.contains_key(unarchived));
+    }
+
+    /// 同一标题文件返回的别名来自显式 ID 字段，不受标题显示名影响。
+    #[test]
+    fn titles_scan_exposes_alias_links_without_merging_titles() {
+        let root = std::env::temp_dir().join(format!("magpie-hud-title-alias-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let org = root.join("claude-code-sessions").join("profile").join("org");
+        fs::create_dir_all(&org).unwrap();
+        let current = "092398da-37c9-43d9-bf87-3ae8e5d8ec16";
+        let prior = "57594e5e-f162-433e-870a-dc6dd3b9c37c";
+        fs::write(org.join("local_05b47592-aab9-4657-86df-9c6cdbb8b1a1.json"),
+            serde_json::json!({"sessionId":"local_05b47592-aab9-4657-86df-9c6cdbb8b1a1",
+                "cliSessionId":current,"priorCliSessionIds":[prior],"title":"VACS / ID 提取",
+                "messages":[{"body":"do not read"}]}).to_string()).unwrap();
+        let mut titles = Titles::default();
+        let names = titles.scan(std::slice::from_ref(&root));
+        assert_eq!(names.get(current).map(String::as_str), Some("VACS / ID 提取"));
+        assert_eq!(names.get(prior).map(String::as_str), Some("VACS / ID 提取"));
+        assert_eq!(titles.aliases().get(prior).map(String::as_str), Some(current));
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// 重启替换路由缓存；同级标题争议未知，当前身份优先历史身份。
