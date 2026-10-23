@@ -1,6 +1,6 @@
 //! 只读 Magpie 额度与定价用量；账号精确关联，额度、余额、美元费用各保留自身单位。
 
-use crate::usage::RouteSnapshot;
+use crate::usage::{AgentStats, RouteSnapshot};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -125,6 +125,7 @@ impl Telemetry {
                 }
             }
         }
+        apply_agent_usage(&mut view.agent_stats, usage);
     }
 }
 
@@ -137,6 +138,48 @@ fn fill_cost(stats: &mut crate::usage::DailyStats, calls: u64, cost: f64, unpric
         stats.unpriced_requests = unpriced;
         // 分母是网关已定价调用，包含日志排除的内部路由；不是 JSONL 完成行数。
         stats.cost_per_call = (priced > 0).then_some(cost / priced as f64);
+    }
+}
+
+/// 只在该来源分组自己的每个会话都有唯一、有效的网关费用时填写金额。
+/// 缺一个会话、ID 重复或费用字段无效都保持未知，不用全局今日费用分摊。
+pub fn apply_agent_usage(groups: &mut [AgentStats], usage: &Usage) {
+    let mut counts = std::collections::HashMap::<&str, usize>::new();
+    for session in &usage.sessions {
+        if session.id.is_empty() {
+            continue;
+        }
+        *counts.entry(session.id.as_str()).or_default() += 1;
+    }
+    let mut owners = std::collections::HashMap::<String, usize>::new();
+    for group in groups.iter() {
+        for id in &group.cost_sessions { *owners.entry(id.clone()).or_default() += 1; }
+    }
+    for group in groups {
+        if group.cost_sessions.is_empty() || group.cost_sessions.iter().any(|id| owners.get(id) != Some(&1)) {
+            continue;
+        }
+        let mut calls = 0_u64;
+        let mut cost = 0.0_f64;
+        let mut unpriced = 0_u64;
+        let mut covered = true;
+        for session_id in &group.cost_sessions {
+            let unique = counts.get(session_id.as_str()).copied() == Some(1);
+            let matched = usage.sessions.iter().find(|item| item.id == *session_id);
+            match matched.filter(|_| unique) {
+                Some(item) if item.cost.is_finite() && item.cost >= 0.0 && item.unpriced <= item.calls
+                    && (item.calls > 0 || item.unpriced < item.calls) =>
+                {
+                    calls += item.calls;
+                    cost += item.cost;
+                    unpriced += item.unpriced;
+                }
+                _ => covered = false,
+            }
+        }
+        if covered {
+            fill_cost(&mut group.daily, calls, cost, unpriced);
+        }
     }
 }
 
@@ -161,6 +204,19 @@ pub fn apply_day_usage(
     }
     fill_cost(stats, usage.calls, usage.cost, usage.unpriced);
     crate::hourly::apply_gateway_series_for_day(stats, usage, day);
+    Ok(())
+}
+
+/// 历史日期的全局费用与来源分组费用共用一次网关校验。校验失败时两者都保持未知。
+pub fn apply_history_usage(
+    daily: &mut crate::usage::DailyStats,
+    groups: &mut [AgentStats],
+    day: chrono::NaiveDate,
+    expected_period: &str,
+    usage: &Usage,
+) -> Result<(), String> {
+    apply_day_usage(daily, day, expected_period, usage)?;
+    apply_agent_usage(groups, usage);
     Ok(())
 }
 

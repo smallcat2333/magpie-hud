@@ -66,7 +66,7 @@
     const time = byId('stats-date');
     time.textContent = dateLabel(date);
     time.dateTime = date;
-    byId('stats-date-label').title = `${date}，点击查看用量热力日历`;
+    byId('stats-date-label').title = `${date}，点击查看用量热力日历${historical ? '；历史统计，路由与额度实时更新' : ''}`;
     previous.disabled = !earliest || date <= earliest;
     next.disabled = !historical || date >= latestDate();
     previous.title = previous.disabled ? '已到最早记录' : `前一天 ${offsetDate(date, -1)}`;
@@ -75,7 +75,7 @@
     byId('stats-retry').hidden = !failure && !(shown?.costError && historical && !loading);
     const region = document.querySelector('.daily');
     region.setAttribute('aria-busy', String(loading));
-    region.setAttribute('aria-label', `${date}统计${historical ? '，全部会话' : ''}`);
+    region.setAttribute('aria-label', `${date}统计，${live.scope}`);
     document.querySelector('.hourly').setAttribute('aria-busy', String(loading));
     document.querySelector('.hourly').setAttribute('aria-label', `${date}每小时 Token 与金额`);
     byId('hourly-plot').inert = historical && !shown;
@@ -85,6 +85,7 @@
       view = { date: live.date, daily: live.daily, scope: live.scope, costError: live.costError, historical: false };
     } else if (shown) {
       view = { ...shown, scope: '当日全部会话', historical: true };
+      if (live.projectHistory) view = { ...live.projectHistory(shown), historical: true };
     }
     if (view) window.dispatchEvent(new CustomEvent('hud-stats-view', { detail: view }));
     // 没有读数时仍保留版式；失败不显示成零，也不把上一个日期的数据当成所选日。
@@ -94,7 +95,7 @@
     else if (failure) setStatus(`${date} 读取失败：${failure}`);
     else if (historical && shown?.costError) setStatus('费用未能读取，其他统计已更新');
     else if (historical && shown?.daily.requests === 0 && !shown?.daily.cost) setStatus('当天暂无记录');
-    else setStatus(historical ? '历史统计 · 路由与额度实时更新' : '');
+    else setStatus('');
   }
 
   async function query(date) {

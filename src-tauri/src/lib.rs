@@ -44,6 +44,8 @@ struct DateStatsView {
     earliest_date: String,
     latest_date: String,
     daily: usage::DailyStats,
+    /// 该日全部完成记录的来源分组，字段与实时快照 agentStats 相同。
+    agent_stats: Vec<usage::AgentStats>,
     cost_error: Option<String>,
 }
 
@@ -494,6 +496,7 @@ fn read_date_stats(app: &AppHandle, date: &str) -> Result<DateStatsView, String>
                 earliest_date: runtime.snapshot.earliest_date.clone(),
                 latest_date: today.to_string(),
                 daily: runtime.snapshot.daily.clone(),
+                agent_stats: runtime.snapshot.agent_stats.clone(),
                 cost_error: runtime.snapshot.cost_error.clone(),
             });
         }
@@ -522,14 +525,14 @@ fn read_date_stats(app: &AppHandle, date: &str) -> Result<DateStatsView, String>
             }
         }
     }
-    let (mut daily, scanned_earliest) = usage::scan_day_stats(&path, day)?;
+    let (mut daily, mut agent_stats, scanned_earliest) = usage::scan_day_stats(&path, day)?;
     let period = format!("{day}..{day}");
     let cost_error = match live::gateway_url(&host) {
         Ok(base) => {
             let agent = live::client(Duration::from_secs(5));
             let url = format!("{base}/v1/magpie/usage?period={period}");
             match live::read_json::<telemetry::Usage>(&agent, &url) {
-                Ok(usage) => telemetry::apply_day_usage(&mut daily, day, &period, &usage).err(),
+                Ok(usage) => telemetry::apply_history_usage(&mut daily, &mut agent_stats, day, &period, &usage).err(),
                 Err(error) => Some(error),
             }
         }
@@ -546,6 +549,7 @@ fn read_date_stats(app: &AppHandle, date: &str) -> Result<DateStatsView, String>
         earliest_date: current_earliest.to_string(),
         latest_date: today.to_string(),
         daily,
+        agent_stats,
         cost_error,
     };
     if day < today && view.cost_error.is_none() {

@@ -290,7 +290,7 @@ impl LiveState {
                     view.sessions.push(SessionView { id: session_id.into(), label, timestamp_ms: started.map(|t| t.timestamp_millis()).unwrap_or(0),
                         latest_sequence: 0, agent: display_agent(&active.agent), request: String::new(),
                         routes: Vec::new(), subagents: vec![card], completed_subagents: Vec::new(), subagent_history: HashMap::new(), quota_routes: Vec::new(),
-                        notes: [note, second], daily: DailyStats::default() });
+                        notes: [note, second], daily: DailyStats::default(), caller_key_id: String::new(), caller_key_name: String::new() });
                 }
                 continue;
             }
@@ -308,7 +308,7 @@ impl LiveState {
                 view.sessions.push(SessionView { id: session_id.into(), label, timestamp_ms: started.map(|t| t.timestamp_millis()).unwrap_or(0),
                     latest_sequence: 0, agent: display_agent(&active.agent), request: active.model.clone(),
                     routes: vec![card], subagents: Vec::new(), completed_subagents: Vec::new(), subagent_history: HashMap::new(), quota_routes: Vec::new(),
-                    notes: [note, second], daily: DailyStats::default() });
+                    notes: [note, second], daily: DailyStats::default(), caller_key_id: String::new(), caller_key_name: String::new() });
             }
         }
         for session in &mut view.sessions {

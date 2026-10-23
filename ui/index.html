@@ -4,21 +4,22 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Magpie HUD V.0.0.28(2026/10/23)</title>
+  <title>Magpie HUD V.0.0.28</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="hud.css?v=0.0.28-20261023-quota-inline">
+  <link rel="stylesheet" href="hud.css?v=0.0.28-20261023-caller-stats">
   <script src="motion.js?v=0.0.28-20261023-digit-roll" defer></script>
   <script src="hourly.js?v=0.0.28-20261022-endpoint-motion" defer></script>
   <link rel="stylesheet" href="dates.css?v=20261023-deeper-heat">
-  <script src="dates.js?v=20261023-deeper-heat" defer></script>
-  <script src="hud.js?v=0.0.28-20261023-deeper-heat" defer></script>
+  <script src="dates.js?v=20261023-caller-stats" defer></script>
+  <script src="hud.js?v=0.0.28-20261023-caller-stats" defer></script>
 </head>
 <body>
 <main class="hud" id="hud" data-state="waiting" data-sources="compact" data-focus="true">
   <header class="window-bar" id="drag-region" data-tauri-drag-region>
     <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg>
-    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.0.0.28(2026/10/23)</span></h1><span class="brand-subtitle">路由监视</span>
+    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.0.0.28</span></h1><span class="brand-subtitle">路由监视</span>
     <span class="watch-state" id="watch-label" role="status">等待今日记录</span>
+    <button id="agent-select" class="agent-select" type="button" role="combobox" aria-label="按 Agent 筛选路由" aria-haspopup="listbox" aria-expanded="false" aria-controls="agent-options"><span class="agent-caption">Agent</span><span class="agent-icon" aria-hidden="true">∗</span><span class="agent-value">全部</span><span class="agent-arrow" aria-hidden="true">⌄</span></button>
     <label class="scope-label" for="session-select">查看</label>
     <select id="session-select" aria-label="按会话查看路由"><option value="*">最近会话</option></select>
     <button id="pin" class="window-button" type="button" aria-label="置顶窗口" aria-pressed="true" title="置顶窗口"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3h6m-5 0v5l-3 3v1h10v-1l-3-3V3M10 12v5"/></svg></button>
@@ -67,6 +68,7 @@
     <section class="routing" aria-label="Agent 经 magpie 路由到会话账号">
       <svg id="route-lines" class="route-lines" aria-hidden="true"></svg>
       <div class="transit">
+      <div id="active-sessions" class="active-sessions" role="status" aria-live="polite" aria-label="0 个会话正在请求"><strong id="active-session-count">0</strong></div>
       <svg id="source-lines" class="source-lines" aria-hidden="true"></svg>
       <div class="source-node" tabindex="0" id="source-node">
         <div id="source-list" class="source-list"><div class="source-entry"><div class="source-heading"><span class="source-icon"><img src="icons/claude-color.svg" alt=""></span><strong>等待请求</strong></div></div></div>
@@ -88,6 +90,7 @@
     <div class="note-row"><time id="line2-time">--:--:--</time><span class="note-kind" id="line2-kind">来源</span><p id="line2-text">只读 usage.jsonl</p></div>
   </section>
 </main>
+<div id="agent-options" class="agent-options" role="listbox" aria-label="Agent 来源" hidden></div>
 <div id="stats-calendar" class="stats-calendar" role="dialog" aria-modal="false" aria-labelledby="calendar-title" hidden>
   <div class="calendar-heading">
     <strong id="calendar-title">用量热力日历</strong>

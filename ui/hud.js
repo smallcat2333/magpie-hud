@@ -5,6 +5,10 @@
   const byId = id => document.getElementById(id);
   const hud = byId('hud');
   const selector = byId('session-select');
+  const agentSelector = byId('agent-select');
+  const agentOptions = byId('agent-options');
+  let selectedAgent = '*';
+  let agentOptionsKey = '';
   const routeList = byId('routes');
   const lineLayer = byId('route-lines');
   const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
@@ -565,45 +569,200 @@
     const key = name.toLowerCase().replace(/[\s_-]/g, '');
     if (key === 'claudedesktop') return 'Claude Desktop';
     if (key === 'claude' || key === 'claudecode') return 'Claude Code';
+    if (key === 'codex') return 'Codex';
     return name || 'Agent 未提供';
   }
 
-  /** 来源按真实 Agent 合并，最多两个时与 Magpie 纵向排列，给会话留出宽度。 */
+  function sourceIcon(agent, className = 'source-icon') {
+    const icon = document.createElement('span');
+    icon.className = className;
+    icon.setAttribute('aria-hidden', 'true');
+    const family = /claude[\s-]*code/i.test(agent) ? 'claudecode-color' : /claude/i.test(agent) ? 'claude-color' : modelIcon(agent);
+    if (family) {
+      const image = document.createElement('img');
+      image.src = `icons/${family}.svg`;
+      image.alt = '';
+      icon.append(image);
+    } else icon.textContent = agent === '*' ? '∗' : '↗';
+    return icon;
+  }
+
+  function sourceKey(source) {
+    return JSON.stringify([sourceName(source.agent), source.callerKeyId || source.callerKeyName || '']);
+  }
+
+  function callerName(source) {
+    return (source.callerKeyId && snapshot?.callerKeyNames?.[source.callerKeyId]) || source.callerKeyName || '本机';
+  }
+
+  function sourceLabel(source) {
+    return [sourceName(source.agent), callerName(source)].join(' · ');
+  }
+
+  function selectedSource() {
+    return sessionsForView().find(source => sourceKey(source) === selectedAgent)
+      || (snapshot.agentStats || []).find(source => sourceKey(source) === selectedAgent);
+  }
+
+  function filterAgent(sessions) {
+    return selectedAgent === '*' ? sessions : sessions.filter(session => sourceKey(session) === selectedAgent);
+  }
+
+  /** 从完整分组累计可加量，再计算加权比例；未知费用不以全局费用补齐。 */
+  function scopedDaily(groups) {
+    const result = { hourly: Array.from({ length: 24 }, () => ({ tokens: 0, cost: null, costPartial: false })) };
+    const sums = ['requests', 'tokens', 'pricedRequests', 'unpricedRequests', 'outputTokens', 'generationMs', 'speedSamples', 'cacheReadTokens', 'cacheDenominatorTokens'];
+    sums.forEach(key => { result[key] = groups.reduce((sum, group) => sum + (group.daily[key] || 0), 0); });
+    const priced = groups.filter(group => group.daily.requests > 0);
+    result.cost = priced.length && priced.every(group => Number.isFinite(group.daily.cost))
+      ? priced.reduce((sum, group) => sum + group.daily.cost, 0) : priced.length ? null : 0;
+    result.costPerCall = result.cost !== null && result.pricedRequests > 0 ? result.cost / result.pricedRequests : null;
+    result.tokensPerSecond = result.generationMs > 0 ? result.outputTokens * 1000 / result.generationMs : null;
+    result.cacheHitRate = result.cacheDenominatorTokens > 0 ? result.cacheReadTokens / result.cacheDenominatorTokens : null;
+    result.hourly.forEach((hour, index) => {
+      hour.tokens = groups.reduce((sum, group) => sum + (group.daily.hourly?.[index]?.tokens || 0), 0);
+      const values = priced.map(group => group.daily.hourly?.[index]);
+      hour.cost = !values.length ? 0 : values.every(value => Number.isFinite(value?.cost)) ? values.reduce((sum, value) => sum + value.cost, 0) : null;
+      hour.costPartial = values.some(value => value?.costPartial);
+    });
+    return result;
+  }
+
+  function statsForSource(view) {
+    return selectedAgent === '*' ? view.daily : scopedDaily(filterAgent(view.agentStats || []));
+  }
+
+  function statsScope() {
+    return selectedAgent === '*' ? '全部会话' : sourceLabel(selectedSource() || { agent: 'Agent 未提供' });
+  }
+
+  /** 菜单只按已知 Agent 身份筛选；接口未提供来源 IP 时不推断设备。 */
+  function updateAgentSelector(sessions) {
+    const sources = new Map();
+    [...sessions, ...(snapshot.agentStats || [])].forEach(source => sources.set(sourceKey(source), source));
+    const agents = [...sources.keys()].sort((a, b) => sourceLabel(sources.get(a)).localeCompare(sourceLabel(sources.get(b))));
+    if (!sources.has(selectedAgent)) selectedAgent = '*';
+    const key = JSON.stringify([selectedAgent, agents.map(key => [key, callerName(sources.get(key))])]);
+    if (key === agentOptionsKey) return;
+    const focusedAgent = agentOptions.contains(document.activeElement) ? document.activeElement.dataset.agent : null;
+    agentOptionsKey = key;
+    const values = ['*', ...agents];
+    agentOptions.replaceChildren(...values.map((agent, index) => {
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.id = `agent-option-${index}`;
+      option.className = 'agent-option';
+      option.dataset.agent = agent;
+      option.setAttribute('role', 'option');
+      option.setAttribute('aria-selected', String(agent === selectedAgent));
+      option.tabIndex = agent === selectedAgent ? 0 : -1;
+      const label = document.createElement('span');
+      label.className = 'agent-option-name';
+      const source = sources.get(agent);
+      const name = agent === '*' ? '全部' : sourceName(source.agent);
+      const caller = source ? callerName(source) : '本机';
+      label.textContent = name;
+      option.title = agent === '*' ? '全部 Agent 的统计、实时路由与额度' : `${name}\n网关密钥：${caller}`;
+      const check = document.createElement('span');
+      check.className = 'agent-check';
+      check.setAttribute('aria-hidden', 'true');
+      check.textContent = agent === selectedAgent ? '✓' : '';
+      option.append(sourceIcon(agent === '*' ? '*' : name, 'agent-icon'), label);
+      if (agent !== '*') {
+        const address = document.createElement('small');
+        address.className = 'agent-option-address';
+        address.textContent = caller;
+        option.append(address);
+      }
+      option.append(check);
+      return option;
+    }));
+    const selected = sources.get(selectedAgent);
+    agentSelector.querySelector('.agent-icon').replaceWith(sourceIcon(selected ? sourceName(selected.agent) : '*', 'agent-icon'));
+    agentSelector.querySelector('.agent-value').textContent = selected ? sourceLabel(selected) : '全部';
+    agentSelector.title = selected ? sourceLabel(selected) : 'Agent：全部';
+    if (focusedAgent !== null && !agentOptions.hidden) {
+      const option = [...agentOptions.children].find(element => element.dataset.agent === focusedAgent)
+        || agentOptions.querySelector('[aria-selected="true"]');
+      option.focus();
+    }
+  }
+
+  function positionAgentOptions() {
+    const bounds = agentSelector.getBoundingClientRect();
+    agentOptions.style.width = `${Math.min(Math.max(224, bounds.width), innerWidth - 16)}px`;
+    agentOptions.style.left = `${Math.max(8, Math.min(bounds.left, innerWidth - agentOptions.offsetWidth - 8))}px`;
+    agentOptions.style.top = `${bounds.bottom + 5}px`;
+    agentOptions.style.maxHeight = `${Math.max(40, innerHeight - bounds.bottom - 13)}px`;
+  }
+
+  function closeAgentOptions(restoreFocus = false) {
+    agentOptions.hidden = true;
+    agentSelector.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) agentSelector.focus();
+  }
+
+  function openAgentOptions() {
+    if (!snapshot) return;
+    agentOptions.hidden = false;
+    agentSelector.setAttribute('aria-expanded', 'true');
+    positionAgentOptions();
+    agentOptions.querySelector('[aria-selected="true"]').focus();
+  }
+
+  function chooseAgent(agent) {
+    selectedAgent = agent;
+    selector.value = '*';
+    selectedCard = null;
+    renderedIds.clear();
+    quotaOrderTimer = clearTimeout(quotaOrderTimer);
+    updateSelector(sessionsForView());
+    closeAgentOptions(true);
+    render(false);
+  }
+
+  /** 来源按真实 Agent 合并，图标与 Magpie 上下对齐。 */
   function renderSources(sessions) {
     const agents = new Map();
     for (const session of sessions) {
-      const agent = sourceName(session.agent);
-      agents.set(agent, Boolean(agents.get(agent)) || sessionIsActive(session));
+      const key = sourceKey(session);
+      agents.set(key, { source: session, active: Boolean(agents.get(key)?.active) || sessionIsActive(session) });
     }
     const list = byId('source-list');
     for (const [agent, entry] of sourceViews) {
       if (!agents.has(agent)) { entry.remove(); sourceViews.delete(agent); }
     }
-    for (const [agent, active] of agents) {
-      let entry = sourceViews.get(agent);
-      if (entry) { entry.dataset.active = String(active); continue; }
+    for (const [key, { source, active }] of agents) {
+      const agent = sourceName(source.agent);
+      const caller = callerName(source);
+      let entry = sourceViews.get(key);
+      if (entry) {
+        entry.dataset.active = String(active);
+        entry.querySelector('.source-address').textContent = caller;
+        entry.querySelector('.source-address').title = `网关密钥：${caller}`;
+        continue;
+      }
       entry = document.createElement('div');
       entry.className = 'source-entry';
-      entry.dataset.source = agent;
+      entry.dataset.source = key;
       entry.dataset.active = String(active);
       const heading = document.createElement('div');
       heading.className = 'source-heading';
-      const icon = document.createElement('span');
-      icon.className = 'source-icon';
-      const family = /claude[\s-]*code/i.test(agent) ? 'claudecode-color' : /claude/i.test(agent) ? 'claude-color' : modelIcon(agent);
-      if (family) {
-        const image = document.createElement('img');
-        image.src = `icons/${family}.svg`;
-        image.alt = '';
-        icon.append(image);
-      } else icon.textContent = '↗';
+      const icon = sourceIcon(agent);
       const name = document.createElement('strong');
       name.textContent = agent;
       name.title = agent;
-      heading.append(icon, name);
+      const copy = document.createElement('span');
+      copy.className = 'source-copy';
+      const address = document.createElement('small');
+      address.className = 'source-address';
+      address.textContent = caller;
+      address.title = `网关密钥：${caller}`;
+      copy.append(name, address);
+      heading.append(icon, copy);
       entry.append(heading);
       if (!sourceViews.size) list.replaceChildren();
-      sourceViews.set(agent, entry);
+      sourceViews.set(key, entry);
       list.append(entry);
     }
     if (!agents.size) list.textContent = '等待请求';
@@ -904,9 +1063,15 @@
     if (!quotaOrderTimer) quotaOrderTimer = setTimeout(() => { quotaOrderTimer = 0; render(false); }, 60_000);
     hud.dataset.layout = innerWidth < 680 ? 'tall' : 'wide';
     if (!snapshot) return;
-    const allSessions = sessionsForView().filter(hasSessionContent);
+    const allSessions = filterAgent(sessionsForView().filter(hasSessionContent));
     const visibleSessions = allSessions.filter(item => item.routes.length || subagentsForView(item).length);
     const session = allSessions.find(item => item.id === selector.value);
+    const activeCount = (session ? [session] : allSessions).filter(sessionIsActive).length;
+    const activeScope = session ? session.label : statsScope();
+    const activeHint = `${activeScope}：${activeCount} 个会话正在同时请求（含正在请求的子 Agent，同一会话只计一次）`;
+    window.hudMotion.roll(byId('active-session-count'), String(activeCount));
+    byId('active-sessions').title = activeHint;
+    byId('active-sessions').setAttribute('aria-label', activeHint);
     hud.dataset.scope = session ? 'session' : 'all';
     const { protectedSessions, recent } = orderedSessions(visibleSessions);
     const chooseSessions = () => session ? [session] : [...protectedSessions, ...recent.slice(0, Math.max(0, visibleSessionCapacity() - protectedSessions.length))];
@@ -919,11 +1084,14 @@
     text('router-host', snapshot.magpieHost);
     renderSources(sessions);
     window.dispatchEvent(new CustomEvent('hud-live-stats', { detail: {
-      daily: session ? session.daily : snapshot.daily,
+      daily: session ? session.daily : statsForSource(snapshot),
       date: snapshot.date, earliestDate: snapshot.earliestDate, host: snapshot.magpieHost,
-      scope: session ? session.label : '全部会话', costError: snapshot.costError,
+      scope: session ? session.label : statsScope(), costError: snapshot.costError,
+      agentScope: selectedAgent, projectHistory: view => ({ ...view, daily: statsForSource(view), scope: statsScope() }),
     } }));
-    renderQuotas(session ? [session] : snapshot.sessions, forceQuotaOrder);
+    renderQuotas(session ? [session] : filterAgent(snapshot.sessions), forceQuotaOrder);
+    byId('empty-route').querySelector('strong').textContent = selectedAgent === '*' ? '尚无今日会话' : `${statsScope()} 暂无会话`;
+    if (!agentOptions.hidden) positionAgentOptions();
     if (hud.dataset.layout === 'tall') {
       sessions = chooseSessions();
       renderSources(sessions);
@@ -978,7 +1146,7 @@
     }
     renderSources(sessions);
     text('session-count', session ? session.label : `${visibleSessions.length}会话, 显示${sessions.length}个`);
-    byId('source-node').title = [...new Set(sessions.map(item => sourceName(item.agent)))].join('\n');
+    byId('source-node').title = [...new Set(sessions.map(sourceLabel))].join('\n');
     routeList.scrollTop = oldScroll;
     byId('empty-route').hidden = sessions.length > 0;
     const inbound = byId('inbound-active');
@@ -987,7 +1155,7 @@
     inbound.style.opacity = sessions.length ? '1' : '0';
     const picked = sessions.flatMap(item => [...item.routes, ...subagentsForView(item, Boolean(session))]).find(card => card.id === selectedCard);
     if (picked) renderNotes([picked.note, sessions.find(item => item.id === picked.sessionId).notes[1]]);
-    else { selectedCard = null; renderNotes(session ? session.notes : snapshot.notes); }
+    else { selectedCard = null; renderNotes(session ? session.notes : selectedAgent !== '*' && sessions.length ? sessions[0].notes : snapshot.notes); }
     renderedIds = currentIds;
     updateCardTimes();
     const moving = window.hudMotion.layout(before, routeList.querySelectorAll('.route-card'), node => node.dataset.motionKey);
@@ -1164,6 +1332,8 @@
   /** 完整 ID 用于选择，显示会话名；不会把两个前缀相同的会话合并。 */
   function updateSelector(sessions) {
     sessions = sessions.filter(hasSessionContent);
+    updateAgentSelector(sessions);
+    sessions = filterAgent(sessions);
     const previous = selector.value;
     const options = [new Option('最近会话', '*')];
     sessions.forEach(session => options.push(new Option(`${session.label} · ${shortAccount(session.routes[0]?.account || activeSubagents(session)[0]?.account || session.completedSubagents?.[0]?.account || '账号未提供')}`, session.id)));
@@ -1195,32 +1365,71 @@
     window.addEventListener('focus', () => syncFocus(true));
     window.addEventListener('blur', () => syncFocus(false));
     syncFocus(document.hasFocus());
+    agentSelector.addEventListener('click', () => agentOptions.hidden ? openAgentOptions() : closeAgentOptions(true));
+    agentSelector.addEventListener('keydown', event => {
+      if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault();
+        openAgentOptions();
+        if (event.key === 'Home') agentOptions.firstElementChild?.focus();
+        if (event.key === 'End') agentOptions.lastElementChild?.focus();
+      }
+    });
+    agentOptions.addEventListener('click', event => {
+      const option = event.target.closest('[data-agent]');
+      if (option) chooseAgent(option.dataset.agent);
+    });
+    agentOptions.addEventListener('keydown', event => {
+      const options = [...agentOptions.children];
+      const index = options.indexOf(document.activeElement);
+      if (event.key === 'Escape') { event.preventDefault(); closeAgentOptions(true); }
+      else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault();
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1
+          : Math.max(0, Math.min(options.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)));
+        options[next]?.focus();
+      }
+    });
+    document.addEventListener('pointerdown', event => {
+      if (!agentSelector.contains(event.target) && !agentOptions.contains(event.target)) closeAgentOptions();
+    });
+    document.addEventListener('focusin', event => {
+      if (!agentSelector.contains(event.target) && !agentOptions.contains(event.target)) closeAgentOptions();
+    });
     selector.addEventListener('change', () => { selectedCard = null; renderedIds.clear(); quotaOrderTimer = clearTimeout(quotaOrderTimer); render(false); });
-    // 悬停滚轮按选项顺序切换；累积触控板细小增量并限速，边界停止，不循环。
-    let wheelDelta = 0;
-    let wheelTime = 0;
-    let wheelSwitch = -Infinity;
+    // 两个筛选共用滚轮规则；各自累积与限速，边界停止不循环。
+    const bindWheel = (control, optionsFor, indexFor, selectIndex) => {
+      let deltaSum = 0;
+      let wheelTime = 0;
+      let wheelSwitch = -Infinity;
+      control.addEventListener('wheel', event => {
+        const options = optionsFor();
+        if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey
+            || !event.deltaY || Math.abs(event.deltaX) > Math.abs(event.deltaY)
+            || control.disabled || options.length < 2) return;
+        event.preventDefault();
+        const now = performance.now();
+        const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? control.clientHeight : 1);
+        if (now - wheelTime > 180 || Math.sign(delta) !== Math.sign(deltaSum)) deltaSum = 0;
+        wheelTime = now;
+        if (now - wheelSwitch < 140) return;
+        deltaSum += delta;
+        if (Math.abs(deltaSum) < 32) return;
+        const current = indexFor(options);
+        const index = Math.max(0, Math.min(options.length - 1, current + Math.sign(deltaSum)));
+        deltaSum = 0;
+        if (index === current) return;
+        wheelSwitch = now;
+        selectIndex(index, options);
+      }, { passive: false });
+      control.addEventListener('mouseleave', () => { deltaSum = 0; wheelTime = 0; });
+    };
     selector.title = '滚轮上下切换会话';
-    selector.addEventListener('wheel', event => {
-      if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey
-          || !event.deltaY || Math.abs(event.deltaX) > Math.abs(event.deltaY)
-          || selector.disabled || selector.options.length < 2) return;
-      event.preventDefault();
-      const now = performance.now();
-      const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? selector.clientHeight : 1);
-      if (now - wheelTime > 180 || Math.sign(delta) !== Math.sign(wheelDelta)) wheelDelta = 0;
-      wheelTime = now;
-      if (now - wheelSwitch < 140) return;
-      wheelDelta += delta;
-      if (Math.abs(wheelDelta) < 32) return;
-      const index = Math.max(0, Math.min(selector.options.length - 1, selector.selectedIndex + Math.sign(wheelDelta)));
-      wheelDelta = 0;
-      if (index === selector.selectedIndex) return;
-      wheelSwitch = now;
+    bindWheel(selector, () => [...selector.options], () => selector.selectedIndex, index => {
       selector.selectedIndex = index;
       selector.dispatchEvent(new Event('change', { bubbles: true }));
-    }, { passive: false });
-    selector.addEventListener('mouseleave', () => { wheelDelta = 0; wheelTime = 0; });
+    });
+    bindWheel(agentSelector, () => [...agentOptions.children], options => options.findIndex(option => option.dataset.agent === selectedAgent),
+      (index, options) => chooseAgent(options[index].dataset.agent));
     routeList.addEventListener('scroll', () => requestDraw(), { passive: true });
     byId('source-node').addEventListener('scroll', () => requestDraw(), { passive: true });
     setInterval(() => { updateCardTimes(); quotaCarousel(); updateQuotaClocks(); }, 1000);

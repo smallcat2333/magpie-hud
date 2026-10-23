@@ -45,12 +45,10 @@ pub struct DailyStats {
     pub tokens_per_second: Option<f64>,
     /// 已完成请求的缓存命中率，cache_read / (in + cache_read)，0 到 1。分母为 0 时未知。
     pub cache_hit_rate: Option<f64>,
-    /// 加权分子与分母，仅用于聚合，不发给前端。
-    #[serde(skip)]
-    cache_read_tokens: u64,
-    #[serde(skip)]
-    cache_denominator_tokens: u64,
-    /// Magpie 费用除以已定价请求数。全部未定价、费用未知或没有已定价请求时为 None。
+    /// 缓存命中加权分子与分母。前端按所选身份重新相加，不能对比率取平均。
+    pub cache_read_tokens: u64,
+    pub cache_denominator_tokens: u64,
+    /// 已定价请求的平均费用。全部未定价、费用未知或没有已定价请求时为 None。
     pub cost_per_call: Option<f64>,
     /// 按本地请求开始时间分为 24 段，与当日 Token 采用同一口径。
     pub hourly: [HourlyStats; 24],
@@ -98,6 +96,9 @@ struct Record {
     time: String,
     session: String,
     agent: String,
+    /// 网关调用方密钥身份。只来自日志 callerKeyId / callerKeyName，不是供应商账号。
+    caller_key_id: String,
+    caller_key_name: String,
     request: String,
     account: String,
     model: String,
@@ -268,6 +269,27 @@ pub struct SessionView {
     pub quota_routes: Vec<RouteCard>,
     pub notes: [Note; 2],
     pub daily: DailyStats,
+    /// 网关调用方密钥 ID。只在该会话已完成记录真实带有 callerKeyId 时填写。
+    #[serde(default)]
+    pub caller_key_id: String,
+    /// 网关调用方密钥名称。缺失保持空字符串，不用供应商账号或默认名代替。
+    #[serde(default)]
+    pub caller_key_name: String,
+}
+
+/// 一个来源身份的当日完成统计。Agent 只做 claude-desktop 显示名转换，其余保持日志原值。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStats {
+    pub agent: String,
+    /// 网关 callerKeyId。空字符串表示日志没有提供，不能当成某个具体密钥。
+    pub caller_key_id: String,
+    /// 有 callerKeyId 时取该 ID 最后一条非空名称。没有 ID 时，名称本身就是分组键。
+    pub caller_key_name: String,
+    pub daily: DailyStats,
+    /// 该分组实际出现过的会话 ID，只用于核对网关费用覆盖，不发给前端。
+    #[serde(skip)]
+    pub cost_sessions: Vec<String>,
 }
 
 /// 图、会话列表、全局统计使用同一次原子快照，revision 控制前端去重。
@@ -283,6 +305,11 @@ pub struct RouteSnapshot {
     pub magpie_host: String,
     pub sessions: Vec<SessionView>,
     pub daily: DailyStats,
+    /// 全部已完成记录按原始 Agent 与 callerKeyId 分组。进行中请求没有调用方密钥，不在这里。
+    #[serde(default)]
+    pub agent_stats: Vec<AgentStats>,
+    /// 所有日期日志中同一密钥 ID 最新的名称，仅用于展示。
+    pub caller_key_names: HashMap<String, String>,
     pub quotas: Vec<crate::telemetry::Quota>,
     pub quota_error: Option<String>,
     pub cost_error: Option<String>,
@@ -296,6 +323,7 @@ pub struct UsageLedger {
     /// 闭区间结束日。单日账本与 `day` 相同；月份扫描才放宽到整月。
     end_day: NaiveDate,
     earliest_day: Option<NaiveDate>,
+    caller_key_names: HashMap<String, (i64, String)>,
     records: Vec<Record>,
     seen: HashSet<String>,
     pub revision: u64,
@@ -314,6 +342,7 @@ impl UsageLedger {
             day: start,
             end_day: end,
             earliest_day: None,
+            caller_key_names: HashMap::new(),
             records: Vec::new(),
             seen: HashSet::new(),
             revision: 0,
@@ -327,8 +356,10 @@ impl UsageLedger {
             return false;
         }
         let earliest = self.earliest_day;
+        let caller_key_names = std::mem::take(&mut self.caller_key_names);
         let revision = self.revision + 1;
         *self = Self::new(day);
+        self.caller_key_names = caller_key_names;
         self.earliest_day = earliest;
         self.revision = revision;
         true
@@ -377,6 +408,16 @@ impl UsageLedger {
             self.earliest_day
                 .map_or(record_day, |earliest| earliest.min(record_day)),
         );
+        if let (Some(id), Some(name)) = (string(&value, "callerKeyId"), string(&value, "callerKeyName")) {
+            let time = timestamp.timestamp_millis();
+            let update = self.caller_key_names.get(id).map_or(true, |(previous, _)| time >= *previous);
+            if update && self.caller_key_names.get(id).map(|(_, previous)| previous.as_str()) != Some(name) {
+                self.caller_key_names.insert(id.into(), (time, name.into()));
+                self.revision += 1;
+            } else if update {
+                self.caller_key_names.insert(id.into(), (time, name.into()));
+            }
+        }
         if record_day < self.day || record_day > self.end_day {
             return;
         }
@@ -422,6 +463,8 @@ impl UsageLedger {
             } else {
                 agent.into()
             },
+            caller_key_id: string(&value, "callerKeyId").unwrap_or("").into(),
+            caller_key_name: string(&value, "callerKeyName").unwrap_or("").into(),
             request: string(&value, "req").unwrap_or("请求模型未提供").into(),
             account: string(&value, "providerAccount")
                 .filter(|s| !s.is_empty())
@@ -464,6 +507,7 @@ impl UsageLedger {
             daily.add(record);
             grouped.entry(&record.session).or_default().push(record);
         }
+        let agent_stats = agent_groups(&self.records);
         let mut sessions = Vec::new();
         for (session, records) in grouped {
             // t 是请求开始时间；完成顺序以完整日志行的追加顺序为准。
@@ -581,6 +625,7 @@ impl UsageLedger {
             let mut quota_routes: Vec<_> = quota_by_account.into_values().collect();
             quota_routes.sort_by(|a, b| b.0.cmp(&a.0));
             let quota_routes: Vec<_> = quota_routes.into_iter().map(|(_, route)| route).collect();
+            let (caller_key_id, caller_key_name) = caller_identity(&records);
             let (anchor, anchor_card) = if let Some(latest_root) = latest_root {
                 let card = routes.iter().find(|route| route.current).expect("根请求当前卡片");
                 (latest_root, card.note.clone())
@@ -635,6 +680,8 @@ impl UsageLedger {
                 subagent_history,
                 quota_routes,
                 daily: stats,
+                caller_key_id,
+                caller_key_name,
             });
         }
         sessions.sort_by(|a, b| b.latest_sequence.cmp(&a.latest_sequence).then(a.id.cmp(&b.id)));
@@ -689,6 +736,8 @@ impl UsageLedger {
             magpie_host: host.into(),
             sessions,
             daily,
+            agent_stats,
+            caller_key_names: self.caller_key_names.iter().map(|(id, (_, name))| (id.clone(), name.clone())).collect(),
             quotas: Vec::new(),
             quota_error: None,
             cost_error: None,
@@ -699,12 +748,12 @@ impl UsageLedger {
     }
 
     /// 汇总该账本日期内全部有效记录（历史按日查看不截断到最近 10 个会话）。
-    pub fn day_stats(&self) -> (DailyStats, Option<NaiveDate>) {
+    pub fn day_stats(&self) -> (DailyStats, Vec<AgentStats>, Option<NaiveDate>) {
         let mut daily = DailyStats::default();
         for record in &self.records {
             daily.add(record);
         }
-        (daily, self.earliest_day)
+        (daily, agent_groups(&self.records), self.earliest_day)
     }
 
     /// 按本地日期汇总闭区间内每一天。Token 与调用数和单日 `day_stats` 同一口径。
@@ -740,7 +789,7 @@ pub struct DayUsage {
 pub fn scan_day_stats(
     path: &std::path::Path,
     day: NaiveDate,
-) -> Result<(DailyStats, Option<NaiveDate>), String> {
+) -> Result<(DailyStats, Vec<AgentStats>, Option<NaiveDate>), String> {
     let mut ledger = UsageLedger::new(day);
     let mut cursor = crate::tail::LogCursor::default();
     cursor.update_for_day(path, &mut ledger, day)?;
@@ -748,6 +797,58 @@ pub fn scan_day_stats(
         return Err("历史日志文件未找到，无法确认所选日期统计".into());
     }
     Ok(ledger.day_stats())
+}
+
+/// 按原始 Agent 与调用方身份汇总全部完成记录。费用不在这里填写。
+/// 有 callerKeyId 时按 ID 分组；没有 ID 时按 callerKeyName 分开，两边都空才共用一组。
+fn agent_groups(records: &[Record]) -> Vec<AgentStats> {
+    let mut order: Vec<(String, String, String)> = Vec::new();
+    let mut groups: HashMap<(String, String, String), AgentStats> = HashMap::new();
+    for record in records {
+        let name_key = if record.caller_key_id.is_empty() { record.caller_key_name.clone() } else { String::new() };
+        let key = (record.agent.clone(), record.caller_key_id.clone(), name_key);
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+            groups.insert(key.clone(), AgentStats {
+                agent: record.agent.clone(),
+                caller_key_id: record.caller_key_id.clone(),
+                caller_key_name: if record.caller_key_id.is_empty() { record.caller_key_name.clone() } else { String::new() },
+                daily: DailyStats::default(),
+                cost_sessions: Vec::new(),
+            });
+        }
+        let group = groups.get_mut(&key).expect("刚插入的来源分组");
+        if !record.caller_key_id.is_empty() && !record.caller_key_name.is_empty() {
+            group.caller_key_name.clone_from(&record.caller_key_name);
+        }
+        if !group.cost_sessions.iter().any(|id| id == &record.session) {
+            group.cost_sessions.push(record.session.clone());
+        }
+        group.daily.add(record);
+    }
+    let mut stats: Vec<_> = order.into_iter().filter_map(|key| groups.remove(&key)).collect();
+    stats.sort_by(|left, right| {
+        right.daily.requests.cmp(&left.daily.requests)
+            .then_with(|| left.agent.cmp(&right.agent))
+            .then_with(|| left.caller_key_id.cmp(&right.caller_key_id))
+            .then_with(|| left.caller_key_name.cmp(&right.caller_key_name))
+    });
+    stats
+}
+
+/// 会话展示用最后一条真实带有调用方字段的完成记录，不拿供应商账号填补。
+fn caller_identity(records: &[&Record]) -> (String, String) {
+    let mut id = String::new();
+    let mut name = String::new();
+    for record in records {
+        if !record.caller_key_id.is_empty() {
+            id.clone_from(&record.caller_key_id);
+        }
+        if !record.caller_key_name.is_empty() {
+            name.clone_from(&record.caller_key_name);
+        }
+    }
+    (id, name)
 }
 
 /// 一次只读扫描所选本地月的每日 Token 与调用数，并返回日志中最早的有效日期。
@@ -1200,6 +1301,60 @@ mod tests {
         assert_eq!(ledger.snapshot("h", "ready", None).daily.tokens_per_second, Some(50.0));
     }
 
+    #[test]
+    fn caller_names_use_latest_timestamp_across_days_without_changing_stats() {
+        let mut ledger = ledger();
+        let mut old = fixture(1, "old-session", 200);
+        old["callerKeyId"] = json!("stable-key");
+        old["callerKeyName"] = json!("旧名称");
+        ledger.ingest(old.to_string().as_bytes());
+        let before = ledger.snapshot("h", "ready", None);
+        let mut newer = fixture(2, "new-day-session", 200);
+        newer["t"] = json!("2026-10-21T02:00:00Z");
+        newer["callerKeyId"] = json!("stable-key");
+        newer["callerKeyName"] = json!("最新名称");
+        ledger.ingest(newer.to_string().as_bytes());
+        ledger.ingest(old.to_string().as_bytes());
+        let after = ledger.snapshot("h", "ready", None);
+        assert_eq!(after.caller_key_names.get("stable-key").map(String::as_str), Some("最新名称"));
+        assert_eq!(after.daily, before.daily);
+        assert_eq!(after.sessions.len(), before.sessions.len());
+        assert!(after.revision > before.revision);
+        ledger.change_day(ledger.day.succ_opt().unwrap());
+        assert_eq!(ledger.snapshot("h", "ready", None).caller_key_names["stable-key"], "最新名称");
+    }
+
+    #[test]
+    fn caller_groups_keep_all_records_and_weighted_metrics() {
+        let mut ledger = ledger();
+        for (id, key, name, input, cache, output) in [
+            (1, "a", "W728", 100, 300, 200),
+            (2, "a", "W728 新名", 300, 100, 400),
+            (3, "b", "杨润杰", 50, 50, 100),
+            (4, "", "只有名称", 20, 0, 100),
+            (5, "", "另一个名称", 10, 30, 100),
+        ] {
+            let mut item = fixture(id, &format!("source-{id}"), 200);
+            item["agent"] = json!("codex");
+            item["callerKeyId"] = json!(key);
+            item["callerKeyName"] = json!(name);
+            item["in"] = json!(input);
+            item["cache_read"] = json!(cache);
+            item["out"] = json!(output);
+            ledger.ingest(item.to_string().as_bytes());
+        }
+        let snapshot = ledger.snapshot("h", "ready", None);
+        assert_eq!(snapshot.agent_stats.len(), 4);
+        let group = snapshot.agent_stats.iter().find(|group| group.caller_key_id == "a").unwrap();
+        assert_eq!(group.caller_key_name, "W728 新名");
+        assert_eq!(group.daily.requests, 2);
+        assert_eq!(group.daily.tokens, 1400);
+        assert_eq!(group.daily.cache_hit_rate, Some(0.5));
+        assert_eq!(group.daily.tokens_per_second, Some(150.0));
+        assert_eq!(group.daily.cost, None);
+        assert_eq!(snapshot.sessions.iter().find(|session| session.id == "source-3").unwrap().caller_key_name, "杨润杰");
+    }
+
     /// 非对象、空文件和未换行记录都不形成路由，也不伪造时间。
     #[test]
     fn ignores_empty_non_object_and_incomplete_records() {
@@ -1240,12 +1395,13 @@ mod tests {
         assert_eq!(live_view.earliest_date, day1.to_string());
         assert_eq!(live_view.daily.requests, 1);
 
-        let (hist_daily, earliest) = scan_day_stats(&path, day1).unwrap();
+        let (hist_daily, hist_agents, earliest) = scan_day_stats(&path, day1).unwrap();
         assert_eq!(earliest, Some(day1));
         assert_eq!(hist_daily.requests, 11);
         assert_eq!(hist_daily.speed_samples, 11);
         // 历史单日汇总包含全部 11 个会话（总输出 2000 / 22s），不截断为 10 个。
         assert!((hist_daily.tokens_per_second.unwrap() - 2000.0 / 22.0).abs() < 1e-6);
+        assert!(hist_agents.iter().all(|group| group.caller_key_id.is_empty()));
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -1337,7 +1493,7 @@ mod tests {
             .filter(|day| day.date != first_usage.date && day.date != late_usage.date)
             .all(|day| day.requests == 0 && day.tokens == 0));
 
-        let (single, _) = scan_day_stats(&path, first_usage.date).unwrap();
+        let (single, _, _) = scan_day_stats(&path, first_usage.date).unwrap();
         assert_eq!((single.requests, single.tokens), (first_usage.requests, first_usage.tokens));
         let _ = std::fs::remove_dir_all(directory);
     }
