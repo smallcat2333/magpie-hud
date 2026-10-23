@@ -1038,7 +1038,7 @@
       view.fill.dataset.percent = '0';
       view.track.removeAttribute('aria-valuenow');
     }
-    const severity = percent === null ? 'unknown' : used > 98 ? 'critical' : used > 80 ? 'warning' : 'normal';
+    const severity = percent === null ? 'unknown' : used > 95 ? 'critical' : used > 80 ? 'warning' : 'normal';
     view.track.parentElement.dataset.severity = severity;
     view.track.parentElement.dataset.low = String(severity === 'warning');
     const read = quota.readAt || quota.asOf;
