@@ -679,7 +679,12 @@
       if (view.marker.hidden) continue;
       const elapsed = Math.min(100, Math.max(0, (1 - (resetAt - now) / periodMs) * 100));
       view.marker.style.left = `clamp(0px, ${elapsed}%, calc(100% - 1px))`;
-      const hint = `细竖线：周期已过 ${elapsed.toFixed(1)}%；色条：已用额度`;
+      const used = view.track.dataset.unknown === 'false' ? Number(view.fill.dataset.percent) : NaN;
+      const difference = used - elapsed;
+      const pace = !Number.isFinite(used) ? 'unknown' : difference > 5 ? 'ahead' : difference < -5 ? 'within' : 'balanced';
+      view.marker.dataset.pace = pace;
+      const comparison = pace === 'ahead' ? '用量高于时间进度超过 5 个百分点' : pace === 'within' ? '用量低于时间进度超过 5 个百分点' : pace === 'balanced' ? '用量与时间进度相差不超过 5 个百分点' : '用量未知';
+      const hint = `细竖线：周期已过 ${elapsed.toFixed(1)}%；色条：已用额度；${comparison}`;
       view.marker.title = `${view.item.title}\n${hint}`;
       view.track.title = view.marker.title;
       view.track.setAttribute('aria-description', hint);

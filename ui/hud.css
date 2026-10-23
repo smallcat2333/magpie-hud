@@ -63,6 +63,9 @@
 .quota-track{position:relative;overflow:visible}
 .quota-fill{border-radius:4px;max-width:100%}
 .quota-time-marker{position:absolute;top:-2px;bottom:-2px;width:1px;background:var(--ink);box-shadow:0 0 0 1px rgb(23 25 30/.5);z-index:1}
+.quota-time-marker[data-pace="balanced"]{background:var(--muted)}
+.quota-time-marker[data-pace="within"]{background:var(--completed)}
+.quota-time-marker[data-pace="ahead"]{background:#ff9a3c}
 /* 额度按已用原值分级；文字和进度使用同一状态色。 */
 .branch-trunk{stroke:var(--muted);opacity:.4}
 .quota-window{--quota-color:var(--stat-tokens)}
