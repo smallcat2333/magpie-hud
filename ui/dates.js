@@ -182,12 +182,16 @@
     if (restoreFocus) byId('stats-date-label').focus({ preventScroll: true });
   }
 
+  function scopedMonth() {
+    return calendarView && live?.projectMonth ? live.projectMonth(calendarView) : calendarView;
+  }
+
   function readDay(date) {
     if (date > latestDate()) return `${date} · 尚未到来`;
     if (earliest && date < earliest) return `${date} · 记录开始前`;
     if (calendarLoading) return `${date} · 正在读取用量`;
     if (calendarError || !calendarView) return `${date} · 用量未读取`;
-    const item = calendarView.days.find(day => day.date === date);
+    const item = scopedMonth().days.find(day => day.date === date);
     if (!item) return `${date} · 用量未提供`;
     return `${date} · ${item.tokens.toLocaleString('zh-CN')} Token · ${item.requests.toLocaleString('zh-CN')} 次调用`;
   }
@@ -205,8 +209,11 @@
     const weekday = (first.getDay() + 6) % 7;
     const count = new Date(year, month, 0).getDate();
     const cells = Math.ceil((weekday + count) / 7) * 7;
-    const values = new Map((calendarView?.days || []).map(day => [day.date, day]));
-    const maximum = Math.max(0, ...(calendarView?.days || []).filter(day => day.date <= latestDate()).map(day => day.tokens));
+    const monthView = scopedMonth();
+    const values = new Map((monthView?.days || []).map(day => [day.date, day]));
+    const maximum = Math.max(0, ...(monthView?.days || []).filter(day => day.date <= latestDate()).map(day => day.tokens));
+    byId('calendar-title').title = live?.agentScopeLabel || '全部会话';
+    calendar.setAttribute('aria-label', `用量热力日历：${live?.agentScopeLabel || '全部会话'}`);
     const fragment = document.createDocumentFragment();
     const table = [];
     let total = 0;
@@ -376,5 +383,6 @@
       failure = '';
     }
     render();
+    if (!calendar.hidden) renderCalendar();
   });
 })();

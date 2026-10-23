@@ -579,6 +579,16 @@ struct MonthUsageView {
     earliest_date: String,
     latest_date: String,
     days: Vec<MonthDayUsage>,
+    agent_days: Vec<MonthAgentUsage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MonthAgentUsage {
+    agent: String,
+    caller_key_id: String,
+    caller_key_name: String,
+    days: Vec<MonthDayUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -604,7 +614,7 @@ fn read_month_usage(app: &AppHandle, month: &str) -> Result<MonthUsageView, Stri
         let runtime = state.lock().expect("状态锁损坏");
         usage_path(&runtime.config)
     };
-    let (days, scanned_earliest) = usage::scan_month_usage(&path, start, end)?;
+    let (days, agent_days, scanned_earliest) = usage::scan_month_scoped_usage(&path, start, end)?;
     let today = Local::now().date_naive();
     let earliest = scanned_earliest
         .map(|date| date.min(today))
@@ -613,6 +623,10 @@ fn read_month_usage(app: &AppHandle, month: &str) -> Result<MonthUsageView, Stri
         month,
         earliest_date: earliest.to_string(),
         latest_date: today.to_string(),
+        agent_days: agent_days.into_iter().map(|(agent, caller_key_id, caller_key_name, days)| MonthAgentUsage {
+            agent, caller_key_id, caller_key_name,
+            days: days.into_iter().map(|day| MonthDayUsage { date: day.date.to_string(), tokens: day.tokens, requests: day.requests }).collect(),
+        }).collect(),
         days: days
             .into_iter()
             .map(|day| MonthDayUsage {

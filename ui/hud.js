@@ -1087,7 +1087,19 @@
       daily: session ? session.daily : statsForSource(snapshot),
       date: snapshot.date, earliestDate: snapshot.earliestDate, host: snapshot.magpieHost,
       scope: session ? session.label : statsScope(), costError: snapshot.costError,
-      agentScope: selectedAgent, projectHistory: view => ({ ...view, daily: statsForSource(view), scope: statsScope() }),
+      agentScope: selectedAgent, agentScopeLabel: statsScope(),
+      projectMonth: view => {
+        if (selectedAgent === '*') return view;
+        const values = new Map();
+        filterAgent(view.agentDays || []).forEach(group => group.days.forEach(day => {
+          const sum = values.get(day.date) || { tokens: 0, requests: 0 };
+          sum.tokens += day.tokens;
+          sum.requests += day.requests;
+          values.set(day.date, sum);
+        }));
+        return { ...view, days: view.days.map(day => ({ date: day.date, tokens: 0, requests: 0, ...values.get(day.date) })) };
+      },
+      projectHistory: view => ({ ...view, daily: statsForSource(view), scope: statsScope() }),
     } }));
     renderQuotas(session ? [session] : filterAgent(snapshot.sessions), forceQuotaOrder);
     byId('empty-route').querySelector('strong').textContent = selectedAgent === '*' ? '尚无今日会话' : `${statsScope()} 暂无会话`;
@@ -1198,15 +1210,15 @@
       }
       const stacked = router.top >= icon.bottom;
       index += 1;
-      // 上下排列直接从图标下沿接入 Magpie 顶沿，允许交叉，不为绕线预留左侧走廊。
+      // 纵向来源走图标左侧的紧凑独立弧线，避免穿过下方图标并重合成一根竖线。
       const port = index / (sources.length + 1);
-      const x = (stacked ? icon.left + icon.width / 2 : icon.right) - bounds.left;
-      const y = (stacked ? icon.bottom : icon.top + icon.height / 2) - bounds.top;
-      const endX = (stacked ? router.left + router.width * port : router.left) - bounds.left;
-      const endY = (stacked ? router.top : router.top + router.height * port) - bounds.top;
-      const bend = Math.max(10, Math.abs(endY - y) * .5);
+      const x = (stacked ? icon.left : icon.right) - bounds.left;
+      const y = icon.top + icon.height / 2 - bounds.top;
+      const endX = router.left - bounds.left;
+      const endY = router.top + router.height * port - bounds.top;
+      const lane = Math.max(1, Math.min(x, endX) - 14) + (index - 1) * Math.min(6, 14 / Math.max(1, sources.length - 1));
       path.setAttribute('d', stacked
-        ? `M${x} ${y}C${x} ${y + bend} ${endX} ${endY - bend} ${endX} ${endY}`
+        ? `M${x} ${y}C${lane} ${y} ${lane} ${endY} ${endX} ${endY}`
         : `M${x} ${y}C${x + (endX - x) * .5} ${y} ${endX - 12} ${endY} ${endX} ${endY}`);
       const flowing = entry.dataset.active === 'true';
       if (path.dataset.active !== String(flowing)) {

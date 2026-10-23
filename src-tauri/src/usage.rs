@@ -756,6 +756,19 @@ impl UsageLedger {
         (daily, agent_groups(&self.records), self.earliest_day)
     }
 
+    pub fn scoped_days_in_range(&self) -> Vec<(String, String, String, Vec<DayUsage>)> {
+        let mut groups: BTreeMap<(String, String, String), BTreeMap<NaiveDate, DayUsage>> = BTreeMap::new();
+        for record in &self.records {
+            let key = (canonical_agent(&record.agent), record.caller_key_id.clone(),
+                if record.caller_key_id.is_empty() { record.caller_key_name.clone() } else { String::new() });
+            let day = groups.entry(key).or_default().entry(record.day)
+                .or_insert(DayUsage { date: record.day, tokens: 0, requests: 0 });
+            day.tokens = day.tokens.saturating_add(record.tokens);
+            day.requests = day.requests.saturating_add(1);
+        }
+        groups.into_iter().map(|((agent, id, name), days)| (agent, id, name, days.into_values().collect())).collect()
+    }
+
     /// 按本地日期汇总闭区间内每一天。Token 与调用数和单日 `day_stats` 同一口径。
     pub fn days_in_range(&self) -> (Vec<DayUsage>, Option<NaiveDate>) {
         let mut by_day: BTreeMap<NaiveDate, DayUsage> = BTreeMap::new();
@@ -864,6 +877,27 @@ pub fn scan_month_usage(
         return Err("历史日志文件未找到，无法确认所选月份用量".into());
     }
     Ok(ledger.days_in_range())
+}
+
+pub fn scan_month_scoped_usage(
+    path: &std::path::Path, start: NaiveDate, end: NaiveDate,
+) -> Result<(Vec<DayUsage>, Vec<(String, String, String, Vec<DayUsage>)>, Option<NaiveDate>), String> {
+    let mut ledger = UsageLedger::spanning(start, end);
+    let mut cursor = crate::tail::LogCursor::default();
+    cursor.update_for_day(path, &mut ledger, start)?;
+    if cursor.missing { return Err("历史日志文件未找到，无法确认月份用量".into()); }
+    let (days, earliest) = ledger.days_in_range();
+    Ok((days, ledger.scoped_days_in_range(), earliest))
+}
+
+fn canonical_agent(agent: &str) -> String {
+    let key = agent.to_lowercase().replace([' ', '_', '-'], "");
+    match key.as_str() {
+        "claudedesktop" => "Claude Desktop".into(),
+        "claude" | "claudecode" => "Claude Code".into(),
+        "codex" => "Codex".into(),
+        _ => agent.into(),
+    }
 }
 
 /// 读取非空字符串字段；缺失和空值都保持未知。
@@ -1299,6 +1333,26 @@ mod tests {
         assert!(!incomplete.text.contains("缓存命中率"));
         assert!(!incomplete.text.contains("NaN"));
         assert_eq!(ledger.snapshot("h", "ready", None).daily.tokens_per_second, Some(50.0));
+    }
+
+    #[test]
+    fn month_scopes_separate_keys_and_merge_agent_aliases() {
+        let day = ledger().day;
+        let mut ledger = UsageLedger::spanning(day, day.succ_opt().unwrap());
+        for (id, agent, key, output) in [(1, "claude-code", "a", 100), (2, "claude", "a", 200), (3, "claude-code", "b", 500)] {
+            let mut item = fixture(id, &format!("session-{id}"), 200);
+            item["agent"] = json!(agent);
+            item["callerKeyId"] = json!(key);
+            item["out"] = json!(output);
+            ledger.ingest(item.to_string().as_bytes());
+        }
+        let groups = ledger.scoped_days_in_range();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "Claude Code");
+        assert_eq!(groups[0].1, "a");
+        assert_eq!(groups[0].3[0].requests, 2);
+        assert_eq!(groups[0].3[0].tokens + groups[1].3[0].tokens, ledger.day_stats().0.tokens);
+        assert_eq!(groups[1].3[0].requests, 1);
     }
 
     #[test]

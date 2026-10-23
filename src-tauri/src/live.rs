@@ -280,6 +280,7 @@ impl LiveState {
             };
             if child.is_some() {
                 child_sessions.insert(session_id.to_owned());
+                // 子请求并进父会话，不新开一行，所以不会改写父会话已有的网关密钥。
                 if let Some(session) = view.sessions.iter_mut().find(|s| s.id == session_id) {
                     if let Some(existing) = session.subagents.iter_mut().find(|item| item.subagent_id == card.subagent_id) {
                         if card.route_id > existing.route_id { *existing = card; }
@@ -305,10 +306,13 @@ impl LiveState {
                 session.routes.insert(0, card);
             } else {
                 active_sessions.insert(session_id.to_owned());
+                // 进行中请求的 usage 记录尚未写入，网关密钥还不可知。沿用该会话已完成记录的密钥，
+                // 不能留空：空密钥在来源列表里会被显示成「本机」，请求一完成又跳回真实密钥。
+                let (caller_key_id, caller_key_name) = known_caller(view, session_id);
                 view.sessions.push(SessionView { id: session_id.into(), label, timestamp_ms: started.map(|t| t.timestamp_millis()).unwrap_or(0),
                     latest_sequence: 0, agent: display_agent(&active.agent), request: active.model.clone(),
                     routes: vec![card], subagents: Vec::new(), completed_subagents: Vec::new(), subagent_history: HashMap::new(), quota_routes: Vec::new(),
-                    notes: [note, second], daily: DailyStats::default(), caller_key_id: String::new(), caller_key_name: String::new() });
+                    notes: [note, second], daily: DailyStats::default(), caller_key_id, caller_key_name });
             }
         }
         for session in &mut view.sessions {
@@ -558,6 +562,16 @@ fn updated_at(start: DateTime<chrono::FixedOffset>, elapsed_ms: u64) -> String {
 /// 同一 Desktop 会话跨 CLI ID 只比较这个时刻，旧快照或无更新时间时不隐藏。
 fn root_mark(card: &RouteCard) -> Option<DateTime<chrono::FixedOffset>> {
     DateTime::parse_from_rfc3339(card.updated_at.as_deref()?).ok()
+}
+
+/// 进行中请求还没有 usage 记录，网关密钥未知。只沿用这个会话自己已完成记录里的密钥；
+/// 同名来源可能是另一台机器的另一个密钥，不能拿来填。没有记录就保持空字符串。
+fn known_caller(view: &RouteSnapshot, session_id: &str) -> (String, String) {
+    view.sessions.iter()
+        .find(|session| session.id == session_id)
+        .filter(|session| !session.caller_key_id.is_empty() || !session.caller_key_name.is_empty())
+        .map(|session| (session.caller_key_id.clone(), session.caller_key_name.clone()))
+        .unwrap_or_default()
 }
 
 /// 来源文案与日志口径一致。
@@ -951,6 +965,37 @@ mod tests {
         let mut finished = ledger.snapshot("h", "ready", None);
         live.apply(&mut finished);
         assert!(finished.sessions.is_empty());
+    }
+
+    /// 进行中请求的 usage 记录还没落地，沿用该会话已完成记录的网关密钥，
+    /// 不留空密钥把来源显示成「本机」。会话没有记录时再按来源找，两边都没有就保持空。
+    #[test]
+    fn live_request_keeps_known_caller_until_usage_arrives() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        let row = serde_json::json!({"route_id":3,"t":now.to_rfc3339(),"session":"alpha",
+            "agent":"claude","callerKeyId":"key-1","callerKeyName":"杨润杰",
+            "providerAccount":"one@example.com","provider":"codex","model":"gpt-test",
+            "status":200,"in":10,"out":10,"ms":2000,"req":"group/smart-split"});
+        ledger.ingest(row.to_string().as_bytes());
+        let mut live = LiveState::default();
+        live.activity.active.push(Active { id: 2, session: "alpha".into(), agent: "claude".into(),
+            started: now.to_rfc3339(), phase: "upstream".into(), route: 11, ..Active::default() });
+        live.routes.insert(11, LiveRoute { id: 11, session: "alpha".into(), ..LiveRoute::default() });
+        let mut view = ledger.snapshot("h", "ready", None);
+        live.apply(&mut view);
+        assert_eq!(view.sessions.len(), 1);
+        assert_eq!(view.sessions[0].caller_key_id, "key-1");
+        assert_eq!(view.sessions[0].caller_key_name, "杨润杰");
+
+        // 全新会话没有已完成记录：保持空字符串，不拿别的会话的密钥来填。
+        live.activity.active.push(Active { id: 3, session: "beta".into(), agent: "claude".into(),
+            started: now.to_rfc3339(), phase: "upstream".into(), route: 12, ..Active::default() });
+        live.routes.insert(12, LiveRoute { id: 12, session: "beta".into(), ..LiveRoute::default() });
+        live.apply(&mut view);
+        // 另一个会话即使来源同名，也可能是另一台机器的另一个密钥，不能借用 alpha 的。
+        let beta = view.sessions.iter().find(|session| session.id == "beta").unwrap();
+        assert!(beta.caller_key_id.is_empty() && beta.caller_key_name.is_empty());
     }
 
     /// 未到阈值的上游为蓝色运行，仍活跃的已结束 trace 不撤卡。
