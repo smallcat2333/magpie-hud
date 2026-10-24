@@ -31,6 +31,9 @@ pub struct AppConfig {
     /// 上次可见的正常窗口位置与尺寸；首次运行为空。
     /// 只保存稳定矩形，不保存最小化哨兵坐标、零尺寸或隐藏态。
     pub window: Option<WindowPlacement>,
+    /// 用量详情最后的正常位置与尺寸；旧配置缺少此项时首次居中。
+    #[serde(default)]
+    pub details_window: Option<WindowPlacement>,
     /// 是否置顶，默认 true。
     pub always_on_top: bool,
 }
@@ -38,7 +41,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     /// 返回首次运行配置：默认路径、本机显示地址、无保存位置、置顶。
     fn default() -> Self {
-        Self { usage_jsonl_path: String::new(), magpie_host: "127.0.0.1:3425".to_string(), window: None, always_on_top: true }
+        Self { usage_jsonl_path: String::new(), magpie_host: "127.0.0.1:3425".to_string(), window: None, details_window: None, always_on_top: true }
     }
 }
 
@@ -84,6 +87,17 @@ pub fn usage_path(config: &AppConfig) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn details_geometry_roundtrips_and_old_config_still_loads() {
+        let old=r#"{"usageJsonlPath":"","magpieHost":"127.0.0.1:3425","window":null,"alwaysOnTop":true}"#;
+        let mut config:AppConfig=serde_json::from_str(old).unwrap();
+        assert_eq!(config.details_window,None);
+        config.details_window=Some(WindowPlacement{x:-120.0,y:80.0,width:960.0,height:720.0});
+        let restored:AppConfig=serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(restored.details_window,config.details_window);
+        assert_eq!(restored.window,None);
+    }
 
     /// 空路径回到默认日志，空白地址与关闭置顶必须原样保存。
     #[test]

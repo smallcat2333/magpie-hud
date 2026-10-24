@@ -147,7 +147,7 @@ where F: FnMut(usize) -> Result<PricePage, String> {
     let mut offset = 0;
     let mut scan_limit = None;
     loop {
-        if started.elapsed() > Duration::from_secs(15) {
+        if started.elapsed() > Duration::from_secs(90) {
             warnings.push("逐请求费用读取超时，已匹配费用保留，其余未知".into()); break;
         }
         let page = match fetch(offset) {
@@ -205,14 +205,41 @@ fn parse_cycles(bytes: &[u8]) -> Result<(Vec<Cycle>,bool),String> {
     for (identity,windows) in history {
         let Some((provider,account)) = identity.split_once('|') else { missing=true; continue; };
         for (window, observations) in windows {
+            let mut observations = observations;
+            observations.sort_by_key(|o| stamp(&o.at));
+            let mut windows: Vec<Cycle> = Vec::new();
             for o in observations {
                 let times = o.start.as_deref().and_then(stamp).zip(o.resets_at.as_deref().and_then(stamp)).zip(stamp(&o.at));
                 let Some(((start,end),at)) = times else { missing=true; continue; };
                 if start >= end || at < start || at > end { missing=true; continue; }
-                let key = (provider.to_string(),account.to_string(),window.clone(),start,end);
-                if cycles.get(&key).is_some_and(|old| old.observed_at >= at) { continue; }
-                cycles.insert(key,Cycle { provider:provider.into(),account:account.into(),window:window.clone(),
-                    start,end,observed_at:at,remaining:o.left.filter(|v|v.is_finite() && *v>=0.0 && *v<=100.0) });
+                let remaining = o.left.filter(|v|v.is_finite() && *v>=0.0 && *v<=100.0);
+                if let Some(previous) = windows.last_mut() {
+                    let same = previous.start == start && previous.end == end;
+                    let overlap = start < previous.end && end > previous.start;
+                    let replenished = previous.remaining.zip(remaining).is_some_and(|(before,after)| after > before + 1.0);
+                    let nearby = (start - previous.start).abs() <= 10 * 60 * 1000
+                        && (end - previous.end).abs() <= 10 * 60 * 1000;
+                    // 相近边界且没有额度回升时视为时间校准；额度回升仍保留为独立重置。
+                    if same || overlap && !replenished && nearby {
+                        previous.start = start;
+                        previous.end = end;
+                        previous.observed_at = at;
+                        previous.remaining = remaining;
+                        continue;
+                    }
+                    // 迟到的旧周期读数不能再创建一个重叠周期。
+                    if start < previous.start { continue; }
+                }
+                windows.push(Cycle { provider:provider.into(),account:account.into(),window:window.clone(),
+                    start,end,observed_at:at,remaining });
+            }
+            for index in 1..windows.len() {
+                if windows[index-1].end > windows[index].start {
+                    windows[index-1].end = windows[index].start;
+                }
+            }
+            for cycle in windows {
+                cycles.insert((cycle.provider.clone(),cycle.account.clone(),cycle.window.clone(),cycle.start,cycle.end),cycle);
             }
         }
     }
@@ -282,6 +309,36 @@ mod tests {
             Ok(PricePage{period:period.into(),offset,total:2,rows:vec![priced.clone()]})
         });
         assert_eq!(costs.len(),1);assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn cycles_merge_boundary_corrections_and_close_early_resets() {
+        let bytes = br#"{"vendor|account":{"7 days":[
+          {"at":"2025-01-01T00:00:00Z","left":100,"start":"2025-01-01T00:00:00Z","resetsAt":"2025-01-08T00:00:00Z"},
+          {"at":"2025-01-01T01:00:00Z","left":100,"start":"2025-01-01T00:04:00Z","resetsAt":"2025-01-08T00:04:00Z"},
+          {"at":"2025-01-02T00:00:00Z","left":0,"start":"2025-01-01T00:04:01Z","resetsAt":"2025-01-08T00:04:01Z"},
+          {"at":"2025-01-02T00:01:00Z","left":100,"start":"2025-01-02T00:01:00Z","resetsAt":"2025-01-09T00:01:00Z"},
+          {"at":"2025-01-02T01:00:00Z","left":90,"start":"2025-01-02T00:01:00Z","resetsAt":"2025-01-09T00:01:00Z"}
+        ]}}"#;
+        let (cycles,missing)=parse_cycles(bytes).unwrap();
+        assert!(!missing);
+        assert_eq!(cycles.len(),2);
+        assert_eq!(cycles[1].start,stamp("2025-01-01T00:04:01Z").unwrap());
+        assert_eq!(cycles[1].end,cycles[0].start);
+        assert_eq!(cycles[1].remaining,Some(0.0));
+        assert_eq!(cycles[0].remaining,Some(90.0));
+    }
+
+    #[test]
+    fn cycles_keep_nearby_resets_when_allowance_really_increases() {
+        let bytes = br#"{"vendor|account":{"7 days":[
+          {"at":"2025-01-01T00:03:00Z","left":0,"start":"2025-01-01T00:00:00Z","resetsAt":"2025-01-08T00:00:00Z"},
+          {"at":"2025-01-01T00:04:00Z","left":100,"start":"2025-01-01T00:04:00Z","resetsAt":"2025-01-08T00:04:00Z"}
+        ]}}"#;
+        let (cycles,missing)=parse_cycles(bytes).unwrap();
+        assert!(!missing);
+        assert_eq!(cycles.len(),2);
+        assert_eq!(cycles[1].end,cycles[0].start);
     }
 
     #[test]

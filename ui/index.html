@@ -4,20 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Magpie HUD V.0.0.28</title>
+  <title>Magpie HUD V.0.0.29</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="hud.css?v=0.0.28-20261024-quota-two-chars">
+  <link rel="stylesheet" href="hud.css?v=0.0.28-20261024-route-label-width">
   <script src="motion.js?v=0.0.28-20261023-digit-roll" defer></script>
   <script src="hourly.js?v=0.0.28-20261022-endpoint-motion" defer></script>
   <link rel="stylesheet" href="dates.css?v=20261023-deeper-heat">
   <script src="dates.js?v=20261023-caller-stats" defer></script>
-  <script src="hud.js?v=0.0.28-20261023-caller-stats" defer></script>
+  <script src="hud.js?v=0.0.28-20261024-feishu-icon" defer></script>
 </head>
 <body>
 <main class="hud" id="hud" data-state="waiting" data-sources="compact" data-focus="true">
   <header class="window-bar" id="drag-region" data-tauri-drag-region>
     <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg>
-    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.0.0.28</span></h1><span class="brand-subtitle">路由监视</span>
+    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.0.0.29</span></h1><span class="brand-subtitle">路由监视</span>
     <span class="watch-state" id="watch-label" role="status">等待今日记录</span>
     <button id="agent-select" class="agent-select" type="button" role="combobox" aria-label="按 Agent 筛选路由" aria-haspopup="listbox" aria-expanded="false" aria-controls="agent-options"><span class="agent-caption">Agent</span><span class="agent-icon" aria-hidden="true">∗</span><span class="agent-value">全部</span><span class="agent-arrow" aria-hidden="true">⌄</span></button>
     <label class="scope-label" for="session-select">查看</label>
@@ -85,9 +85,9 @@
       </div>
     </section>
   </div>
-  <section class="route-notes" aria-label="最新路由说明" aria-live="polite" aria-atomic="true">
-    <div class="note-row"><time id="line1-time">--:--:--</time><span class="note-kind" id="line1-kind">等待</span><p id="line1-text">等待 Magpie 路由写入…</p></div>
-    <div class="note-row"><time id="line2-time">--:--:--</time><span class="note-kind" id="line2-kind">来源</span><p id="line2-text">只读 usage.jsonl</p></div>
+  <section class="route-notes" aria-label="最新请求日志" aria-live="polite" aria-atomic="true">
+    <div class="note-row" hidden><time id="line1-time"></time><span class="note-kind" id="line1-kind"></span><p id="line1-text"></p></div>
+    <div class="note-row" hidden><time id="line2-time"></time><span class="note-kind" id="line2-kind"></span><p id="line2-text"></p></div>
   </section>
 </main>
 <div id="agent-options" class="agent-options" role="listbox" aria-label="Agent 来源" hidden></div>

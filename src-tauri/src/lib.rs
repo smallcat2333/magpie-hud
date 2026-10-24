@@ -63,6 +63,7 @@ struct Runtime {
     history_cache: std::collections::HashMap<chrono::NaiveDate, CachedDayStats>,
     /// 合并窗口保存请求。事件回调不在持锁时等待写盘线程。
     window_save: Arc<WindowSave>,
+    details_save: Arc<WindowSave>,
 }
 
 impl Runtime {
@@ -75,6 +76,7 @@ impl Runtime {
         let ledger = UsageLedger::new(Local::now().date_naive());
         let snapshot = ledger.snapshot(&config.magpie_host, "waiting", config_error.clone());
         let saved_window = config.window.filter(|placement| stable_window(placement));
+        let saved_details = config.details_window.filter(|placement| stable_window(placement));
         let mut runtime = Self {
             config,
             config_error,
@@ -86,6 +88,7 @@ impl Runtime {
             snapshot,
             history_cache: std::collections::HashMap::new(),
             window_save: Arc::new(WindowSave::new(saved_window)),
+            details_save: Arc::new(WindowSave::new(saved_details)),
         };
         runtime.refresh(None);
         runtime
@@ -160,11 +163,15 @@ struct StartupState {
     pinned: bool,
 }
 
+/// 窗口创建尚未完成时，后续双击等待同一轮创建，避免并发注册相同标签。
+struct DetailsWindowLock(tauri::async_runtime::Mutex<()>);
+
 /// 运行独立桌面应用；不修改 Magpie，不开启 HTTP 接口。
 pub fn run() {
     tauri::Builder::default()
         .manage(Arc::new(Mutex::new(Runtime::new())))
         .manage(Mutex::new(details::DetailContext::default()))
+        .manage(DetailsWindowLock(tauri::async_runtime::Mutex::new(())))
         .setup(|app| {
             setup_window(app.handle())?;
             setup_tray(app.handle())?;
@@ -231,10 +238,11 @@ fn setup_window(app: &AppHandle) -> tauri::Result<()> {
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = tauri::menu::MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
     let hide = tauri::menu::MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
-    let reset = tauri::menu::MenuItem::with_id(app, "reset", "初始化位置", true, None::<&str>)?;
+    let reset = tauri::menu::MenuItem::with_id(app, "reset", "重置 HUD 浮窗位置", true, None::<&str>)?;
+    let reset_details = tauri::menu::MenuItem::with_id(app, "reset-details", "重置用量详情位置", true, None::<&str>)?;
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
     let exit = tauri::menu::MenuItem::with_id(app, "exit", "退出", true, None::<&str>)?;
-    let menu = tauri::menu::Menu::with_items(app, &[&show, &hide, &reset, &separator, &exit])?;
+    let menu = tauri::menu::Menu::with_items(app, &[&show, &hide, &reset, &reset_details, &separator, &exit])?;
     let tray = tauri::tray::TrayIconBuilder::with_id("main")
         .tooltip("Magpie HUD")
         .menu(&menu)
@@ -247,7 +255,13 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                     let _ = app.emit("config-error", error);
                 }
             }
+            "reset-details" => {
+                if let Err(error) = reset_details_position(&app) {
+                    let _ = app.emit("config-error", error);
+                }
+            }
             "exit" => {
+                let _ = remember_details(&app);
                 let _ = remember_window(app);
                 app.exit(0);
             }
@@ -479,18 +493,42 @@ async fn open_usage_details(app: AppHandle, context: details::DetailContext) -> 
     if !["tokens", "speed", "cost", "cache", "calls", "average"].contains(&context.metric.as_str()) {
         return Err("未知统计指标".into());
     }
+    let gate = app.state::<DetailsWindowLock>();
+    let _opening = gate.0.lock().await;
     *app.state::<Mutex<details::DetailContext>>().lock().map_err(|_| "详情状态锁损坏")? = context.clone();
     if let Some(window) = app.get_webview_window("usage-details") {
         window.emit("usage-details-context", &context).map_err(|e| e.to_string())?;
-        window.show().map_err(|e| e.to_string())?;
         window.unminimize().map_err(|e| e.to_string())?;
+        if !window.is_maximized().unwrap_or(false) { constrain_current(&window).map_err(|e|e.to_string())?; }
+        window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
     } else {
         let window = tauri::WebviewWindowBuilder::new(&app, "usage-details", tauri::WebviewUrl::App("details.html".into()))
             .title("Magpie HUD · 用量详情").inner_size(960.0, 720.0)
-            .min_inner_size(480.0, 480.0).resizable(true).decorations(false).transparent(true).center()
+            .min_inner_size(480.0, 480.0).resizable(true).decorations(false).shadow(false).transparent(true).visible(false).center()
             .build().map_err(|e| e.to_string())?;
+        let saved = app.state::<Arc<Mutex<Runtime>>>().lock().map_err(|_|"状态锁损坏")?.config.details_window;
+        if let Some(saved) = saved.filter(stable_window) {
+            window.set_size(LogicalSize::new(saved.width.max(480.0), saved.height.max(480.0))).map_err(|e|e.to_string())?;
+            window.set_position(LogicalPosition::new(saved.x,saved.y)).map_err(|e|e.to_string())?;
+        }
+        constrain_current(&window).map_err(|e|e.to_string())?;
         backdrop::apply(&window).map_err(|e| e.to_string())?;
+        window.show().map_err(|e|e.to_string())?;
+        let _ = remember_details(&app);
+        let handle=app.clone();
+        window.on_window_event(move |event| match event {
+            tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
+                if let Some(window)=handle.get_webview_window("usage-details") {
+                    if let Some(rect)=stable_outer_placement(&window) {
+                        handle.state::<Arc<Mutex<Runtime>>>().lock().expect("状态锁损坏").details_save.remember(rect);
+                    }
+                }
+                schedule_details_save(&handle);
+            }
+            tauri::WindowEvent::CloseRequested{..} | tauri::WindowEvent::Focused(false) => {let _=remember_details(&handle);}
+            _=>{}
+        });
     }
     Ok(())
 }
@@ -732,6 +770,7 @@ fn set_pinned(app: AppHandle, pinned: bool) -> Result<bool, String> {
 fn reset_window_position(app: AppHandle) -> Result<(), String> {
     let window = app.get_webview_window("main").ok_or("窗口不存在")?;
     window.unminimize().map_err(|error| error.to_string())?;
+    window.unmaximize().map_err(|error| error.to_string())?;
     window.show().map_err(|error| error.to_string())?;
     let scale = window.scale_factor().map_err(|error| error.to_string())?;
     let width = (1120.0 * scale).round().max(1.0) as u32;
@@ -749,6 +788,66 @@ fn reset_window_position(app: AppHandle) -> Result<(), String> {
     window.set_focus().map_err(|error| error.to_string())
 }
 
+/// 详情位置独立保存；关闭后的重置清除保存值，下次打开居中。
+fn reset_details_position(app: &AppHandle) -> Result<(),String> {
+    if let Some(window)=app.get_webview_window("usage-details") {
+        window.unminimize().map_err(|e|e.to_string())?;
+        window.unmaximize().map_err(|e|e.to_string())?;
+        window.set_size(LogicalSize::new(960.0,720.0)).map_err(|e|e.to_string())?;
+        window.center().map_err(|e|e.to_string())?;
+        constrain_current(&window).map_err(|e|e.to_string())?;
+        window.show().map_err(|e|e.to_string())?;
+        remember_details(app)?;
+        window.set_focus().map_err(|e|e.to_string())
+    } else {
+        let state=app.state::<Arc<Mutex<Runtime>>>();
+        let mut runtime=state.lock().map_err(|_|"状态锁损坏")?;
+        if let Some(error)=&runtime.config_error {return Err(error.clone());}
+        let mut config=runtime.config.clone();config.details_window=None;
+        save_config(&config::config_path(),&config)?;
+        runtime.config=config;
+        *runtime.details_save.normal.lock().map_err(|_|"详情位置锁损坏")?=None;
+        Ok(())
+    }
+}
+
+fn remember_details(app: &AppHandle) -> Result<(),String> {
+    if let Some(window)=app.get_webview_window("usage-details") {
+        if let Some(rect)=stable_outer_placement(&window) {
+            app.state::<Arc<Mutex<Runtime>>>().lock().map_err(|_|"状态锁损坏")?.details_save.remember(rect);
+        }
+    }
+    persist_details(app)
+}
+
+fn persist_details(app: &AppHandle) -> Result<(),String> {
+    let state=app.state::<Arc<Mutex<Runtime>>>();
+    let mut runtime=state.lock().map_err(|_|"状态锁损坏")?;
+    if let Some(error)=&runtime.config_error {return Err(error.clone());}
+    let placement=runtime.details_save.cached();
+    if runtime.config.details_window==placement {return Ok(());}
+    let mut config=runtime.config.clone();config.details_window=placement;
+    save_config(&config::config_path(),&config)?;runtime.config=config;Ok(())
+}
+
+fn schedule_details_save(app: &AppHandle) {
+    let save=app.state::<Arc<Mutex<Runtime>>>().lock().expect("状态锁损坏").details_save.clone();
+    save.dirty.store(true,Ordering::Release);
+    if save.worker.swap(true,Ordering::AcqRel) {return;}
+    let app=app.clone();
+    std::thread::spawn(move || {
+        loop {
+            save.dirty.store(false,Ordering::Release);
+            std::thread::sleep(Duration::from_millis(250));
+            if save.dirty.load(Ordering::Acquire) {continue;}
+            if let Err(error)=persist_details(&app) {let _=app.emit("config-error",error);}
+            save.worker.store(false,Ordering::Release);
+            if save.dirty.load(Ordering::Acquire) {schedule_details_save(&app);}
+            break;
+        }
+    });
+}
+
 /// 供界面隐藏按钮使用：先记住正常矩形，再隐藏到托盘。
 #[tauri::command]
 fn hide_window(app: AppHandle) -> Result<(), String> {
@@ -759,6 +858,7 @@ fn hide_window(app: AppHandle) -> Result<(), String> {
 /// 标题栏关闭按钮保存位置后直接退出，不弹确认。
 #[tauri::command]
 fn close_window(app: AppHandle) {
+    let _ = remember_details(&app);
     let _ = remember_window(&app);
     app.exit(0);
 }
@@ -831,6 +931,14 @@ fn remember_window(app: &AppHandle) -> Result<(), String> {
 
 /// 拒绝最小化哨兵、零尺寸和非有限坐标，只接受可再次恢复的正常矩形。
 fn stable_outer_placement(window: &WebviewWindow) -> Option<WindowPlacement> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, IsZoomed};
+        let hwnd = HWND(window.hwnd().ok()?.0);
+        // 原生移动/缩放事件可能早于 Tauri 的最大化状态更新，不能缓存过渡矩形。
+        if unsafe { IsIconic(hwnd).as_bool() || IsZoomed(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() } { return None; }
+    }
     if window.is_minimized().ok()? || window.is_maximized().ok()? || !window.is_visible().unwrap_or(false) { return None; }
     let position = window.outer_position().ok()?;
     let size = window.outer_size().ok()?;
@@ -878,9 +986,10 @@ fn constrain_current(window: &WebviewWindow) -> tauri::Result<()> {
     let next = constrain(current, work);
     // 工作区不足时降低最小尺寸，正常桌面仍保留可操作的缩放下限。
     let scale = window.scale_factor()?;
+    let (min_width,min_height)=if window.label()=="usage-details" {(480.0,480.0)} else {(360.0,280.0)};
     window.set_min_size(Some(PhysicalSize::new(
-        ((360.0 * scale) as u32).min(work.width),
-        ((280.0 * scale) as u32).min(work.height),
+        ((min_width * scale) as u32).min(work.width),
+        ((min_height * scale) as u32).min(work.height),
     )))?;
     window.set_size(PhysicalSize::new(next.width, next.height))?;
     window.set_position(PhysicalPosition::new(next.x, next.y))

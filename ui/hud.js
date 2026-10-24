@@ -65,6 +65,7 @@
   function modelIcon(model) {
     const name = model.toLowerCase();
     const families = [
+      ['feishu', /feishu|lark|飞书/],
       ['xiaomimimo', /mimo|xiaomi/],
       ['siliconcloud-color', /silicon/],
       ['modelscope-color', /modelscope/],
@@ -163,7 +164,7 @@
     const icon = document.createElement('span');
     icon.className = 'model-icon';
     const selecting = ['running', 'waiting'].includes(card.state) && card.account === '正在选择账号';
-    const family = modelIcon(card.model);
+    const family = modelIcon(card.model) || (/feishu|lark|飞书/i.test(card.provider || '') ? 'feishu' : null);
     if (family) {
       const image = document.createElement('img');
       image.src = `icons/${family}.svg`;
@@ -303,7 +304,7 @@
     button.addEventListener('click', () => {
       selectedCard = card.id;
       routeList.querySelectorAll('.route-card,.subagent-row').forEach(element => element.classList.toggle('selected', element === button));
-      renderNotes([card.note, session.notes[1]]);
+      renderNotes([card.note], [session]);
     });
     return button;
   }
@@ -511,13 +512,27 @@
     };
   }
 
-  /** 下方两个固定槽同步更新，不追加历史行。 */
-  function renderNotes(notes) {
-    notes.forEach((note, index) => {
-      text(`line${index + 1}-time`, note.time);
-      text(`line${index + 1}-kind`, note.kind);
-      text(`line${index + 1}-text`, note.text);
-    });
+  /** 两行只展示实际请求记录，口径说明保留在卡片悬停提示中。 */
+  function renderNotes(notes, sessions = []) {
+    const kinds = new Set(['进行中', '完成', '恢复', '取消', '失败', '状态']);
+    const records = sessions.flatMap(session => [
+      ...session.routes, ...(session.subagents || []), ...(session.completedSubagents || []),
+    ]).sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
+    const seen = new Set();
+    const actual = [...notes, ...records.map(card => card.note)].filter(note => {
+      if (!note?.text || !kinds.has(note.kind)) return false;
+      const key = JSON.stringify([note.time, note.kind, note.text]);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 2);
+    for (let index = 0; index < 2; index++) {
+      const note = actual[index];
+      byId(`line${index + 1}-text`).closest('.note-row').hidden = !note;
+      text(`line${index + 1}-time`, note?.time || '');
+      text(`line${index + 1}-kind`, note?.kind || '');
+      text(`line${index + 1}-text`, note?.text || '');
+    }
   }
 
   /** 六项数值和可聚焦区域共用完整说明，避免数字节点自己的 title 遮住详情。 */
@@ -1180,8 +1195,8 @@
     inbound.classList.toggle('flowing', hasRequests);
     inbound.style.opacity = sessions.length ? '1' : '0';
     const picked = sessions.flatMap(item => [...item.routes, ...subagentsForView(item, Boolean(session))]).find(card => card.id === selectedCard);
-    if (picked) renderNotes([picked.note, sessions.find(item => item.id === picked.sessionId).notes[1]]);
-    else { selectedCard = null; renderNotes(session ? session.notes : selectedAgent !== '*' && sessions.length ? sessions[0].notes : snapshot.notes); }
+    if (picked) renderNotes([picked.note], sessions.filter(item => item.id === picked.sessionId));
+    else { selectedCard = null; renderNotes(session ? session.notes : selectedAgent !== '*' && sessions.length ? sessions[0].notes : snapshot.notes, sessions); }
     renderedIds = currentIds;
     updateCardTimes();
     const moving = window.hudMotion.layout(before, routeList.querySelectorAll('.route-card'), node => node.dataset.motionKey);

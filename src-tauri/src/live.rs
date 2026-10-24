@@ -88,6 +88,9 @@ pub struct Candidate {
     /// 该候选实际经过的子组 id（通常是直接子组，不含父组）。
     #[serde(default)]
     pub via: Vec<String>,
+    /// 组成员固定强度；与 Try.fixed 对应，不是拟合后的实际 effort。
+    #[serde(default)]
+    pub fixed: String,
 }
 
 /// 当前尝试用于显示真实模型、强度以及是否已结束。
@@ -98,6 +101,8 @@ pub struct Attempt {
     pub model: String,
     #[serde(default)]
     pub effort: String,
+    #[serde(default)]
+    pub fixed: String,
     /// 该尝试被最终选中；用于已结束 trace 在没有 active 时定位实际路径。
     #[serde(default)]
     pub picked: bool,
@@ -505,11 +510,12 @@ fn desktop_auxiliary(route: &LiveRoute) -> bool {
 
 /// 尝试 ID 是失败后休息的键，不是独立账号键。当前登录账号的键是 provider，
 /// 同组里该账号的每个模型都会复用它；其余账号是 `provider@user`，多密钥是 `provider#key`。
-/// 模型能唯一对应时用该行。否则仅当 provider 与账号完全一致时认领；任一不同就不猜。
+/// 模型和成员原始固定强度共同定位；否则仅当 provider 与账号完全一致时认领。
+/// 不用拟合后的 effort 反推 fixed，任一身份不同就不猜。
 fn selected_candidate<'a>(route: &'a LiveRoute, attempt: &Attempt) -> Option<&'a Candidate> {
     if attempt.id.is_empty() { return None; }
     let candidates: Vec<_> = route.order.as_deref().unwrap_or_default().iter()
-        .filter(|candidate| candidate.id == attempt.id).collect();
+        .filter(|candidate| candidate.id == attempt.id && candidate.fixed == attempt.fixed).collect();
     let exact: Vec<_> = candidates.iter().copied()
         .filter(|candidate| !attempt.model.is_empty() && candidate.model == attempt.model).collect();
     let pool: Vec<_> = if exact.is_empty() {
@@ -543,7 +549,7 @@ fn route_chain(route: &LiveRoute, attempt: Option<&Attempt>, candidate: Option<&
     let Some(attempt) = attempt.filter(|attempt| !attempt.id.is_empty()) else { return chain; };
     let Some(candidate) = candidate else { return chain; };
     let mut paths = route.order.as_deref().unwrap_or_default().iter()
-        .filter(|row| row.id == attempt.id && row.model == candidate.model
+        .filter(|row| row.id == attempt.id && row.model == candidate.model && row.fixed == attempt.fixed
             && row.provider == candidate.provider && row.who == candidate.who)
         .map(|row| {
             let mut path = Vec::new();
@@ -945,7 +951,7 @@ mod tests {
                 RouteSubgroup { id: "sub-a".into(), name: "干活".into(), ..Default::default() },
             ], ..Default::default() }),
             order: Some(vec![Candidate { id: "seat".into(), provider: "codex".into(),
-                model: "gpt-test".into(), who: "one@example.com".into(), via: vec!["sub-a".into()] }]),
+                model: "gpt-test".into(), who: "one@example.com".into(), via: vec!["sub-a".into()], ..Default::default() }]),
             tries: Some(vec![Attempt { id: "seat".into(), model: "gpt-test".into(), picked: true, done: true, ..Default::default() }]),
             ..Default::default() });
         let mut view = ledger.snapshot("h", "ready", None);
@@ -1716,8 +1722,8 @@ mod tests {
                     RouteSubgroup { id: "sub-b".into(), reference: "ref-b".into(), name: "deepseek".into() },
                 ] }),
             order: Some(vec![
-                Candidate { id: "seat".into(), provider: "p".into(), model: "m".into(), who: "a@example.com".into(), via: vec!["ref-a".into()] },
-                Candidate { id: "other".into(), provider: "p".into(), model: "m".into(), who: "b@example.com".into(), via: vec!["sub-b".into()] },
+                Candidate { id: "seat".into(), provider: "p".into(), model: "m".into(), who: "a@example.com".into(), via: vec!["ref-a".into()], ..Default::default() },
+                Candidate { id: "other".into(), provider: "p".into(), model: "m".into(), who: "b@example.com".into(), via: vec!["sub-b".into()], ..Default::default() },
             ]),
             ..Default::default()
         };
@@ -1792,7 +1798,7 @@ mod tests {
     #[test]
     fn nested_route_chain_preserves_order_and_common_prefix() {
         let candidate = Candidate { id: "seat".into(), provider: "p".into(), model: "m".into(),
-            who: "fixture@example.com".into(), via: vec!["worker".into(), "group/gpt".into()] };
+            who: "fixture@example.com".into(), via: vec!["worker".into(), "group/gpt".into()], ..Default::default() };
         let attempt = Attempt { id: "seat".into(), model: "m".into(), picked: true, done: true, ..Default::default() };
         let mut route = LiveRoute {
             group: Some(RouteGroup { name: "自动".into(), subs: vec![
@@ -1810,6 +1816,29 @@ mod tests {
         assert_eq!(trace_chain(&route), vec!["自动"]);
         route.tries = None;
         assert_eq!(trace_chain(&route), vec!["自动"]);
+    }
+
+    /// 同账号同模型跨组出现时按原始固定强度区分，不用拟合后的 High 猜 Max。
+    #[test]
+    fn route_chain_distinguishes_fixed_members_of_the_same_model() {
+        let mut route: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id":1,
+            "group":{"name":"自动","subs":[{"id":"worker","name":"干活"},{"id":"nano","name":"高速"}]},
+            "order":[
+                {"id":"zcode","provider":"zcode","model":"GLM-5.3-Flash","who":"fixture","via":["worker"],"fixed":"max"},
+                {"id":"zcode","provider":"zcode","model":"GLM-5.3-Flash","who":"fixture","via":["nano"]}
+            ],
+            "tries":[{"id":"zcode","model":"GLM-5.3-Flash","effort":"high","picked":true,"done":true}]
+        })).unwrap();
+        assert_eq!(trace_chain(&route), vec!["自动", "高速"]);
+        route.tries.as_mut().unwrap()[0].fixed = "max".into();
+        assert_eq!(trace_chain(&route), vec!["自动", "干活"]);
+        route.tries.as_mut().unwrap()[0].fixed = "xhigh".into();
+        assert_eq!(trace_chain(&route), vec!["自动"], "没有匹配成员时不借用另一条路径");
+        route.tries.as_mut().unwrap()[0].fixed.clear();
+        let duplicate = Candidate { via: Vec::new(), ..route.order.as_ref().unwrap()[1].clone() };
+        route.order.as_mut().unwrap().push(duplicate);
+        assert_eq!(trace_chain(&route), vec!["自动"], "固定强度相同而路径仍歧义时保留共同前缀");
     }
 
     /// 活跃卡 updatedAt 取 start + 已用毫秒，按 UTC 毫秒精度输出。

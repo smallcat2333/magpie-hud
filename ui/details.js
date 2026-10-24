@@ -6,9 +6,9 @@
   const units = { tokens: 'tok', speed: 'tok/s', cost: '$', cache: '%', calls: '次', average: '$/次' };
   const filterNames = { sourceKey: 'Agent / 来源', model: '模型', provider: '供应商', accountKey: '账号', effort: '强度' };
   const filters = Object.fromEntries(Object.keys(filterNames).map(k => [k, new Set()]));
-  let data = null, metric = 'tokens', view = 'trend', mode = 'groups', session = '', cycle = null;
+  let data = null, metric = 'tokens', view = 'trend', mode = 'groups', session = '', cycle = null, cycleUsage = null;
   let page = 0, request = 0, drill = null, sort = 'value', descending = true, loading = false;
-  let cycleRows = [], displayRows = [], groupRows = [];
+  let cycleRows = [], displayRows = [], groupRows = [], viewCosts = [];
   let labels = new Map();
   const pageSize = 30;
   const ns = 'http://www.w3.org/2000/svg';
@@ -124,52 +124,115 @@
   }
 
   function makeBins(rows) {
-    if (view !== 'trend') return group(rows, r => r[$('group').value], data.costs)
+    if (view !== 'trend') return group(rows, r => r[$('group').value], viewCosts)
       .map(g => ({...g, label:rowLabel($('group').value,g.key)})).sort((a,b) => (metricValue(b.stats) ?? -1) - (metricValue(a.stats) ?? -1));
     const hourly = $('grain').value === 'hour';
     const key = r => hourly ? `${r.date} ${String(r.hour).padStart(2,'0')}:00` : r.date;
-    const bins = new Map(group(rows,key,data.costs).map(g => [g.key,g]));
+    const bins = new Map(group(rows,key,viewCosts).map(g => [g.key,g]));
     const result = [];
     for(let date=data.start; date<=data.end; date=offset(date,1)) {
       for(let h=0; h<(hourly?24:1); h++) {
         const k = hourly ? `${date} ${String(h).padStart(2,'0')}:00` : date;
-        const b = bins.get(k) || {key:k,rows:[],stats:aggregate([],data.costs)};
+        const b = bins.get(k) || {key:k,rows:[],stats:aggregate([],viewCosts)};
         result.push({...b,label:hourly && data.start===data.end ? `${String(h).padStart(2,'0')}:00` : k.slice(5)});
       }
     }
     return result;
   }
 
+  function cycleKey(c) { return c ? JSON.stringify([c.provider,c.account,c.window,c.start,c.end]) : ''; }
+
+  /** 扩展查询未就绪时，统计单元格显示加载或失败状态。 */
+  function loadingCell(kind, title) {
+    const td=node('td',kind==='error'?'读取失败':'加载中','num cycle-usage-loading');
+    if(kind!=='error'){td.setAttribute('aria-busy','true');const spinner=node('span',undefined,'loading-spinner');spinner.setAttribute('aria-hidden','true');td.prepend(spinner);}
+    if(title)td.title=title;
+    return td;
+  }
+
+  // 实际使用=周期开始至今的累计金额，只认周期归属，不受日期范围与筛选影响；范围不足时扩展查询一次。
+  function cycleUsageStats(c) {
+    if (cycleUsage?.status!=='ready') return null;
+    return aggregate(filter(cycleUsage.data.rows,{},'',c), cycleUsage.data.costs);
+  }
+  function ensureCycleUsage() {
+    if(!cycleRows.length)return;
+    const start=localDate(new Date(Math.min(...cycleRows.map(c=>c.start)))), end=localDate(), key=`${start}|${end}`;
+    if(cycleUsage?.key===key)return;
+    if(start>=data.start && end<=data.end) { cycleUsage={key,status:'ready',data}; queueMicrotask(render); return; }
+    cycleUsage={key,status:'loading'};
+    const sourceData=data;
+    const query=window.__TAURI__
+      ? window.__TAURI__.core.invoke('query_usage_details',{start,end})
+      : (window.hudDetailsPreviewQuery?window.hudDetailsPreviewQuery(start,end):Promise.reject(new Error('无数据源')));
+    query.then(result=>{ if(cycleUsage?.key!==key || data!==sourceData)return; cycleUsage={key,status:'ready',data:result}; render(); })
+      .catch(error=>{ if(cycleUsage?.key!==key || data!==sourceData)return; cycleUsage={key,status:'error',error:String(error)}; render(); });
+  }
+
   function renderCycles(baseRows) {
-    const selectedWindow = $('cycle-window').value;
+    const control = $('cycle-window'), selectedWindow = control.value;
     const keys = [...new Set(data.cycles.filter(c =>
       (!filters.provider.size || filters.provider.has(c.provider)) &&
       (!filters.accountKey.size || filters.accountKey.has(JSON.stringify([c.provider,c.account]))))
       .map(c=>JSON.stringify([c.provider,c.account,c.window])))];
-    $('cycle-window').replaceChildren();
-    keys.forEach(k => { const o=node('option',JSON.parse(k).map(x=>x || '未记录').join(' · ')); o.value=k; $('cycle-window').append(o); });
-    if(keys.includes(selectedWindow)) $('cycle-window').value=selectedWindow;
-    const selected=$('cycle-window').value;
-    cycleRows=data.cycles.filter(c => JSON.stringify([c.provider,c.account,c.window])===selected && c.end>dayStart(data.start) && c.start<dayStart(offset(data.end,1)));
-    if(cycle && !cycleRows.some(c=>c===cycle)) cycle=null;
-    if(!cycle && cycleRows.length) cycle=cycleRows[0];
-    const cols=['周期（本地时间）','Token','调用','最近额度读数','状态'];
+    // 不在每次指标/周期切换时替换原生下拉的选项，保留弹层和焦点状态。
+    if(JSON.stringify([...control.options].map(o=>o.value))!==JSON.stringify(keys)) {
+      control.replaceChildren();
+      keys.forEach(k => { const o=node('option',JSON.parse(k).map(x=>x || '未记录').join(' · ')); o.value=k; control.append(o); });
+      if(keys.includes(selectedWindow)) control.value=selectedWindow;
+    }
+    const selected=control.value, previousCycle=cycleKey(cycle);
+    // 周期列表不受所选日期范围限制，直接回溯该账号与窗口的全部已记录周期。
+    cycleRows=data.cycles.filter(c => JSON.stringify([c.provider,c.account,c.window])===selected);
+    cycle=cycleRows.find(c=>cycleKey(c)===previousCycle)||cycleRows[0]||null;
+    const monetary=metric==='cost'||metric==='average';
+    const extended=cycleUsage?.status==='ready'?cycleUsage.data:null;
+    const rangeCoversNow=Date.now()<dayStart(offset(data.end,1));
+    const cols=['周期（本地时间）',`${metric==='cost'?'100%用量预估':metricNames[metric]}（${units[metric]}）`,'实际使用估值（$）','调用',...(monetary?['费用覆盖']:[]),'最近额度读数','状态'];
     const table=node('table'), head=node('thead'), hr=node('tr'), body=node('tbody'); cols.forEach(c=>hr.append(node('th',c))); head.append(hr); table.append(head,body);
     cycleRows.forEach(c => {
-      const members=filter(baseRows,{},'',c), s=aggregate(members,data.costs), tr=node('tr');
+      // 扩展查询就绪即用完整周期数据；未就绪时仅当所选范围已覆盖该周期至今的请求才用当前数据。
+      const source=extended||((c.start>=dayStart(data.start)&&rangeCoversNow)?data:null);
+      const s=source?aggregate(filter(source.rows,filters,session,c),source.costs):null;
+      const tr=node('tr');
       tr.classList.toggle('selected',c===cycle);
-      const cell=node('td'), button=node('button',`${stamp(c.start)} — ${stamp(c.end)}`); button.type='button';
-      button.addEventListener('click',()=>{cycle=c;clearDrill();render();}); cell.append(button); tr.append(cell);
-      tr.append(node('td',number.format(s.tokens),'num'),node('td',String(s.calls),'num'));
+      const cell=node('td'), button=node('button',stamp(c.start)); button.type='button';
+      button.setAttribute('aria-pressed',String(c===cycle));
+      const select=()=>{cycle=c;clearDrill();render();};
+      button.addEventListener('click',select);
+      tr.addEventListener('click',e=>{if(!e.target.closest('button'))select();});
+      cell.append(button); tr.append(cell);
+      const used=c.remaining==null?null:Math.min(100,Math.max(0,100-c.remaining));
+      const projected=metric==='cost'&&s&&s.cost!=null&&used!==null&&used>=1?s.cost*100/used:null;
+      const value=node('td',s?`${valueText(metric==='cost'?projected:s[metric],metric)} ${units[metric]}`:'—','num');
+      if(s)value.title=metric==='cost'
+        ?(projected!=null
+          ?`100%用量费用预估 ${valueText(projected,'cost')} $ = 周期累计 ${valueText(s.cost,'cost')} $ ÷ 已用 ${used.toFixed(1)}%；未定价请求不计入累计；实际累计见「实际使用估值」列`
+          :`100%用量费用预估暂无法折算（${used==null?'无额度读数':'已用不足 1% 或暂无已定价费用'}）；周期累计 ${valueText(s.cost,'cost')} $ 见「实际使用估值」列`)
+        :`${metricNames[metric]} ${valueText(s[metric],metric)} ${units[metric]}${monetary?`；费用覆盖 ${s.priced}/${s.calls} 次；未覆盖部分不计入已知金额`:''}`;
+      else value.title=cycleUsage?.status==='error'?`周期统计读取失败：${cycleUsage.error}`:'周期统计加载中';
+      tr.append(value);
+      const usage=cycleUsageStats(c), actual=node('td',usage?`${valueText(usage.cost,'cost')} $`:(cycleUsage?.status==='error'?'读取失败':'加载中'),'num');
+      if(!usage && cycleUsage?.status!=='error') {
+        actual.classList.add('cycle-usage-loading');
+        actual.setAttribute('aria-busy','true');
+        const spinner=node('span',undefined,'loading-spinner');
+        spinner.setAttribute('aria-hidden','true');
+        actual.prepend(spinner);
+      }
+      actual.title=usage?`周期开始至今累计 ${valueText(usage.cost,'cost')} $ · ${number.format(usage.tokens)} Token · ${usage.calls} 次 · 费用覆盖 ${usage.priced}/${usage.calls}；按模型定价折算，非实际扣款；不受日期范围与筛选影响${cycleUsage.data.warnings?.length?`；${cycleUsage.data.warnings.join('；')}`:''}`
+        :(cycleUsage?.status==='error'?`实际使用读取失败：${cycleUsage.error}`:'实际使用加载中');
+      tr.append(actual,s?node('td',String(s.calls),'num'):loadingCell(cycleUsage?.status==='error'?'error':'loading'));
+      if(monetary)tr.append(s?node('td',`${s.priced}/${s.calls} 次`,'num'):loadingCell(cycleUsage?.status==='error'?'error':'loading'));
       const read=node('td',c.remaining===null?'—':`已用 ${(100-c.remaining).toFixed(1)}%`,'num'); read.title=`观测于 ${stamp(c.observedAt)}；不是期末最终读数`; tr.append(read);
-      const clipped=c.start<dayStart(data.start)||c.end>Math.min(Date.now(),dayStart(offset(data.end,1)));
-      tr.append(node('td',`${c.end>Date.now()?'进行中':'已结束'}${clipped?' · 范围内部分':''}`)); body.append(tr);
+      tr.append(node('td',`${c.end>Date.now()?'进行中':'已结束'}`)); body.append(tr);
     });
-    if(!cycleRows.length) { const td=node('td',keys.length?'所选日期没有有明确边界的周期':'没有可用的明确周期边界', 'empty'); td.colSpan=5; const tr=node('tr');tr.append(td);body.append(tr); }
+    if(!cycleRows.length) { const td=node('td',keys.length?'所选账号与窗口没有明确边界的周期':'没有可用的明确周期边界', 'empty'); td.colSpan=cols.length; const tr=node('tr');tr.append(td);body.append(tr); }
     $('cycle-list').replaceChildren(table);
-    $('cycle-message').textContent='仅显示已记录的周期；请求统计仅覆盖本地日志';
+    $('cycle-message').textContent='周期统计覆盖完整周期并遵循当前筛选；实际使用估值为周期开始至今的累计金额，只覆盖本地日志，不受日期范围与筛选影响';
     $('cycle-actions').hidden=!cycle;
     const i=cycleRows.indexOf(cycle); $('cycle-prev').disabled=i<0||i>=cycleRows.length-1; $('cycle-next').disabled=i<=0;
+    ensureCycleUsage();
   }
 
   function svgNode(tag, attrs={}, text) { const el=document.createElementNS(ns,tag);for(const [k,v] of Object.entries(attrs)) el.setAttribute(k,String(v));if(text!==undefined)el.textContent=text;return el; }
@@ -183,7 +246,7 @@
     const capacity=Math.max(8,Math.floor(w/12));
     if(view==='trend' && bins.length>capacity) {
       const span=Math.ceil(bins.length/capacity); plotted=[];
-      for(let i=0;i<bins.length;i+=span) {const part=bins.slice(i,i+span), rows=part.flatMap(b=>b.rows);plotted.push({key:part[0].key,label:`${part[0].label} — ${part.at(-1).label}`,rows,stats:aggregate(rows,data.costs)});}
+      for(let i=0;i<bins.length;i+=span) {const part=bins.slice(i,i+span), rows=part.flatMap(b=>b.rows);plotted.push({key:part[0].key,label:`${part[0].label} — ${part.at(-1).label}`,rows,stats:aggregate(rows,viewCosts)});}
     } else if(view!=='trend') plotted=bins.slice(0,16);
     const values=plotted.map(b=>metricValue(b.stats));
     const max=Math.max(0,...values.filter(v=>Number.isFinite(v)));
@@ -219,9 +282,9 @@
     if (!data) return;
     const rows=drill?displayRows.filter(r=>drill.ids.has(r.id)):displayRows;
     const grouping=$('group').value;
-    const grouped=group(rows,r=>r[grouping],data.costs).map(g=>({...g,label:rowLabel(grouping,g.key)}));
+    const grouped=group(rows,r=>r[grouping],viewCosts).map(g=>({...g,label:rowLabel(grouping,g.key)}));
     const requestMode=mode==='requests';
-    const entries=requestMode?rows.map(r=>({label:stamp(r.timestamp),row:r,stats:aggregate([r],data.costs)})):mode==='chart'?makeBins(rows):grouped;
+    const entries=requestMode?rows.map(r=>({label:stamp(r.timestamp),row:r,stats:aggregate([r],viewCosts)})):mode==='chart'?makeBins(rows):grouped;
     entries.sort((a,b)=>{
       const av=sort==='label'?a.label:sort==='time'?a.row?.timestamp:sort==='value'?a.stats[metric]:a.stats[sort];
       const bv=sort==='label'?b.label:sort==='time'?b.row?.timestamp:sort==='value'?b.stats[metric]:b.stats[sort];
@@ -260,15 +323,17 @@
     if(!data)return;
     const base=filter(data.rows,filters,session);
     if(view==='cycles')renderCycles(base);
-    displayRows=filter(base,{},'',view==='cycles'?cycle:null);
-    if(view==='cycles' && !cycle) displayRows=[];
-    const stats=aggregate(displayRows,data.costs);
-    document.querySelectorAll('[data-metric]').forEach(b=>{const k=b.dataset.metric;const value=b.querySelector('.metric-value');const unavailable=view==='cycles'&&!cycle;value.textContent=unavailable?'—':valueText(stats[k],k,true);value.append(node('span',units[k],'metric-unit'));b.title=`${metricNames[k]} ${unavailable?'—':valueText(stats[k],k)} ${units[k]}`;if(k==='cost'||k==='average'){const partial=stats.priced<stats.calls;b.querySelector('.metric-label').textContent=metricNames[k]+(partial?' · 部分':'');b.title+=`；费用覆盖 ${stats.priced}/${stats.calls} 次`;}});
+    // 周期视图使用扩展查询的完整周期数据；未就绪时先用所选范围内的部分数据，就绪后自动补全。
+    const cycleSource=view==='cycles'&&cycle?(cycleUsage?.status==='ready'?cycleUsage.data:data):null;
+    displayRows=view==='cycles'?(cycle?filter(cycleSource.rows,filters,session,cycle):[]):filter(base,{},{});
+    viewCosts=(cycleSource||data).costs;
+    const stats=aggregate(displayRows,viewCosts);
+    document.querySelectorAll('[data-metric]').forEach(b=>{const k=b.dataset.metric;const value=b.querySelector('.metric-value');const unavailable=view==='cycles'&&!cycle;value.textContent=unavailable?'—':valueText(stats[k],k,true);value.append(node('span',units[k],'metric-unit'));b.title=`${metricNames[k]} ${unavailable?'—':valueText(stats[k],k)} ${units[k]}`;if(k==='cost'||k==='average'){b.querySelector('.metric-label').textContent=metricNames[k];b.title+=`；费用覆盖 ${stats.priced}/${stats.calls} 次`;}});
     groupRows=makeBins(displayRows);
     $('chart-title').textContent=`${metricNames[metric]} · ${view==='trend'?'时间趋势':view==='cycles'?'周期内分组':'分组对比'}`;
     chart(groupRows);
-    const notes={tokens:`输入 ${number.format(stats.input)} + 输出 ${number.format(stats.output)} + 缓存读取 ${number.format(stats.cacheRead)} Token`,speed:`${stats.samples} 个有效成功样本 · 有效生成时间 ${(stats.generation/1000).toFixed(2)} 秒；不平均各请求速度`,cache:`缓存读取 /（输入 + 缓存读取），按 Token 加权`,calls:`成功 ${stats.success} · 失败 ${stats.failed} · 取消 ${stats.cancelled} · 未知 ${stats.unknown}`,cost:`费用覆盖 ${stats.priced}/${stats.calls} 次；按 Magpie 逐请求金额汇总，未覆盖部分不计入已知金额`,average:`按 ${stats.priced} 次已定价调用计算；缺少完整费用归属时显示未知`};
-    $('metric-note').textContent=notes[metric]+(cycle&&view==='cycles'?' · 仅统计日期范围与所选周期的交集':'');
+    const notes={tokens:`输入 ${number.format(stats.input)} + 输出 ${number.format(stats.output)} + 缓存读取 ${number.format(stats.cacheRead)} Token`,speed:`${stats.samples} 个有效成功样本 · 有效生成时间 ${(stats.generation/1000).toFixed(2)} 秒；不平均各请求速度`,cache:`缓存读取 /（输入 + 缓存读取），按 Token 加权`,calls:`成功 ${stats.success} · 失败 ${stats.failed} · 取消 ${stats.cancelled} · 未知 ${stats.unknown}`,cost:`费用覆盖 ${stats.priced}/${stats.calls} 次；按 Magpie 逐请求金额汇总，未覆盖部分不计入已知金额`,average:`已知费用 / ${stats.priced} 次已定价调用；未定价调用不参与均值`};
+    $('metric-note').textContent=notes[metric]+(cycle&&view==='cycles'?' · 统计所选完整周期':'');
     renderTable();
   }
 
@@ -287,7 +352,7 @@
         :await (window.hudDetailsPreviewQuery?window.hudDetailsPreviewQuery(start,end):Promise.reject(new Error('独立预览未注入数据，请从 HUD 打开详情')));
       if(id!==request)return;
       if(result.start!==start||result.end!==end)throw new Error('返回的统计日期与所选范围不一致');
-      data=result;labels=new Map();data.rows.forEach(r=>{r.accountKey=JSON.stringify([r.provider,r.account]);labels.set(r.sourceKey,sourceLabel(r));});
+      data=result;labels=new Map();data.rows.forEach(r=>{r.accountKey=JSON.stringify([r.provider,r.account]);labels.set(r.sourceKey,sourceLabel(r));});cycleUsage=null;
       if (Array.isArray(fullCycle)) cycle=data.cycles.find(c=>JSON.stringify([c.provider,c.account,c.window,c.start,c.end])===JSON.stringify(fullCycle))||null;
       $('load-status').hidden=true;$('warnings').textContent=data.warnings.join('；');
       $('updated').textContent=`更新于 ${new Date().toLocaleTimeString('zh-CN',{hour12:false})} · ${data.start} — ${data.end}`;
