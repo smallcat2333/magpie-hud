@@ -539,13 +539,13 @@ fn usage_details_context(app: AppHandle) -> details::DetailContext {
 }
 
 #[tauri::command]
-async fn query_usage_details(app: AppHandle, start: String, end: String) -> Result<details::DetailData, String> {
+async fn query_usage_details(app: AppHandle, start: String, end: String, filters: Option<details::DetailFilters>) -> Result<details::DetailData, String> {
     let (path, host) = {
         let state = app.state::<Arc<Mutex<Runtime>>>();
         let runtime = state.lock().map_err(|_| "状态锁损坏")?;
         (usage_path(&runtime.config), runtime.config.magpie_host.clone())
     };
-    tauri::async_runtime::spawn_blocking(move || details::query(&path, &host, &start, &end))
+    tauri::async_runtime::spawn_blocking(move || details::query(&path, &host, &start, &end, &filters.unwrap_or_default()))
         .await.map_err(|e| format!("详情查询任务失败：{e}"))?
 }
 

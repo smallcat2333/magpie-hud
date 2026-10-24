@@ -6,12 +6,12 @@
   <meta name="color-scheme" content="dark">
   <title>Magpie HUD V.0.0.29</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="hud.css?v=0.0.28-20261024-route-label-width">
+  <link rel="stylesheet" href="hud.css?v=0.0.29-20261024-quota-tooltip">
   <script src="motion.js?v=0.0.28-20261023-digit-roll" defer></script>
   <script src="hourly.js?v=0.0.28-20261022-endpoint-motion" defer></script>
   <link rel="stylesheet" href="dates.css?v=20261023-deeper-heat">
   <script src="dates.js?v=20261023-caller-stats" defer></script>
-  <script src="hud.js?v=0.0.28-20261024-feishu-icon" defer></script>
+  <script src="hud.js?v=0.0.29-20261024-quota-tooltip" defer></script>
 </head>
 <body>
 <main class="hud" id="hud" data-state="waiting" data-sources="compact" data-focus="true">
@@ -25,10 +25,6 @@
     <button id="pin" class="window-button" type="button" aria-label="置顶窗口" aria-pressed="true" title="置顶窗口"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3h6m-5 0v5l-3 3v1h10v-1l-3-3V3M10 12v5"/></svg></button>
     <button id="hide-window" class="window-button" type="button" aria-label="最小化到托盘" title="最小化到托盘"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10h10"/></svg></button>
     <button id="close-window" class="window-button" type="button" aria-label="关闭程序" title="关闭程序"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8"/></svg></button>
-    <div id="window-menu" class="window-menu" hidden>
-      <button type="button" data-window-action="reset">初始化位置</button>
-      <button type="button" data-window-action="hide">隐藏到托盘</button>
-    </div>
   </header>
   <div class="content">
     <aside class="sidebar" aria-label="统计与用量">
@@ -90,6 +86,7 @@
     <div class="note-row" hidden><time id="line2-time"></time><span class="note-kind" id="line2-kind"></span><p id="line2-text"></p></div>
   </section>
 </main>
+<div id="quota-tooltip" class="quota-tooltip" role="tooltip" hidden></div>
 <div id="agent-options" class="agent-options" role="listbox" aria-label="Agent 来源" hidden></div>
 <div id="stats-calendar" class="stats-calendar" role="dialog" aria-modal="false" aria-labelledby="calendar-title" hidden>
   <div class="calendar-heading">

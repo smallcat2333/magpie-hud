@@ -68,18 +68,47 @@ pub fn parse_range(start: &str, end: &str) -> Result<(NaiveDate, NaiveDate), Str
     Ok((a,b))
 }
 
-pub fn query(path: &Path, host: &str, start: &str, end: &str) -> Result<DetailData, String> {
+/// 与前端一致的筛选条件；空集合表示不限制。按筛选缩小逐请求费用的匹配范围。
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailFilters {
+    #[serde(default)] pub source_keys: Vec<String>,
+    #[serde(default)] pub models: Vec<String>,
+    #[serde(default)] pub providers: Vec<String>,
+    #[serde(default)] pub account_keys: Vec<String>,
+    #[serde(default)] pub efforts: Vec<String>,
+    #[serde(default)] pub session: String,
+}
+
+impl DetailFilters {
+    fn matches(&self, row: &usage::UsageDetailRow, account_key: &str) -> bool {
+        (self.source_keys.is_empty() || self.source_keys.iter().any(|k| *k == row.source_key))
+            && (self.models.is_empty() || self.models.iter().any(|m| *m == row.model))
+            && (self.providers.is_empty() || self.providers.iter().any(|p| *p == row.provider))
+            && (self.account_keys.is_empty() || self.account_keys.iter().any(|k| *k == account_key))
+            && (self.efforts.is_empty() || self.efforts.iter().any(|e| *e == row.effort))
+            && (self.session.is_empty() || self.session == row.session)
+    }
+}
+
+pub fn query(path: &Path, host: &str, start: &str, end: &str, filters: &DetailFilters) -> Result<DetailData, String> {
     let (a,b) = parse_range(start,end)?;
-    let rows = usage::scan_detail_rows(path,a,b)?;
+    let mut rows = usage::scan_detail_rows(path,a,b)?;
     if rows.len() > 200_000 { return Err("所选范围超过 20 万条请求，请缩小日期范围".into()); }
+    // 先按筛选缩小行集，费用匹配随之收窄；网关分页从最新往前，已筛选的近期请求可以提前结束扫描。
+    rows.retain(|row| {
+        let account_key = serde_json::to_string(&[&row.provider, &row.account]).unwrap_or_default();
+        filters.matches(row, &account_key)
+    });
     let mut data = DetailData { start:start.into(),end:end.into(),rows,costs:vec![],cycles:vec![],warnings:vec![] };
     let period = format!("{a}..{b}");
     if !data.rows.is_empty() {
         match live::gateway_url(host) {
             Ok(base) => {
+                let scope = pricing_scope(&data.rows);
+                let client = live::client(Duration::from_secs(5));
                 let (costs, warnings) = request_costs(&data.rows, &period, |offset| {
-                    let client = live::client(Duration::from_secs(5));
-                    live::read_json::<PricePage>(&client, &format!("{base}/v1/magpie/usage/requests?period={period}&via=through&limit=500&offset={offset}"))
+                    live::read_json::<PricePage>(&client, &format!("{base}/v1/magpie/usage/requests?period={period}&via=through&limit=500&offset={offset}{scope}"))
                 });
                 data.costs = costs;
                 data.warnings.extend(warnings);
@@ -95,6 +124,24 @@ pub fn query(path: &Path, host: &str, start: &str, end: &str) -> Result<DetailDa
         Err(e) => data.warnings.push(e),
     }
     Ok(data)
+}
+
+/// 仅当全部待匹配行共有同一非空字段时下推过滤；多账号仍读取并核对完整集合。
+fn pricing_scope(rows: &[usage::UsageDetailRow]) -> String {
+    let Some(first) = rows.first() else { return String::new(); };
+    let mut query = String::new();
+    for (name, value, common) in [
+        ("provider", first.provider.as_str(), rows.iter().all(|r| r.provider == first.provider)),
+        ("account", first.account.as_str(), rows.iter().all(|r| r.account == first.account)),
+    ] {
+        if value.is_empty() || !common { continue; }
+        query.push('&'); query.push_str(name); query.push('=');
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) { query.push(byte as char); }
+            else { query.push_str(&format!("%{byte:02X}")); }
+        }
+    }
+    query
 }
 
 /// 只反序列化统计/身份字段，不接收正文、凭据或错误原文。
@@ -251,6 +298,32 @@ fn parse_cycles(bytes: &[u8]) -> Result<(Vec<Cycle>,bool),String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn detail_filters_narrow_rows_before_cost_matching() {
+        let row=|model:&str,provider:&str,account:&str,effort:&str| usage::UsageDetailRow{
+            id:String::new(),timestamp:0,date:String::new(),hour:0,session:"s".into(),agent:String::new(),
+            caller_key_id:String::new(),caller_key_name:String::new(),source_key:r#"["Claude Code","key-a"]"#.into(),
+            provider:provider.into(),account:account.into(),model:model.into(),effort:effort.into(),
+            outcome:"success".into(),input:0,output:0,cache_read:0,tokens:0,generation_ms:None};
+        let account_key=serde_json::to_string(&["vendor","account"]).unwrap();
+        let key_for=|p:&str,a:&str| serde_json::to_string(&[p,a]).unwrap();
+        let decoded: DetailFilters = serde_json::from_value(serde_json::json!({
+            "accountKeys":[account_key.clone()],"sourceKeys":[r#"["Claude Code","key-a"]"#]
+        })).unwrap();
+        assert!(!decoded.matches(&row("model-a","vendor","other","high"),&key_for("vendor","other")));
+        assert_eq!(decoded.source_keys.len(),1);
+        let filters=DetailFilters{models:vec!["model-a".into()],account_keys:vec![account_key.clone()],..Default::default()};
+        assert!(filters.matches(&row("model-a","vendor","account","high"),&account_key));
+        assert!(!filters.matches(&row("model-b","vendor","account","high"),&account_key));
+        assert!(!filters.matches(&row("model-a","vendor","other","high"),&key_for("vendor","other")));
+        assert!(DetailFilters::default().matches(&row("x","y","z","w"),&account_key));
+        let first = row("model-a","vendor","账号+a&b@example.com","high");
+        assert_eq!(pricing_scope(&[first.clone()]), "&provider=vendor&account=%E8%B4%A6%E5%8F%B7%2Ba%26b%40example.com");
+        assert_eq!(pricing_scope(&[first.clone(), row("b","vendor","other","high")]), "&provider=vendor");
+        assert_eq!(pricing_scope(&[first, row("b","other","different","high")]), "");
+        assert_eq!(pricing_scope(&[]), "");
+    }
+
     #[test]
     fn validates_range_before_scanning() {
         assert!(parse_range("2026-1-01","2026-01-02").is_err());

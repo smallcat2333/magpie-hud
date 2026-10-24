@@ -6,7 +6,7 @@
   const units = { tokens: 'tok', speed: 'tok/s', cost: '$', cache: '%', calls: '次', average: '$/次' };
   const filterNames = { sourceKey: 'Agent / 来源', model: '模型', provider: '供应商', accountKey: '账号', effort: '强度' };
   const filters = Object.fromEntries(Object.keys(filterNames).map(k => [k, new Set()]));
-  let data = null, metric = 'tokens', view = 'trend', mode = 'groups', session = '', cycle = null, cycleUsage = null;
+  let data = null, metric = 'tokens', view = 'trend', mode = 'groups', session = '', cycle = null;
   let page = 0, request = 0, drill = null, sort = 'value', descending = true, loading = false;
   let cycleRows = [], displayRows = [], groupRows = [], viewCosts = [];
   let labels = new Map();
@@ -150,23 +150,48 @@
     return td;
   }
 
-  // 实际使用=周期开始至今的累计金额，只认周期归属，不受日期范围与筛选影响；范围不足时扩展查询一次。
-  function cycleUsageStats(c) {
-    if (cycleUsage?.status!=='ready') return null;
-    return aggregate(filter(cycleUsage.data.rows,{},'',c), cycleUsage.data.costs);
+  // 周期统计按当前筛选逐周期异步查询；相邻周期共用同一日期范围，完成后逐行填充。
+  const cycleUsageMap = new Map();
+  const cycleQueue = [];
+  let cycleActive = 0;
+
+  function filterPayload() {
+    return {
+      sourceKeys: [...filters.sourceKey], models: [...filters.model], providers: [...filters.provider],
+      accountKeys: [...filters.accountKey], efforts: [...filters.effort], session,
+    };
   }
-  function ensureCycleUsage() {
-    if(!cycleRows.length)return;
-    const start=localDate(new Date(Math.min(...cycleRows.map(c=>c.start)))), end=localDate(), key=`${start}|${end}`;
-    if(cycleUsage?.key===key)return;
-    if(start>=data.start && end<=data.end) { cycleUsage={key,status:'ready',data}; queueMicrotask(render); return; }
-    cycleUsage={key,status:'loading'};
-    const sourceData=data;
-    const query=window.__TAURI__
-      ? window.__TAURI__.core.invoke('query_usage_details',{start,end})
-      : (window.hudDetailsPreviewQuery?window.hudDetailsPreviewQuery(start,end):Promise.reject(new Error('无数据源')));
-    query.then(result=>{ if(cycleUsage?.key!==key || data!==sourceData)return; cycleUsage={key,status:'ready',data:result}; render(); })
-      .catch(error=>{ if(cycleUsage?.key!==key || data!==sourceData)return; cycleUsage={key,status:'error',error:String(error)}; render(); });
+
+  function cycleUsageEntry(c) {
+    // 所选范围已覆盖该周期至今的请求时直接用当前数据，不再发查询。
+    const coveredLocally = c.start>=dayStart(data.start)
+      && (Date.now()<dayStart(offset(data.end,1)) || c.end<=dayStart(offset(data.end,1)));
+    if (coveredLocally) return {status:'ready', data};
+    const end = c.end > Date.now() ? new Date() : new Date(c.end);
+    const start = localDate(new Date(c.start)), endDay = localDate(end);
+    const payload = {...filterPayload(),providers:[c.provider],accountKeys:[JSON.stringify([c.provider,c.account])]};
+    const key = `${start}|${endDay}|${JSON.stringify(payload)}`;
+    let entry = cycleUsageMap.get(key);
+    if (!entry) {
+      entry = {status:'loading'};
+      cycleUsageMap.set(key, entry);
+      cycleQueue.push({entry, start, end: endDay, sourceData: data, filters: payload});
+      pumpCycleUsage();
+    }
+    return entry;
+  }
+
+  function pumpCycleUsage() {
+    while (cycleActive < 2 && cycleQueue.length) {
+      const job = cycleQueue.shift();
+      cycleActive++;
+      const query = window.__TAURI__
+        ? window.__TAURI__.core.invoke('query_usage_details',{start:job.start,end:job.end,filters:job.filters})
+        : (window.hudDetailsPreviewQuery?window.hudDetailsPreviewQuery(job.start,job.end):Promise.reject(new Error('无数据源')));
+      query.then(result=>{ if(data===job.sourceData){result.rows.forEach(r=>{r.accountKey=JSON.stringify([r.provider,r.account]);});job.entry.status='ready';job.entry.data=result;} })
+        .catch(error=>{ if(data===job.sourceData){job.entry.status='error';job.entry.error=String(error);} })
+        .finally(()=>{ cycleActive--; if(data===job.sourceData)render(); pumpCycleUsage(); });
+    }
   }
 
   function renderCycles(baseRows) {
@@ -186,53 +211,54 @@
     cycleRows=data.cycles.filter(c => JSON.stringify([c.provider,c.account,c.window])===selected);
     cycle=cycleRows.find(c=>cycleKey(c)===previousCycle)||cycleRows[0]||null;
     const monetary=metric==='cost'||metric==='average';
-    const extended=cycleUsage?.status==='ready'?cycleUsage.data:null;
-    const rangeCoversNow=Date.now()<dayStart(offset(data.end,1));
-    const cols=['周期（本地时间）',`${metric==='cost'?'100%用量预估':metricNames[metric]}（${units[metric]}）`,'实际使用估值（$）','调用',...(monetary?['费用覆盖']:[]),'最近额度读数','状态'];
+    const cols=['周期（本地时间）',`${metricNames[metric]}（${units[metric]}）`,'窗口估值（$）','实际使用估值（$）','调用',...(monetary?['费用覆盖']:[]),'最近额度读数','状态'];
     const table=node('table'), head=node('thead'), hr=node('tr'), body=node('tbody'); cols.forEach(c=>hr.append(node('th',c))); head.append(hr); table.append(head,body);
     cycleRows.forEach(c => {
-      // 扩展查询就绪即用完整周期数据；未就绪时仅当所选范围已覆盖该周期至今的请求才用当前数据。
-      const source=extended||((c.start>=dayStart(data.start)&&rangeCoversNow)?data:null);
-      const s=source?aggregate(filter(source.rows,filters,session,c),source.costs):null;
+      // 所选范围已覆盖时直接用当前数据，否则按筛选逐周期异步查询，完成后逐行填充。
+      const entry=cycleUsageEntry(c);
+      const s=entry.status==='ready'?aggregate(filter(entry.data.rows,filters,session,c),entry.data.costs):null;
       const tr=node('tr');
       tr.classList.toggle('selected',c===cycle);
-      const cell=node('td'), button=node('button',stamp(c.start)); button.type='button';
+      const cell=node('td'), button=node('button',`${stamp(c.start)} — ${stamp(c.end)}`); button.type='button';
       button.setAttribute('aria-pressed',String(c===cycle));
       const select=()=>{cycle=c;clearDrill();render();};
       button.addEventListener('click',select);
       tr.addEventListener('click',e=>{if(!e.target.closest('button'))select();});
       cell.append(button); tr.append(cell);
       const used=c.remaining==null?null:Math.min(100,Math.max(0,100-c.remaining));
-      const projected=metric==='cost'&&s&&s.cost!=null&&used!==null&&used>=1?s.cost*100/used:null;
-      const value=node('td',s?`${valueText(metric==='cost'?projected:s[metric],metric)} ${units[metric]}`:'—','num');
-      if(s)value.title=metric==='cost'
-        ?(projected!=null
-          ?`100%用量费用预估 ${valueText(projected,'cost')} $ = 周期累计 ${valueText(s.cost,'cost')} $ ÷ 已用 ${used.toFixed(1)}%；未定价请求不计入累计；实际累计见「实际使用估值」列`
-          :`100%用量费用预估暂无法折算（${used==null?'无额度读数':'已用不足 1% 或暂无已定价费用'}）；周期累计 ${valueText(s.cost,'cost')} $ 见「实际使用估值」列`)
-        :`${metricNames[metric]} ${valueText(s[metric],metric)} ${units[metric]}${monetary?`；费用覆盖 ${s.priced}/${s.calls} 次；未覆盖部分不计入已知金额`:''}`;
-      else value.title=cycleUsage?.status==='error'?`周期统计读取失败：${cycleUsage.error}`:'周期统计加载中';
-      tr.append(value);
-      const usage=cycleUsageStats(c), actual=node('td',usage?`${valueText(usage.cost,'cost')} $`:(cycleUsage?.status==='error'?'读取失败':'加载中'),'num');
-      if(!usage && cycleUsage?.status!=='error') {
+      const estimate=s&&s.cost!=null&&used!==null&&used>=1?s.cost*100/used:null;
+      const estimateCell = s
+        ? node('td',`${valueText(estimate,'cost')} $`,'num')
+        : loadingCell(entry.status==='error'?'error':'loading');
+      estimateCell.title = s
+        ?(estimate!=null
+          ?`窗口估值 ${valueText(estimate,'cost')} $ = 周期累计 ${valueText(s.cost,'cost')} $ ÷ 已用 ${used.toFixed(1)}%；按额度窗口用量比例折算的满用量费用预估；未定价请求不计入累计`
+          :`窗口估值暂无法折算（${used==null?'无额度读数':'已用不足 1% 或暂无已定价费用'}）；周期累计 ${valueText(s.cost,'cost')} $ 见「实际使用估值」列`)
+        :(entry.status==='error'?`窗口估值读取失败：${entry.error}`:'窗口估值加载中');
+      const value=node('td',s?`${valueText(s[metric],metric)} ${units[metric]}`:'—','num');
+      value.title=s?`${metricNames[metric]} ${valueText(s[metric],metric)} ${units[metric]}${monetary?`；费用覆盖 ${s.priced}/${s.calls} 次；未覆盖部分不计入已知金额`:''}`
+        :(entry.status==='error'?`周期统计读取失败：${entry.error}`:'周期统计加载中');
+      tr.append(value,estimateCell);
+      const actual=node('td',s?`${valueText(s.cost,'cost')} $`:(entry.status==='error'?'读取失败':'加载中'),'num');
+      if(!s && entry.status!=='error') {
         actual.classList.add('cycle-usage-loading');
         actual.setAttribute('aria-busy','true');
         const spinner=node('span',undefined,'loading-spinner');
         spinner.setAttribute('aria-hidden','true');
         actual.prepend(spinner);
       }
-      actual.title=usage?`周期开始至今累计 ${valueText(usage.cost,'cost')} $ · ${number.format(usage.tokens)} Token · ${usage.calls} 次 · 费用覆盖 ${usage.priced}/${usage.calls}；按模型定价折算，非实际扣款；不受日期范围与筛选影响${cycleUsage.data.warnings?.length?`；${cycleUsage.data.warnings.join('；')}`:''}`
-        :(cycleUsage?.status==='error'?`实际使用读取失败：${cycleUsage.error}`:'实际使用加载中');
-      tr.append(actual,s?node('td',String(s.calls),'num'):loadingCell(cycleUsage?.status==='error'?'error':'loading'));
-      if(monetary)tr.append(s?node('td',`${s.priced}/${s.calls} 次`,'num'):loadingCell(cycleUsage?.status==='error'?'error':'loading'));
+      actual.title=s?`周期开始至今累计 ${valueText(s.cost,'cost')} $ · ${number.format(s.tokens)} Token · ${s.calls} 次 · 费用覆盖 ${s.priced}/${s.calls}；按模型定价折算，非实际扣款；覆盖完整周期并遵循当前筛选${entry.data.warnings?.length?`；${entry.data.warnings.join('；')}`:''}`
+        :(entry.status==='error'?`实际使用读取失败：${entry.error}`:'实际使用加载中');
+      tr.append(actual,s?node('td',String(s.calls),'num'):loadingCell(entry.status==='error'?'error':'loading'));
+      if(monetary)tr.append(s?node('td',`${s.priced}/${s.calls} 次`,'num'):loadingCell(entry.status==='error'?'error':'loading'));
       const read=node('td',c.remaining===null?'—':`已用 ${(100-c.remaining).toFixed(1)}%`,'num'); read.title=`观测于 ${stamp(c.observedAt)}；不是期末最终读数`; tr.append(read);
       tr.append(node('td',`${c.end>Date.now()?'进行中':'已结束'}`)); body.append(tr);
     });
     if(!cycleRows.length) { const td=node('td',keys.length?'所选账号与窗口没有明确边界的周期':'没有可用的明确周期边界', 'empty'); td.colSpan=cols.length; const tr=node('tr');tr.append(td);body.append(tr); }
     $('cycle-list').replaceChildren(table);
-    $('cycle-message').textContent='周期统计覆盖完整周期并遵循当前筛选；实际使用估值为周期开始至今的累计金额，只覆盖本地日志，不受日期范围与筛选影响';
+    $('cycle-message').textContent='周期统计覆盖完整周期并遵循当前筛选；窗口估值为周期累计÷已用%的满用量预估，实际使用估值为周期开始至今累计';
     $('cycle-actions').hidden=!cycle;
     const i=cycleRows.indexOf(cycle); $('cycle-prev').disabled=i<0||i>=cycleRows.length-1; $('cycle-next').disabled=i<=0;
-    ensureCycleUsage();
   }
 
   function svgNode(tag, attrs={}, text) { const el=document.createElementNS(ns,tag);for(const [k,v] of Object.entries(attrs)) el.setAttribute(k,String(v));if(text!==undefined)el.textContent=text;return el; }
@@ -323,9 +349,10 @@
     if(!data)return;
     const base=filter(data.rows,filters,session);
     if(view==='cycles')renderCycles(base);
-    // 周期视图使用扩展查询的完整周期数据；未就绪时先用所选范围内的部分数据，就绪后自动补全。
-    const cycleSource=view==='cycles'&&cycle?(cycleUsage?.status==='ready'?cycleUsage.data:data):null;
-    displayRows=view==='cycles'?(cycle?filter(cycleSource.rows,filters,session,cycle):[]):filter(base,{},{});
+    // 周期视图使用所选周期的异步查询结果；未就绪时先用所选范围内的部分数据，就绪后自动补全。
+    const selEntry=view==='cycles'&&cycle?cycleUsageEntry(cycle):null;
+    const cycleSource=selEntry?.status==='ready'?selEntry.data:null;
+    displayRows=view==='cycles'?(cycle?filter((cycleSource||data).rows,filters,session,cycle):[]):base;
     viewCosts=(cycleSource||data).costs;
     const stats=aggregate(displayRows,viewCosts);
     document.querySelectorAll('[data-metric]').forEach(b=>{const k=b.dataset.metric;const value=b.querySelector('.metric-value');const unavailable=view==='cycles'&&!cycle;value.textContent=unavailable?'—':valueText(stats[k],k,true);value.append(node('span',units[k],'metric-unit'));b.title=`${metricNames[k]} ${unavailable?'—':valueText(stats[k],k)} ${units[k]}`;if(k==='cost'||k==='average'){b.querySelector('.metric-label').textContent=metricNames[k];b.title+=`；费用覆盖 ${stats.priced}/${stats.calls} 次`;}});
@@ -348,11 +375,11 @@
       document.querySelectorAll('.metric-value').forEach(v=>v.textContent='—');
     }
     try {
-      const result=window.__TAURI__?await window.__TAURI__.core.invoke('query_usage_details',{start,end})
+      const result=window.__TAURI__?await window.__TAURI__.core.invoke('query_usage_details',{start,end,filters:filterPayload()})
         :await (window.hudDetailsPreviewQuery?window.hudDetailsPreviewQuery(start,end):Promise.reject(new Error('独立预览未注入数据，请从 HUD 打开详情')));
       if(id!==request)return;
       if(result.start!==start||result.end!==end)throw new Error('返回的统计日期与所选范围不一致');
-      data=result;labels=new Map();data.rows.forEach(r=>{r.accountKey=JSON.stringify([r.provider,r.account]);labels.set(r.sourceKey,sourceLabel(r));});cycleUsage=null;
+      data=result;labels=new Map();data.rows.forEach(r=>{r.accountKey=JSON.stringify([r.provider,r.account]);labels.set(r.sourceKey,sourceLabel(r));});cycleUsageMap.clear();
       if (Array.isArray(fullCycle)) cycle=data.cycles.find(c=>JSON.stringify([c.provider,c.account,c.window,c.start,c.end])===JSON.stringify(fullCycle))||null;
       $('load-status').hidden=true;$('warnings').textContent=data.warnings.join('；');
       $('updated').textContent=`更新于 ${new Date().toLocaleTimeString('zh-CN',{hour12:false})} · ${data.start} — ${data.end}`;

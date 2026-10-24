@@ -21,6 +21,11 @@
   const sourceViews = new Map();
   const sourceBranches = new Map();
   const quotaViews = new Map();
+  const quotaTooltip = byId('quota-tooltip');
+  let quotaTooltipView = null;
+  let quotaTooltipShowTimer = 0;
+  let quotaTooltipHideTimer = 0;
+  let quotaTooltipKey = '';
   const subagentNumbers = new Map();
   const childPresence = new Map();
   const childSessions = new Map();
@@ -818,7 +823,11 @@
     } else quotaRenderKey = orderKey;
     const next = new Map(entries.map(entry => [entry.key, entry]));
     for (const [key, view] of quotaViews) {
-      if (!next.has(key)) { view.item.remove(); quotaViews.delete(key); }
+      if (!next.has(key)) {
+        if (quotaTooltipView === view) hideQuotaTooltip();
+        view.item.remove();
+        quotaViews.delete(key);
+      }
     }
     let previous = null;
     for (const entry of entries) {
@@ -907,8 +916,6 @@
       view.marker.dataset.pace = pace;
       const comparison = pace === 'ahead' ? '用量高于时间进度超过 5 个百分点' : pace === 'within' ? '用量低于时间进度超过 5 个百分点' : pace === 'balanced' ? '用量与时间进度相差不超过 5 个百分点' : '用量未知';
       const hint = `细竖线：周期已过 ${elapsed.toFixed(1)}%${view.monthEstimated ? '（按一个月估算：从下次重置时间倒推一个日历月）' : ''}；色条：已用额度；${comparison}`;
-      view.marker.title = `${view.item.title}\n${hint}`;
-      view.track.title = view.marker.title;
       view.track.setAttribute('aria-description', hint);
     }
   }
@@ -923,6 +930,143 @@
     if (name === 'copilot') return 'githubcopilot';
     if (name === 'zcode') return 'zcode';
     return modelIcon(provider);
+  }
+
+  /** 同一窗口的数值和文字共用口径；缺失读数不伪装为零。 */
+  function quotaWindowDetails(span) {
+    const used = span.unlimited ? null : Number.isFinite(span.used) ? span.used
+      : Number.isFinite(span.remaining) ? 100 - span.remaining : null;
+    const percent = used === null ? null : Math.min(100, Math.max(0, used));
+    const format = value => value.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+    const status = span.unlimited ? '不限量' : used === null ? '用量未提供' : used >= 100 ? `已用 ${format(used)}% · 已用尽` : `已用 ${format(used)}%`;
+    const severity = used === null ? 'unknown' : used > 95 ? 'critical' : used > 80 ? 'warning' : 'normal';
+    const amount = Number.isFinite(span.amount) ? span.amount
+      : Number.isFinite(span.limit) && used !== null ? span.limit * used / 100 : null;
+    const credits = /credits?|积分/i.test(`${span.name || ''} ${span.unit || ''}`);
+    const unit = credits ? ' 积分' : span.unit ? ` ${span.unit}` : '';
+    const quantity = amount !== null && Number.isFinite(span.limit)
+      ? `已用 ${format(amount)} / ${format(span.limit)}${unit}` : span.display || '';
+    const remaining = amount !== null && Number.isFinite(span.limit)
+      ? `剩余 ${format(Math.max(0, span.limit - amount))}${unit}`
+      : used !== null ? `剩余 ${format(Math.max(0, 100 - used))}%` : '';
+    const reset = span.resetsAt && !Number.isNaN(Date.parse(span.resetsAt))
+      ? `${new Date(span.resetsAt).toLocaleString('zh-CN', { hour12: false })} 重置` : '重置时间未提供';
+    const name = [span.family || span.pool, span.name || '额度'].filter(Boolean).join(' · ');
+    return { used, percent, status, severity, quantity, remaining, reset, name };
+  }
+
+  /** 只在悬停或聚焦的账号上展开；渲染仍只使用 textContent。 */
+  function renderQuotaTooltip(view) {
+    const { card, models, quota, windows } = view.entry;
+    const key = JSON.stringify([quota, card.account, [...models], snapshot.quotaError]);
+    if (key === quotaTooltipKey) return;
+    quotaTooltipKey = key;
+    const node = (tag, className, text) => {
+      const element = document.createElement(tag);
+      element.className = className;
+      if (text) element.textContent = text;
+      return element;
+    };
+    const header = node('div', 'quota-tooltip-heading');
+    const identity = node('div', 'quota-tooltip-identity');
+    identity.append(node('strong', '', quota.name || quota.provider), node('span', 'quota-tooltip-account', card.account));
+    const count = quota.windows.length;
+    header.append(identity, node('span', 'quota-tooltip-count', `${count} 个窗口`));
+    const content = [header];
+    const context = [quota.plan, [...models].join(' · ')].filter(Boolean).join(' · ');
+    if (context) content.push(node('p', 'quota-tooltip-context', context));
+    const list = node('div', 'quota-tooltip-windows');
+    for (const span of windows.filter(Boolean)) {
+      const details = quotaWindowDetails(span);
+      const row = node('div', 'quota-tooltip-window');
+      row.dataset.severity = details.severity;
+      const heading = node('div', 'quota-tooltip-window-heading');
+      heading.append(node('strong', '', details.name), node('span', 'quota-tooltip-value', details.status));
+      const track = node('div', 'quota-tooltip-track');
+      track.dataset.unknown = String(details.percent === null);
+      if (details.percent !== null) {
+        track.setAttribute('role', 'progressbar');
+        track.setAttribute('aria-label', details.name);
+        track.setAttribute('aria-valuemin', '0');
+        track.setAttribute('aria-valuemax', '100');
+        track.setAttribute('aria-valuenow', String(details.percent));
+        track.setAttribute('aria-valuetext', [details.status, details.quantity, details.remaining].filter(Boolean).join('，'));
+        const fill = node('span', 'quota-tooltip-fill');
+        fill.style.width = `${details.percent}%`;
+        track.append(fill);
+      }
+      row.append(heading, track);
+      if (details.quantity) row.append(node('div', 'quota-tooltip-quantity', details.quantity));
+      const meta = node('div', 'quota-tooltip-meta');
+      if (details.remaining) meta.append(node('span', '', details.remaining));
+      meta.append(node('time', '', details.reset));
+      row.append(meta);
+      list.append(row);
+    }
+    if (count) content.push(list);
+    else if (!quota.balance) content.push(node('p', 'quota-tooltip-context', '未提供额度窗口'));
+    if (quota.balance) content.push(node('p', 'quota-tooltip-balance', `余额 ${quota.balance}`));
+    const error = snapshot.quotaError || quota.error;
+    if (error) content.push(node('p', 'quota-tooltip-error', `旧读数 · ${error}`));
+    const read = quota.readAt || quota.asOf;
+    if (read) {
+      const time = !Number.isNaN(Date.parse(read)) ? new Date(read).toLocaleString('zh-CN', { hour12: false }) : read;
+      content.push(node('div', 'quota-tooltip-footer', `最近读数 ${time}`));
+    }
+    const scroll = quotaTooltip.scrollTop;
+    quotaTooltip.replaceChildren(...content);
+    quotaTooltip.scrollTop = scroll;
+  }
+
+  /** 浮层挂在 body 上避开侧栏裁剪，始终收在当前窗口内。 */
+  function positionQuotaTooltip() {
+    if (!quotaTooltipView || quotaTooltip.hidden) return;
+    const anchor = quotaTooltipView.item.getBoundingClientRect();
+    const width = quotaTooltip.offsetWidth;
+    const height = quotaTooltip.offsetHeight;
+    let left = anchor.right + 12;
+    if (left + width > innerWidth - 8) left = anchor.left - width - 12;
+    if (left < 8) {
+      left = Math.min(anchor.left, innerWidth - width - 8);
+      const top = anchor.bottom + 8;
+      quotaTooltip.style.top = `${Math.max(8, Math.min(top + height <= innerHeight - 8 ? top : anchor.top - height - 8, innerHeight - height - 8))}px`;
+    } else quotaTooltip.style.top = `${Math.max(8, Math.min(anchor.top - 8, innerHeight - height - 8))}px`;
+    quotaTooltip.style.left = `${Math.max(8, left)}px`;
+  }
+
+  function hideQuotaTooltip() {
+    clearTimeout(quotaTooltipShowTimer);
+    clearTimeout(quotaTooltipHideTimer);
+    quotaTooltipView?.item.removeAttribute('aria-describedby');
+    quotaTooltipView = null;
+    quotaTooltip.hidden = true;
+  }
+
+  function showQuotaTooltip(view, immediate = false) {
+    clearTimeout(quotaTooltipShowTimer);
+    clearTimeout(quotaTooltipHideTimer);
+    const show = () => {
+      if (!view.item.isConnected) return;
+      if (quotaTooltipView !== view) {
+        quotaTooltipView?.item.removeAttribute('aria-describedby');
+        quotaTooltip.scrollTop = 0;
+      }
+      quotaTooltipView = view;
+      renderQuotaTooltip(view);
+      quotaTooltip.hidden = false;
+      view.item.setAttribute('aria-describedby', 'quota-tooltip');
+      positionQuotaTooltip();
+    };
+    if (immediate || !quotaTooltip.hidden) show();
+    else quotaTooltipShowTimer = setTimeout(show, 180);
+  }
+
+  function scheduleQuotaTooltipHide() {
+    clearTimeout(quotaTooltipShowTimer);
+    clearTimeout(quotaTooltipHideTimer);
+    quotaTooltipHideTimer = setTimeout(() => {
+      if (!quotaTooltip.matches(':hover') && !quotaTooltipView?.item.matches(':hover, :focus')) hideQuotaTooltip();
+    }, 160);
   }
 
   /** 只创建稳定元素，不在每次快照中重排。 */
@@ -963,7 +1107,12 @@
     const value = document.createElement('strong');
     row.append(label, track, value);
     item.append(icon, header, row);
-    return { item, icon, image, fallback, account, reset, label, track, fill, marker, value };
+    const view = { item, icon, image, fallback, account, reset, label, track, fill, marker, value };
+    item.addEventListener('pointerenter', () => showQuotaTooltip(view));
+    item.addEventListener('pointerleave', scheduleQuotaTooltipHide);
+    item.addEventListener('focus', () => showQuotaTooltip(view, true));
+    item.addEventListener('blur', scheduleQuotaTooltipHide);
+    return view;
   }
 
   /** 重置倒计时使用两级单位；不足一分钟时不显示负数或虚假的零分钟。 */
@@ -1001,7 +1150,7 @@
       stale.textContent = '旧读数';
       view.account.after(stale);
     } else if (!quota.error && stale) stale.remove();
-    if (stale) stale.title = quota.error;
+    if (stale) stale.removeAttribute('title');
     const family = quotaIcon(quota.provider);
     view.item.dataset.namedWindow = String(quota.provider.toLowerCase() === 'zcode');
     const iconPath = family ? `icons/${family}.${family === 'zcode' ? 'png' : 'svg'}` : '';
@@ -1063,27 +1212,18 @@
     view.track.parentElement.dataset.severity = severity;
     view.track.parentElement.dataset.low = String(severity === 'warning');
     const read = quota.readAt || quota.asOf;
-    const windows = (quota.windows || []).map(window => {
-      const used = window.unlimited ? null : Number.isFinite(window.used) ? window.used
-        : Number.isFinite(window.remaining) ? 100 - window.remaining : null;
-      const status = window.unlimited ? '不限量' : used === null ? '用量未提供' : `已用 ${Number.isInteger(used) ? used : used.toFixed(1)}%`;
-      const reset = window.resetsAt && !Number.isNaN(Date.parse(window.resetsAt))
-        ? `${new Date(window.resetsAt).toLocaleString('zh-CN', { hour12: false })} 重置` : '重置时间未提供';
-      const creditWindow = /credits?|积分/i.test(`${window.name || ''} ${window.unit || ''}`);
-      const amount = Number.isFinite(window.amount) ? window.amount
-        : Number.isFinite(window.limit) && used !== null ? window.limit * used / 100 : null;
-      const format = value => value.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
-      const quantity = amount !== null && Number.isFinite(window.limit)
-        ? `已用 ${format(amount)} / ${format(window.limit)}${creditWindow ? ' 积分' : window.unit ? ` ${window.unit}` : ''} · 剩余 ${format(Math.max(0, window.limit - amount))}`
-        : window.display || '';
-      return `${[window.family || window.pool, window.name || '额度'].filter(Boolean).join(' · ')} · ${status}${quantity ? `\n${quantity}` : ''}\n${reset}`;
+    const windows = (quota.windows || []).map(span => {
+      const details = quotaWindowDetails(span);
+      return [details.name, details.status, details.quantity, details.remaining, details.reset].filter(Boolean).join('，');
     });
     const readTime = read && !Number.isNaN(Date.parse(read)) ? new Date(read).toLocaleString('zh-CN', { hour12: false }) : read;
-    view.item.title = [quota.name || quota.provider, card.account, [...models].join(' · '), ...windows,
-      quota.balance ? `余额 ${quota.balance}` : '', readTime ? `读数 ${readTime}` : '', snapshot.quotaError || quota.error || ''].filter(Boolean).join('\n');
-    // 子节点使用同一提示，账号或重置时间自己的 title 不再遮住完整窗口清单。
-    [view.icon, view.account, view.reset, view.track, view.value, view.label].forEach(element => { element.title = view.item.title; });
-    view.item.setAttribute('aria-label', view.item.title.replaceAll('\n', '，'));
+    const description = [quota.name || quota.provider, card.account, [...models].join(' · '), ...windows,
+      quota.balance ? `余额 ${quota.balance}` : '', readTime ? `读数 ${readTime}` : '', snapshot.quotaError || quota.error || ''].filter(Boolean).join('，');
+    // 系统 title 会遮住自绘浮层；完整口径保留在可访问名称中。
+    [view.item, view.icon, view.account, view.reset, view.track, view.marker, view.value, view.label].forEach(element => element.removeAttribute('title'));
+    view.item.title = '';
+    view.item.setAttribute('aria-label', description);
+    if (quotaTooltipView === view) { renderQuotaTooltip(view); positionQuotaTooltip(); }
   }
 
   /** 根据当前会话选择生成分支和两行说明，保留滚动位置。 */
@@ -1404,8 +1544,18 @@
     // 焦点仅记录交互状态，聚焦与失焦使用相同的半透明背景。
     const syncFocus = focused => { hud.dataset.focus = String(focused); };
     window.addEventListener('focus', () => syncFocus(true));
-    window.addEventListener('blur', () => syncFocus(false));
+    window.addEventListener('blur', () => { syncFocus(false); hideQuotaTooltip(); });
     syncFocus(document.hasFocus());
+    quotaTooltip.addEventListener('pointerenter', () => clearTimeout(quotaTooltipHideTimer));
+    quotaTooltip.addEventListener('pointerleave', scheduleQuotaTooltipHide);
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') hideQuotaTooltip(); });
+    document.addEventListener('pointerdown', event => {
+      if (!quotaTooltip.contains(event.target) && !event.target.closest('.quota-item')) hideQuotaTooltip();
+    });
+    document.addEventListener('scroll', event => {
+      if (!quotaTooltip.contains(event.target)) hideQuotaTooltip();
+    }, true);
+    window.addEventListener('resize', positionQuotaTooltip);
     agentSelector.addEventListener('click', () => agentOptions.hidden ? openAgentOptions() : closeAgentOptions(true));
     agentSelector.addEventListener('keydown', event => {
       if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
@@ -1510,22 +1660,8 @@
     });
     byId('hide-window').addEventListener('click', () => invoke('hide_window').catch(reportError));
     byId('close-window').addEventListener('click', () => invoke('close_window').catch(reportError));
-    const menu = byId('window-menu');
-    const showMenu = event => {
-      event.preventDefault();
-      menu.hidden = false;
-      const bounds = menu.getBoundingClientRect();
-      menu.style.left = `${Math.max(8, Math.min(event.clientX, innerWidth - bounds.width - 8))}px`;
-      menu.style.top = `${Math.max(8, Math.min(event.clientY, innerHeight - bounds.height - 8))}px`;
-    };
-    document.addEventListener('contextmenu', event => { if (!event.target.closest('input,textarea,select')) showMenu(event); });
-    document.addEventListener('pointerdown', event => { if (!menu.contains(event.target)) menu.hidden = true; });
-    menu.addEventListener('click', async event => {
-      const action = event.target.closest('[data-window-action]')?.dataset.windowAction;
-      menu.hidden = true;
-      if (action === 'hide') await invoke('hide_window').catch(reportError);
-      if (action === 'reset') await invoke('reset_window_position').catch(reportError);
-    });
+    // 右键不触发任何菜单；输入控件保留系统编辑菜单。
+    document.addEventListener('contextmenu', event => { if (!event.target.closest('input,textarea,select')) event.preventDefault(); });
     byId('drag-region').addEventListener('pointerdown', event => {
       if (event.button === 0 && !event.target.closest('button,select,label')) window.__TAURI__.webviewWindow.getCurrentWebviewWindow().startDragging().catch(reportError);
     });
