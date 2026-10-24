@@ -812,6 +812,56 @@ pub fn scan_day_stats(
     Ok(ledger.day_stats())
 }
 
+/// 详情查询仅输出统计字段；正文、凭据和原始错误文本不会进入详情窗口。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDetailRow {
+    pub id: String,
+    pub timestamp: i64,
+    pub date: String,
+    pub hour: usize,
+    pub session: String,
+    pub agent: String,
+    pub caller_key_id: String,
+    pub caller_key_name: String,
+    pub source_key: String,
+    pub provider: String,
+    pub account: String,
+    pub model: String,
+    pub effort: String,
+    pub outcome: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub tokens: u64,
+    pub generation_ms: Option<f64>,
+}
+
+pub fn scan_detail_rows(path: &std::path::Path, start: NaiveDate, end: NaiveDate)
+    -> Result<Vec<UsageDetailRow>, String>
+{
+    let mut ledger = UsageLedger::spanning(start, end);
+    let mut cursor = crate::tail::LogCursor::default();
+    cursor.update_for_day(path, &mut ledger, start)?;
+    if cursor.missing { return Err("用量日志文件未找到".into()); }
+    let mut rows: Vec<_> = ledger.records.iter().map(|r| {
+        let agent = canonical_agent(&r.agent);
+        let identity = if r.caller_key_id.is_empty() { &r.caller_key_name } else { &r.caller_key_id };
+        UsageDetailRow {
+            id: r.identity.clone(), timestamp: r.timestamp_ms, date: r.day.to_string(), hour: r.hour,
+            session: r.session.clone(), source_key: serde_json::to_string(&[&agent, identity]).unwrap(), agent,
+            caller_key_id: r.caller_key_id.clone(),
+            caller_key_name: ledger.caller_key_names.get(&r.caller_key_id).map(|(_, name)| name.clone())
+                .unwrap_or_else(|| r.caller_key_name.clone()),
+            provider: r.provider.clone(), account: r.account.clone(), model: r.model.clone(), effort: r.effort.clone(),
+            outcome: r.outcome().into(), input: r.input, output: r.output, cache_read: r.cache_read, tokens: r.tokens,
+            generation_ms: if r.success() { r.generation_ms } else { None },
+        }
+    }).collect();
+    rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| a.id.cmp(&b.id)));
+    Ok(rows)
+}
+
 /// 按原始 Agent 与调用方身份汇总全部完成记录。费用不在这里填写。
 /// 有 callerKeyId 时按 ID 分组；没有 ID 时按 callerKeyName 分开，两边都空才共用一组。
 fn agent_groups(records: &[Record]) -> Vec<AgentStats> {

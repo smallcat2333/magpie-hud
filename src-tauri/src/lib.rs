@@ -2,6 +2,7 @@
 
 mod backdrop;
 mod config;
+mod details;
 mod hourly;
 mod live;
 mod placement;
@@ -163,6 +164,7 @@ struct StartupState {
 pub fn run() {
     tauri::Builder::default()
         .manage(Arc::new(Mutex::new(Runtime::new())))
+        .manage(Mutex::new(details::DetailContext::default()))
         .setup(|app| {
             setup_window(app.handle())?;
             setup_tray(app.handle())?;
@@ -174,6 +176,9 @@ pub fn run() {
             startup_state,
             query_date_stats,
             query_month_usage,
+            open_usage_details,
+            usage_details_context,
+            query_usage_details,
             set_pinned,
             reset_window_position,
             hide_window,
@@ -466,6 +471,44 @@ fn startup_state(app: AppHandle) -> StartupState {
         .is_always_on_top()
         .unwrap_or(true);
     StartupState { snapshot, pinned }
+}
+
+/// 单实例详情窗口；启动先订阅再读取上下文，避免首次打开丢失事件。
+#[tauri::command]
+async fn open_usage_details(app: AppHandle, context: details::DetailContext) -> Result<(), String> {
+    if !["tokens", "speed", "cost", "cache", "calls", "average"].contains(&context.metric.as_str()) {
+        return Err("未知统计指标".into());
+    }
+    *app.state::<Mutex<details::DetailContext>>().lock().map_err(|_| "详情状态锁损坏")? = context.clone();
+    if let Some(window) = app.get_webview_window("usage-details") {
+        window.emit("usage-details-context", &context).map_err(|e| e.to_string())?;
+        window.show().map_err(|e| e.to_string())?;
+        window.unminimize().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+    } else {
+        let window = tauri::WebviewWindowBuilder::new(&app, "usage-details", tauri::WebviewUrl::App("details.html".into()))
+            .title("Magpie HUD · 用量详情").inner_size(960.0, 720.0)
+            .min_inner_size(480.0, 480.0).resizable(true).decorations(false).transparent(true).center()
+            .build().map_err(|e| e.to_string())?;
+        backdrop::apply(&window).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn usage_details_context(app: AppHandle) -> details::DetailContext {
+    app.state::<Mutex<details::DetailContext>>().lock().expect("详情状态锁损坏").clone()
+}
+
+#[tauri::command]
+async fn query_usage_details(app: AppHandle, start: String, end: String) -> Result<details::DetailData, String> {
+    let (path, host) = {
+        let state = app.state::<Arc<Mutex<Runtime>>>();
+        let runtime = state.lock().map_err(|_| "状态锁损坏")?;
+        (usage_path(&runtime.config), runtime.config.magpie_host.clone())
+    };
+    tauri::async_runtime::spawn_blocking(move || details::query(&path, &host, &start, &end))
+        .await.map_err(|e| format!("详情查询任务失败：{e}"))?
 }
 
 /// 查询指定本地日期的六项统计与 24 小时趋势；历史日期走只读缓存轨，不干扰当日实时账本。

@@ -861,7 +861,10 @@
     const index = phase < 20_000 ? 0 : 1 + Math.floor((phase - 20_000) / 5_000);
     const span = windows[index];
     const name = span?.name || '额度';
-    const windowName = /^5\s*(hours?|h)$/i.test(name) ? '5h'
+    const zcodeWindow = view.entry.quota.provider.toLowerCase() === 'zcode'
+      ? name.match(/^ZCode\s+(.+?)\s*[·•]\s*(.+)$/i) : null;
+    const windowName = zcodeWindow ? `${zcodeWindow[1].replace(/\s+Dev Day$/i, '').replace(/\s+Plan$/i, '')} · ${zcodeWindow[2].replace(/^GLM-/i, '').replace(/-Flash$/i, 'F')}`
+      : /^5\s*(hours?|h)$/i.test(name) ? '5h'
       : /^(weekly|week|7 days|周|每周)$/i.test(name) ? '周'
         : /^(monthly|month|月|每月)$/i.test(name) ? '月' : name;
     view.windowIndex = index;
@@ -903,6 +906,7 @@
     if (name === 'grok') return 'xai';
     if (name === 'gemini') return 'geminicli-color';
     if (name === 'copilot') return 'githubcopilot';
+    if (name === 'zcode') return 'zcode';
     return modelIcon(provider);
   }
 
@@ -984,7 +988,9 @@
     } else if (!quota.error && stale) stale.remove();
     if (stale) stale.title = quota.error;
     const family = quotaIcon(quota.provider);
-    if (family && view.image.getAttribute('src') !== `icons/${family}.svg`) view.image.src = `icons/${family}.svg`;
+    view.item.dataset.namedWindow = String(quota.provider.toLowerCase() === 'zcode');
+    const iconPath = family ? `icons/${family}.${family === 'zcode' ? 'png' : 'svg'}` : '';
+    if (family && view.image.getAttribute('src') !== iconPath) view.image.src = iconPath;
     view.image.hidden = !family;
     view.fallback.hidden = Boolean(family);
     view.image.alt = quota.name || quota.provider;
@@ -1016,7 +1022,7 @@
       else if (Number.isFinite(span.remaining)) remainingCredits = Math.max(0, span.limit * span.remaining / 100);
       else if (Number.isFinite(span.used)) remainingCredits = Math.max(0, span.limit * (1 - span.used / 100));
     }
-    view.reset.textContent = credits ? remainingCredits === null ? '—' : String(Number(remainingCredits.toFixed(2))) : resetRemaining(resetTime);
+    view.reset.textContent = credits ? remainingCredits === null ? '余量未知' : `余 ${Number(remainingCredits.toFixed(2)).toLocaleString('zh-CN')}` : resetRemaining(resetTime);
     view.reset.dateTime = !credits && resetTime ? span.resetsAt : '';
     view.reset.title = resetTime ? `${resetTime.toLocaleString('zh-CN', { hour12: false })} 重置` : '重置时间未提供';
     view.label.textContent = credits ? '积分' : windowName;
@@ -1048,10 +1054,18 @@
       const status = window.unlimited ? '不限量' : used === null ? '用量未提供' : `已用 ${Number.isInteger(used) ? used : used.toFixed(1)}%`;
       const reset = window.resetsAt && !Number.isNaN(Date.parse(window.resetsAt))
         ? `${new Date(window.resetsAt).toLocaleString('zh-CN', { hour12: false })} 重置` : '重置时间未提供';
-      return `${[window.family || window.pool, window.name || '额度'].filter(Boolean).join(' · ')} · ${status}\n${reset}`;
+      const creditWindow = /credits?|积分/i.test(`${window.name || ''} ${window.unit || ''}`);
+      const amount = Number.isFinite(window.amount) ? window.amount
+        : Number.isFinite(window.limit) && used !== null ? window.limit * used / 100 : null;
+      const format = value => value.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+      const quantity = amount !== null && Number.isFinite(window.limit)
+        ? `已用 ${format(amount)} / ${format(window.limit)}${creditWindow ? ' 积分' : window.unit ? ` ${window.unit}` : ''} · 剩余 ${format(Math.max(0, window.limit - amount))}`
+        : window.display || '';
+      return `${[window.family || window.pool, window.name || '额度'].filter(Boolean).join(' · ')} · ${status}${quantity ? `\n${quantity}` : ''}\n${reset}`;
     });
+    const readTime = read && !Number.isNaN(Date.parse(read)) ? new Date(read).toLocaleString('zh-CN', { hour12: false }) : read;
     view.item.title = [quota.name || quota.provider, card.account, [...models].join(' · '), ...windows,
-      quota.balance ? `余额 ${quota.balance}` : '', read ? `读数 ${read}` : '', snapshot.quotaError || quota.error || ''].filter(Boolean).join('\n');
+      quota.balance ? `余额 ${quota.balance}` : '', readTime ? `读数 ${readTime}` : '', snapshot.quotaError || quota.error || ''].filter(Boolean).join('\n');
     // 子节点使用同一提示，账号或重置时间自己的 title 不再遮住完整窗口清单。
     [view.icon, view.account, view.reset, view.track, view.value, view.label].forEach(element => { element.title = view.item.title; });
     view.item.setAttribute('aria-label', view.item.title.replaceAll('\n', '，'));
@@ -1501,6 +1515,35 @@
       if (event.button === 0 && !event.target.closest('button,select,label')) window.__TAURI__.webviewWindow.getCurrentWebviewWindow().startDragging().catch(reportError);
     });
   }
+
+  // 六项指标共用一个详情窗口，显式携带当前范围；详情筛选不反向修改 HUD。
+  let detailsPreview = null;
+  async function openDetails(metric) {
+    const historical = hud.dataset.statsHistory === 'true';
+    const context = {
+      metric, date: byId('stats-date').dateTime || snapshot?.date,
+      source: selectedAgent,
+      session: historical || selector.value === '*' ? '' : selector.value,
+    };
+    try {
+      if (window.__TAURI__) await window.__TAURI__.core.invoke('open_usage_details', { context });
+      else {
+        const url = `details.html?${new URLSearchParams(context)}`;
+        if (detailsPreview && !detailsPreview.closed) {
+          detailsPreview.dispatchEvent(new CustomEvent('hud-details-preview-context', { detail: context }));
+          detailsPreview.focus();
+        } else detailsPreview = window.open(url, 'hud-usage-details', 'width=960,height=720');
+      }
+    } catch (error) { reportError(error); }
+  }
+  ['tokens', 'speed', 'cost', 'cache', 'calls', 'average'].forEach(metric => {
+    const element = byId(`${metric}-metric`);
+    element.addEventListener('dblclick', () => openDetails(metric));
+    element.addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); openDetails(metric); }
+    });
+    element.setAttribute('aria-description', '双击或按 Enter 打开用量详情');
+  });
 
   window.addEventListener('hud-stats-view', event => {
     const { daily, scope, date, costError, historical } = event.detail;

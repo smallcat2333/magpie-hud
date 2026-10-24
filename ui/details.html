@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark"><title>Magpie HUD · 用量详情</title>
+  <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="details.css?v=20261024-window-controls">
+  <script src="details-data.js?v=20261024-request-costs" defer></script><script src="details.js?v=20261024-request-costs" defer></script>
+</head>
+<body>
+<main>
+  <header class="page-head" data-tauri-drag-region><div class="brand" data-tauri-drag-region><img src="icons/magpie.svg" alt="" data-tauri-drag-region><h1 data-tauri-drag-region>用量详情 <small data-tauri-drag-region>Magpie HUD</small></h1></div><div class="window-actions"><button id="refresh" type="button">刷新</button><button id="detail-minimize" class="window-control" type="button" aria-label="最小化" title="最小化">─</button><button id="detail-maximize" class="window-control" type="button" aria-label="最大化或还原" title="最大化或还原">□</button><button id="detail-close" class="window-control" type="button" aria-label="关闭用量详情" title="关闭（Esc）">×</button></div></header>
+  <section aria-label="统计范围" class="filters">
+    <form id="range-form" class="date-row">
+      <label>开始日期<input id="start" type="date" required></label><span class="date-separator">—</span>
+      <label>结束日期<input id="end" type="date" required></label><button type="submit">查询</button>
+      <div class="presets"><button type="button" data-days="1">今天</button><button type="button" data-days="-1">昨天</button><button type="button" data-days="7">近7天</button><button type="button" data-days="30">近30天</button></div>
+    </form>
+    <details class="filter-disclosure" open><summary>筛选来源、模型与账号</summary><div id="filter-controls" class="filter-row"></div></details>
+    <div class="scope-row"><div id="chips" aria-label="已选条件"></div><p id="load-status" role="status" hidden></p><button id="clear" class="quiet" type="button">清除筛选</button></div>
+  </section>
+  <nav id="metrics" class="metrics" aria-label="统计指标"></nav>
+  <section class="analysis" aria-label="用量分析">
+    <div class="toolbar"><div id="views" class="tabs" role="tablist" aria-label="分析方式"><button type="button" role="tab" data-view="trend">时间趋势</button><button type="button" role="tab" data-view="groups">分组对比</button><button type="button" role="tab" data-view="cycles">重置周期</button></div>
+      <label id="group-label">分组<select id="group"><option value="model">模型</option><option value="provider">供应商</option><option value="accountKey">供应商 / 账号</option><option value="effort">强度</option><option value="agent">Agent</option><option value="sourceKey">Agent / 来源</option><option value="date">日期</option></select></label>
+      <label id="grain-label">粒度<select id="grain"><option value="day">天</option><option value="hour">小时</option></select></label>
+    </div>
+    <div id="cycle-controls" hidden><label>账号与额度窗口<select id="cycle-window"></select></label><span id="cycle-message"></span></div>
+    <div id="cycle-list" class="table-wrap" hidden></div>
+    <div id="cycle-actions" hidden><button id="cycle-prev" type="button">上一周期</button><button id="cycle-next" type="button">下一周期</button><button id="cycle-full" type="button">查看完整周期</button><button id="cycle-clear" type="button">取消周期选择</button></div>
+    <div class="chart-heading"><h2 id="chart-title">Token · 时间趋势</h2><span id="chart-caption"></span></div>
+    <div id="chart" class="chart" aria-label="指标图表"></div><div id="chart-tooltip" role="status" hidden></div>
+    <p id="metric-note" class="note"></p>
+  </section>
+  <section class="records" aria-label="用量明细">
+    <div class="toolbar"><h2>明细 <small id="row-count"></small></h2><div class="tabs" id="table-modes"><button type="button" data-mode="groups">分组汇总</button><button type="button" data-mode="chart">图表数据</button><button type="button" data-mode="requests">逐次请求</button></div><button id="drill-clear" type="button" hidden>返回全部明细</button></div>
+    <div id="table" class="table-wrap"></div>
+    <div class="pager"><span id="page-label"></span><button id="page-prev" type="button">上一页</button><button id="page-next" type="button">下一页</button></div>
+  </section>
+  <footer><span id="updated"></span><details><summary>统计口径与数据覆盖</summary><p>仅统计本地日志中已完成的外部请求，按本地请求开始时间归属。Token = 输入 + 输出 + 缓存读取。TPS = 成功请求输出 Token / 有效生成时间；缓存命中按累计输入量加权。</p><p>费用采用 Magpie 逐请求费用接口的定价结果，精确匹配本地记录后按当前交叉条件汇总；未定价、未匹配或身份冲突的记录不计入已知金额，并显示覆盖数。额度读数来自供应商历史，可能包括其他入口的消耗。</p><p id="warnings"></p></details></footer>
+</main>
+</body></html>

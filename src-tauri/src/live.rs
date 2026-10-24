@@ -28,6 +28,11 @@ pub struct LiveRoute {
     pub id: i64,
     #[serde(default)]
     pub session: String,
+    #[serde(default)]
+    pub agent: String,
+    /// 只取工作目录标记，识别 Desktop 临时辅助 fork；不读取该目录内容。
+    #[serde(default)]
+    pub folder: String,
     /// 子 Agent 身份。与 usage.jsonl 的 subagent 相同；根请求没有该字段。
     #[serde(default, rename = "subagentId")]
     pub subagent_id: String,
@@ -135,6 +140,8 @@ pub struct LiveState {
     pub seq: i64,
     pid: u32,
     routes: BTreeMap<i64, LiveRoute>,
+    /// trace 淘汰后仍记住已确认的辅助会话，避免完成卡再次出现。
+    auxiliary_sessions: HashSet<String>,
     pub activity: Activity,
     pub names: HashMap<String, String>,
     /// 同一 Desktop 会话的历史 CLI ID 映射到当前规范 ID；只来自标题元数据里的显式关联。
@@ -156,12 +163,21 @@ impl LiveState {
         let ids: HashSet<_> = update.ids.into_iter().collect();
         self.routes.retain(|id, _| ids.contains(id));
         for route in update.routes {
+            if desktop_auxiliary(&route) && !route.session.is_empty() {
+                self.auxiliary_sessions.insert(route.session.clone());
+            }
             self.routes.insert(route.id, route);
         }
     }
 
     /// 用活跃请求覆盖展示，不改账本中的次数、费用与当日 Token。
     pub fn apply(&self, view: &mut RouteSnapshot) {
+        // Desktop 起标题等辅助任务会用临时 fork ID 发请求，但没有父级关联。
+        // 不把它画成独立会话；账本与来源统计仍保留真实消耗。
+        let auxiliary_sessions: HashSet<_> = self.routes.values()
+            .filter(|route| desktop_auxiliary(route)).map(|route| route.session.as_str()).collect();
+        view.sessions.retain(|session| !auxiliary_sessions.contains(session.id.as_str())
+            && !self.auxiliary_sessions.contains(&session.id));
         // 账本卡没有完整链，按日志 route_id 复用同一条已结束 trace；只补空链，
         // 不改日志算出的 time/updatedAt。活跃卡稍后由自身选中尝试单独计算。
         for session in &mut view.sessions {
@@ -187,7 +203,7 @@ impl LiveState {
         }).collect();
         for active in &self.activity.active {
             let route = self.routes.get(&active.route);
-            if route.is_some_and(|r| r.kind == "routing") {
+            if route.is_some_and(|r| r.kind == "routing" || desktop_auxiliary(r)) {
                 continue;
             }
             // concurrency 不含子 Agent 身份；等 trace 到齐再挂卡，不能把未知请求先当根请求。
@@ -478,6 +494,15 @@ impl LiveState {
     }
 }
 
+/// 精确识别 Desktop 的临时辅助工作目录，普通 fork/未命名短请求不受影响。
+fn desktop_auxiliary(route: &LiveRoute) -> bool {
+    if route.agent != "claude-desktop" || !route.subagent_id.is_empty() { return false; }
+    let folder = route.folder.replace('\\', "/");
+    let parts: Vec<_> = folder.trim_end_matches('/').split('/').collect();
+    parts.len() >= 2 && parts[parts.len() - 2] == "ccd-session-secrets"
+        && parts.last().is_some_and(|name| name.strip_prefix("fork-").is_some_and(|id| !id.is_empty()))
+}
+
 /// 尝试 ID 是失败后休息的键，不是独立账号键。当前登录账号的键是 provider，
 /// 同组里该账号的每个模型都会复用它；其余账号是 `provider@user`，多密钥是 `provider#key`。
 /// 模型能唯一对应时用该行。否则仅当 provider 与账号完全一致时认领；任一不同就不猜。
@@ -508,47 +533,46 @@ fn selected_candidate<'a>(route: &'a LiveRoute, attempt: &Attempt) -> Option<&'a
     identity
 }
 
-/// 实际组链只认选中尝试匹配到的候选行：候选行的 via 是子组 id/ref，
-/// 经 group.subs 映射成组名；再前置入口组名。观测到的 via 只有一个子组；
-/// 多 token 的顺序语义未验证，同 id 多行 via 不一致、token 无法映射或缺 via
-/// 时返回空链（或仅入口组），绝不把候选全集串成一条假路径。
+/// via 按路径顺序列出子组 id/ref，映射成组名后前置入口组。
+/// 同一账号与模型可能同时出现在多个路径上，只展示这些候选路径的共同前缀；
+/// 无法确认子组时仍保留 trace 明确给出的入口组，不把候选全集拼成实际路径。
 fn route_chain(route: &LiveRoute, attempt: Option<&Attempt>, candidate: Option<&Candidate>) -> Vec<String> {
     let Some(group) = route.group.as_ref() else { return Vec::new(); };
     if group.name.trim().is_empty() { return Vec::new(); }
-    let Some(attempt) = attempt else { return Vec::new(); };
-    if attempt.id.is_empty() { return Vec::new(); }
-    // 账号身份已由 selected_candidate 确认的候选行。
-    let Some(candidate) = candidate else { return vec![group.name.clone()]; };
-    let vias: std::collections::BTreeSet<&str> = route.order.as_deref().unwrap_or_default().iter()
+    let mut chain = vec![group.name.clone()];
+    let Some(attempt) = attempt.filter(|attempt| !attempt.id.is_empty()) else { return chain; };
+    let Some(candidate) = candidate else { return chain; };
+    let mut paths = route.order.as_deref().unwrap_or_default().iter()
         .filter(|row| row.id == attempt.id && row.model == candidate.model
             && row.provider == candidate.provider && row.who == candidate.who)
-        .flat_map(|row| row.via.iter().map(String::as_str))
-        .collect();
-    if vias.len() > 1 { return Vec::new(); }
-    let mut chain = vec![group.name.clone()];
-    for via in vias {
-        let Some(subgroup) = group.subs.iter().find(|sub| sub.id == via || sub.reference == via) else {
-            return Vec::new();
-        };
-        if subgroup.name.trim().is_empty() { return Vec::new(); }
-        if !chain.contains(&subgroup.name) { chain.push(subgroup.name.clone()); }
+        .map(|row| {
+            let mut path = Vec::new();
+            for via in &row.via {
+                // 未知层级之后的路径不再确认，但已确认的父级仍有效。
+                let Some(subgroup) = group.subs.iter().find(|sub| sub.id == *via || sub.reference == *via) else { break; };
+                if subgroup.name.trim().is_empty() { break; }
+                path.push(subgroup.name.clone());
+            }
+            path
+        });
+    if let Some(mut common) = paths.next() {
+        for path in paths {
+            let length = common.iter().zip(&path).take_while(|(left, right)| left == right).count();
+            common.truncate(length);
+        }
+        chain.extend(common);
     }
     chain
 }
 
-/// 已结束的 trace 行没有 active 可定位选中尝试；优先用被选中且已结束的尝试。
-/// 没有 picked 时仅在唯一尝试上使用。身份无法唯一确认时留空，不借入口组。
+/// 已结束的 trace 优先用被选中尝试；多次尝试无法确认时只展示入口组。
 fn trace_chain(route: &LiveRoute) -> Vec<String> {
-    let Some(group) = route.group.as_ref() else { return Vec::new(); };
-    if group.name.trim().is_empty() { return Vec::new(); }
     let tries = route.tries.as_deref().unwrap_or_default();
     let attempt = tries.iter().rev().find(|attempt| attempt.picked && attempt.done)
         .or_else(|| tries.iter().rev().find(|attempt| attempt.picked))
         .or_else(|| (tries.len() == 1).then(|| &tries[0]));
-    let Some(attempt) = attempt else { return Vec::new(); };
-    if attempt.id.is_empty() { return Vec::new(); }
-    let Some(candidate) = selected_candidate(route, attempt) else { return Vec::new(); };
-    route_chain(route, Some(attempt), Some(&candidate))
+    let candidate = attempt.and_then(|attempt| selected_candidate(route, attempt));
+    route_chain(route, attempt, candidate)
 }
 
 /// 活跃卡的更新时间跟随 Magpie 报告的已用时长；start 不可解析时由调用方留空。
@@ -1711,7 +1735,7 @@ mod tests {
         assert_eq!(route_chain(&legacy, Some(&attempt), Some(candidate)), vec!["自动"]);
     }
 
-    /// 同一尝试 id 的多行给出不同 via 时无法判定实际子组，整条链留空。
+    /// 同一尝试的候选子组不一致或未知时，仍保留已确认的入口组。
     #[test]
     fn route_chain_rejects_conflicting_or_unknown_via() {
         let group = Some(RouteGroup { name: "自动".into(),
@@ -1722,13 +1746,70 @@ mod tests {
             Candidate { via: vec!["sub-a".into()], ..candidate.clone() },
             Candidate { via: vec!["unknown".into()], ..candidate.clone() },
         ]), ..Default::default() };
-        assert!(route_chain(&conflicting, Some(&attempt), Some(&candidate)).is_empty());
+        assert_eq!(route_chain(&conflicting, Some(&attempt), Some(&candidate)), vec!["自动"]);
         let unknown = LiveRoute { group, order: Some(vec![
             Candidate { via: vec!["unknown".into()], ..candidate.clone() },
         ]), ..Default::default() };
-        assert!(route_chain(&unknown, Some(&attempt), Some(&candidate)).is_empty());
+        assert_eq!(route_chain(&unknown, Some(&attempt), Some(&candidate)), vec!["自动"]);
         // 旧 trace 没有 group：不猜链。
         assert!(route_chain(&LiveRoute::default(), Some(&attempt), Some(&candidate)).is_empty());
+    }
+
+    #[test]
+    fn desktop_temporary_fork_is_not_a_root_session_but_usage_is_kept() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        for (id, session) in [(1, "normal"), (2, "helper")] {
+            ledger.ingest(serde_json::json!({"route_id":id,"t":now.to_rfc3339(),"session":session,
+                "agent":"claude-desktop","provider":"fixture","model":"m","status":200,
+                "in":2478,"out":27,"ms":2276}).to_string().as_bytes());
+        }
+        let helper = LiveRoute { id: 2, session: "helper".into(), agent: "claude-desktop".into(),
+            folder: "C:\\Temp\\ccd-session-secrets\\fork-fixture".into(), ..Default::default() };
+        assert!(desktop_auxiliary(&helper));
+        assert!(!desktop_auxiliary(&LiveRoute { folder: "project/fork-fixture".into(), ..helper.clone() }));
+        assert!(!desktop_auxiliary(&LiveRoute { agent: "codex".into(), ..helper.clone() }));
+        assert!(!desktop_auxiliary(&LiveRoute { subagent_id: "explicit-child".into(), ..helper.clone() }));
+        let mut live = LiveState::default();
+        live.update(TraceUpdate { pid: 1, seq: 1, ids: vec![2], routes: vec![helper] });
+        live.activity.active.push(Active { id: 1, route: 2, session: "helper".into(),
+            agent: "claude-desktop".into(), started: now.to_rfc3339(), ..Default::default() });
+        let mut view = ledger.snapshot("h", "ready", None);
+        let daily = view.daily.clone();
+        live.apply(&mut view);
+        assert_eq!(view.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec!["normal"]);
+        assert_eq!(view.daily, daily);
+        // trace 滚动淘汰、网关重启之后，不重新出现辅助完成卡。
+        live.update(TraceUpdate { pid: 2, seq: 0, ..Default::default() });
+        let mut view = ledger.snapshot("h", "ready", None);
+        live.apply(&mut view);
+        assert_eq!(view.sessions.len(), 1);
+        assert_eq!(view.sessions[0].id, "normal");
+        assert_eq!(view.daily.requests, 2);
+    }
+
+    /// 多层 via 保留顺序；同一模型也有直达候选时不能把深层路径当作已确定。
+    #[test]
+    fn nested_route_chain_preserves_order_and_common_prefix() {
+        let candidate = Candidate { id: "seat".into(), provider: "p".into(), model: "m".into(),
+            who: "fixture@example.com".into(), via: vec!["worker".into(), "group/gpt".into()] };
+        let attempt = Attempt { id: "seat".into(), model: "m".into(), picked: true, done: true, ..Default::default() };
+        let mut route = LiveRoute {
+            group: Some(RouteGroup { name: "自动".into(), subs: vec![
+                RouteSubgroup { id: "worker".into(), name: "干活".into(), ..Default::default() },
+                RouteSubgroup { id: "gpt".into(), reference: "group/gpt".into(), name: "GPT重置狂欢".into() },
+            ] }),
+            order: Some(vec![candidate.clone()]), tries: Some(vec![attempt.clone()]), ..Default::default()
+        };
+        assert_eq!(route_chain(&route, Some(&attempt), Some(&candidate)), vec!["自动", "干活", "GPT重置狂欢"]);
+        assert_eq!(trace_chain(&route), vec!["自动", "干活", "GPT重置狂欢"]);
+        route.order.as_mut().unwrap().push(Candidate { via: vec!["worker".into()], ..candidate.clone() });
+        assert_eq!(trace_chain(&route), vec!["自动", "干活"]);
+        // 截图中的实际形态：相同账号/模型还存在无 via 的直达候选。
+        route.order.as_mut().unwrap().push(Candidate { via: Vec::new(), ..candidate });
+        assert_eq!(trace_chain(&route), vec!["自动"]);
+        route.tries = None;
+        assert_eq!(trace_chain(&route), vec!["自动"]);
     }
 
     /// 活跃卡 updatedAt 取 start + 已用毫秒，按 UTC 毫秒精度输出。
