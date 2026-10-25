@@ -12,7 +12,18 @@
   }
 
   function capture(nodes, key) {
-    return new Map([...nodes].map(node => [key(node), { rect: node.getBoundingClientRect(), state: node.dataset.status, border: getComputedStyle(node).borderColor, clone: enabled() ? node.cloneNode(true) : null }]));
+    return new Map([...nodes].map(node => {
+      const style = getComputedStyle(node);
+      const movement = node.getAnimations().find(animation => animation.playState === 'running'
+        && animation.effect?.getKeyframes().some(frame => frame.transform !== undefined));
+      const rect = node.getBoundingClientRect();
+      const transform = new DOMMatrixReadOnly(style.transform === 'none' ? undefined : style.transform);
+      const motion = movement ? { frames: movement.effect.getKeyframes(), timing: movement.effect.getTiming(),
+        time: movement.currentTime, left: rect.left - transform.m41, top: rect.top - transform.m42 } : null;
+      return [key(node), { rect, state: node.dataset.status,
+        border: style.borderColor, opacity: Number(style.opacity), motion,
+        clone: enabled() ? node.cloneNode(true) : null }];
+    }));
   }
 
   function layout(before, nodes, key) {
@@ -26,7 +37,7 @@
       const rect = node.getBoundingClientRect();
       node.getAnimations().forEach(animation => animation.cancel());
       if (!previous) {
-        animate(node, [{ opacity: 0, transform: 'translateY(12px) scale(.985)' }, { opacity: 1, transform: 'none' }]);
+        animate(node, [{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }], 220);
         changed = true;
       } else {
         if (previous.state && previous.state !== node.dataset.status) {
@@ -36,8 +47,15 @@
         }
         const dx = previous.rect.left - rect.left;
         const dy = previous.rect.top - rect.top;
-        if (Math.abs(dx) > .5 || Math.abs(dy) > .5) {
-          animate(node, [{ transform: `translate(${dx}px,${dy}px)` }, { transform: 'none' }]);
+        const motion = previous.motion;
+        if (motion && Math.abs(motion.left - rect.left) < .5 && Math.abs(motion.top - rect.top) < .5) {
+          // 快照重建节点时接续原动画时间，避免每次刷新都重新缓入。
+          const continuation = node.animate(motion.frames, motion.timing);
+          continuation.currentTime = motion.time;
+          changed = true;
+        } else if (Math.abs(dx) > .5 || Math.abs(dy) > .5) {
+          animate(node, [{ opacity: previous.opacity, transform: `translate(${dx}px,${dy}px)` },
+            { opacity: 1, transform: 'none' }], 280);
           changed = true;
         }
       }
@@ -64,7 +82,7 @@
       } else layer.append(clone);
       document.getElementById('hud').append(layer);
       exits.add(layer);
-      const animation = animate(clone, [{ opacity: .65, transform: 'none' }, { opacity: 0, transform: 'translateY(-9px) scale(.985)' }], 180);
+      const animation = animate(clone, [{ opacity: previous.opacity, transform: 'none' }, { opacity: 0, transform: 'translateY(-4px)' }], 160);
       const remove = () => { layer.remove(); exits.delete(layer); };
       animation.onfinish = remove;
       animation.oncancel = remove;

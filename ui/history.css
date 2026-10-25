@@ -1,0 +1,41 @@
+/* 请求履历：单个固定浮层，避开卡片与路由滚动容器的裁剪。 */
+.route-history{position:fixed;z-index:60;width:720px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);display:flex;flex-direction:column;min-height:0;color:var(--ink);background:rgb(23 25 30/.97);border:1px solid rgb(190 192 205/.38);border-radius:7px;box-shadow:0 8px 28px rgb(0 0 0/.38);font-size:11px;line-height:16px;user-select:text;overflow:hidden}
+.history-heading{display:flex;align-items:center;gap:12px;padding:9px 11px 8px;border-bottom:1px solid var(--edge);flex-shrink:0;min-width:0}
+.history-identity{display:flex;flex-direction:column;min-width:0;gap:2px;flex:1}
+.history-identity strong{font-size:12px;line-height:17px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.history-subtitle{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px;line-height:14px}
+.history-controls{display:flex;gap:4px;align-items:center;flex-shrink:0}
+.route-history button{height:24px;padding:2px 6px;border:1px solid transparent;border-radius:3px;background:transparent;color:var(--muted);font:inherit;cursor:pointer;white-space:nowrap;user-select:none}
+.route-history button:hover,.route-history button[aria-pressed="true"]{background:var(--raised);border-color:var(--edge);color:var(--ink)}
+.history-controls button:last-child{font-size:18px;width:24px;padding:0}
+.history-message{flex-shrink:0;margin:0;padding:9px 11px;color:var(--muted);line-height:17px;overflow-wrap:anywhere}
+.history-message[data-error="true"]{color:var(--warning)}
+.history-viewport{min-height:0;overflow-x:hidden;overflow-y:auto;max-height:296px;scrollbar-width:thin;scrollbar-color:rgb(180 182 191/.35) transparent;overscroll-behavior:contain;outline-offset:-2px}
+.history-table{width:100%;min-width:0;border-collapse:separate;border-spacing:0;table-layout:fixed;font-size:11px;line-height:16px;font-variant-numeric:tabular-nums}
+.history-caption{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip-path:inset(50%)}
+.history-table th{position:sticky;top:0;z-index:1;color:var(--muted);background:var(--surface);font-size:10px;line-height:16px;font-weight:500;text-align:left;box-sizing:border-box;overflow:hidden;text-overflow:ellipsis;padding:5px 8px;border-bottom:1px solid var(--edge);white-space:nowrap}
+.history-table td{height:26px;padding:5px 8px;border-bottom:1px solid rgb(190 192 205/.08);vertical-align:middle;white-space:nowrap;overflow:hidden}
+.history-table tr:last-child td{border-bottom:0}
+.history-table tbody tr:hover{background:rgb(180 182 191/.06)}
+.history-table th:nth-child(1){width:24px}.history-table th:nth-child(2){width:calc((100% - 96px)*.12)}.history-table th:nth-child(3){width:calc((100% - 96px)*.23)}.history-table th:nth-child(4){width:calc((100% - 96px)*.17)}.history-table th:nth-child(5){width:calc((100% - 96px)*.19)}.history-table th:nth-child(6){width:72px}.history-table th:nth-child(7){width:calc((100% - 96px)*.11)}.history-table th:nth-child(8){width:calc((100% - 96px)*.08)}.history-table th:nth-child(9){width:calc((100% - 96px)*.10)}
+.history-table td.history-outcome .history-cell{overflow:visible}
+.history-expand{padding:0;text-align:center}
+.history-expand-button{width:20px;height:20px;padding:0;font-size:10px;line-height:20px}
+.history-count{margin-left:4px;color:var(--muted);font-size:10px}
+.history-table tr[data-foldable="true"]{cursor:default}
+.history-table tr[data-child-of] td{background:rgb(180 182 191/.04)}
+.history-table tr[data-child-of] .history-time{padding-left:2px}
+.history-cell{display:inline-block;max-width:100%;vertical-align:middle;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.history-table th,.history-table td,.history-table .history-number{text-align:center}
+.history-time{color:var(--muted)}
+.history-effort .effort{display:inline-block;max-width:none;overflow:visible;vertical-align:middle;text-align:center}
+.history-table tr[data-outcome="success"] .history-outcome{color:var(--completed)}
+.history-table tr[data-outcome="failed"] .history-outcome{color:var(--failed)}
+.history-table tr[data-outcome="running"] .history-outcome{color:var(--running)}
+.history-table tr[data-outcome="waiting"] .history-outcome{color:var(--warning)}
+.history-table tr[data-outcome="cancelled"] .history-outcome,.history-table tr[data-outcome="unknown"] .history-outcome,.history-table tr[data-outcome="awaiting_usage"] .history-outcome{color:var(--muted)}
+.history-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;border-top:1px solid var(--edge);color:var(--muted);font-size:10px;line-height:15px;flex-shrink:0;min-width:0}
+.history-coverage{min-width:0;overflow-wrap:anywhere}
+.history-footer button{font-size:10px;padding:0 4px;height:22px}
+@media(max-height:320px){.history-heading{padding-block:5px}.history-subtitle{display:none}.history-footer{padding-block:3px}.history-message{padding-block:5px}}
+@media(forced-colors:active){.route-history,.history-table td,.history-table th{border-color:CanvasText}.route-history{background:Canvas}.history-table th{background:Canvas}}

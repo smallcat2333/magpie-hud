@@ -9,5 +9,6 @@
 /.codex_tmp/
 /.playwright-mcp/
 /.claude/launch.json
+.idea/
 __pycache__/
 *.py[cod]

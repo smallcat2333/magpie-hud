@@ -52,6 +52,60 @@ pub struct LiveRoute {
     pub order: Option<Vec<Candidate>>,
     #[serde(default)]
     pub tries: Option<Vec<Attempt>>,
+    /// 请求开始时间（Route.Time）；履历用它把 trace 与日志行按时间对齐。
+    #[serde(default)]
+    pub time: Option<String>,
+    /// 路由终态 HTTP 状态；done 但无状态不能推断成功。
+    #[serde(default)]
+    pub status: Option<i64>,
+    /// 响应报告模型（Route.Served）；与请求发送模型分开，不互相冒充。
+    #[serde(default)]
+    pub served: String,
+    /// 组规则判定的白名单摘要；when 表达式等其余字段不接收。
+    #[serde(default)]
+    pub rule: Option<TraceRule>,
+}
+
+/// 规则判定摘要：规则目标（use）、判定强度（pick）与本轮命中的意图（classified.intent）。
+/// turn 是该请求所在用户输入（轮）的序号；
+/// held=true 表示本请求是该轮开始后追加的后续请求，沿用轮初判定、自身不触发分类；
+/// grown=true 表示同一轮内因上下文超出模型容量而重新判定，仍属同一输入；
+/// waits=true 也是同轮续行，只是网关未持有该轮初判定（或规则已变更）；
+/// compact 表示请求体被识别为 Agent 自身的会话压缩，不属于任何用户输入。
+/// 上游仅对配置了规则的组给出 rule，普通单账号路由没有 turn 可言。
+#[derive(Clone, Default, Deserialize)]
+pub struct TraceRule {
+    #[serde(default, rename = "use")]
+    pub use_target: String,
+    #[serde(default, rename = "pick")]
+    pub pick: String,
+    #[serde(default)]
+    pub turn: Option<i64>,
+    #[serde(default)]
+    pub held: bool,
+    #[serde(default)]
+    pub waits: bool,
+    #[serde(default)]
+    pub grown: bool,
+    #[serde(default)]
+    pub compact: bool,
+    #[serde(default)]
+    pub classified: TraceClassified,
+}
+
+/// 意图分类结果；只取本轮命中的意图与置信度，不导出候选清单。
+/// after 是分类器被告知的上一轮意图：本轮意图为空时可作沿用线索。
+/// fallback=previous 表示分类失败沿用了上一轮意图，展示时应标注非本轮实测。
+#[derive(Clone, Default, Deserialize)]
+pub struct TraceClassified {
+    #[serde(default)]
+    pub intent: String,
+    #[serde(default)]
+    pub after: String,
+    #[serde(default)]
+    pub sure: Option<f64>,
+    #[serde(default)]
+    pub fallback: String,
 }
 
 /// 组链信息只保留组名与直接子组，不读取成员账号或规则。
@@ -103,13 +157,17 @@ pub struct Attempt {
     pub effort: String,
     #[serde(default)]
     pub fixed: String,
-    /// 该尝试被最终选中；用于已结束 trace 在没有 active 时定位实际路径。
+    /// 上游语义：Effort 是本轮判定的强度选择（代替 Agent 原始强度），
+    /// 不表示该尝试最终胜出；胜出证据以终态尝试与日志交叉核对为准。
     #[serde(default)]
     pub picked: bool,
     #[serde(default)]
     pub done: bool,
     #[serde(default, rename = "firstText")]
     pub first_text: Option<u64>,
+    /// 响应报告模型；与发送模型分开。
+    #[serde(default)]
+    pub served: String,
 }
 
 /// concurrency 完整快照，空列表表示当前没有请求。
@@ -139,6 +197,28 @@ pub struct Active {
     pub route: i64,
 }
 
+/// 履历折叠所需的轮次元数据；按 route_id 累积，trace 淘汰后仍可把日志行归到输入组。
+/// time_ms 保留请求开始时间：网关重启会复用 route_id，只有 id 不够判定同一请求。
+#[derive(Clone, Debug)]
+pub struct TurnRecord {
+    pub session: String,
+    /// 子 Agent ID；根请求为空。轮次序号按各自会话线独立计数。
+    pub subagent: String,
+    pub turn: i64,
+    /// 该轮开始后追加的后续请求，沿用轮初判定。
+    pub held: bool,
+    pub intent: String,
+    pub after: String,
+    pub sure: Option<f64>,
+    /// 上游 fallback 标记；previous 表示意图是沿用上一轮而非本轮实测。
+    pub fallback: String,
+    /// 请求开始时间（本地毫秒），与日志 t 对齐用。
+    pub time_ms: i64,
+}
+
+/// 累积的轮次索引上限；超出后按 route_id 递增顺序淘汰最旧条目。
+const TURN_HISTORY_CAP: usize = 8192;
+
 /// 实时状态与已完成用量独立；失联后清空活跃态并显示提示，避免动画永远运行。
 #[derive(Default)]
 pub struct LiveState {
@@ -147,6 +227,8 @@ pub struct LiveState {
     routes: BTreeMap<i64, LiveRoute>,
     /// trace 淘汰后仍记住已确认的辅助会话，避免完成卡再次出现。
     auxiliary_sessions: HashSet<String>,
+    /// 按输入折叠履历所需的轮次元数据；网关重启清空（route_id 空间随之重置）。
+    turn_history: BTreeMap<i64, TurnRecord>,
     pub activity: Activity,
     pub names: HashMap<String, String>,
     /// 同一 Desktop 会话的历史 CLI ID 映射到当前规范 ID；只来自标题元数据里的显式关联。
@@ -162,6 +244,7 @@ impl LiveState {
     pub fn update(&mut self, update: TraceUpdate) {
         if self.pid != update.pid || update.seq < self.seq {
             self.routes.clear();
+            self.turn_history.clear();
         }
         self.pid = update.pid;
         self.seq = update.seq;
@@ -171,8 +254,40 @@ impl LiveState {
             if desktop_auxiliary(&route) && !route.session.is_empty() {
                 self.auxiliary_sessions.insert(route.session.clone());
             }
+            self.remember_turn(&route);
             self.routes.insert(route.id, route);
         }
+        while self.turn_history.len() > TURN_HISTORY_CAP {
+            self.turn_history.pop_first();
+        }
+    }
+
+    /// 记录用户输入（轮）内的请求序号；标题生成/压缩等辅助调用自成一个合成轮，
+    /// 与真实输入无关，不参与折叠，否则会把标题行并进用户输入组。
+    fn remember_turn(&mut self, route: &LiveRoute) {
+        if !route.kind.is_empty() || desktop_auxiliary(route) {
+            return;
+        }
+        let Some(rule) = route.rule.as_ref() else { return };
+        if rule.compact {
+            return;
+        }
+        let Some(turn) = rule.turn else { return };
+        let time_ms = route.time.as_deref()
+            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+            .map(|time| time.timestamp_millis())
+            .unwrap_or_default();
+        self.turn_history.insert(route.id, TurnRecord {
+            session: route.session.clone(),
+            subagent: route.subagent_id.trim().to_owned(),
+            turn,
+            held: rule.held || rule.grown || rule.waits,
+            intent: rule.classified.intent.trim().to_owned(),
+            after: rule.classified.after.trim().to_owned(),
+            sure: rule.classified.sure,
+            fallback: rule.classified.fallback.trim().to_owned(),
+            time_ms,
+        });
     }
 
     /// 用活跃请求覆盖展示，不改账本中的次数、费用与当日 Token。
@@ -287,6 +402,7 @@ impl LiveState {
                 } };
             let card = RouteCard {
                 id: format!("live-{}-{}", self.pid, active.id), session_id: session_id.into(),
+                history_session: route.filter(|r| r.session != session_id).map(|r| r.session.clone()),
                 session_label: label.clone(), account: account.into(), model: model.into(), provider: provider.into(),
                 effort: effort.into(), state: phase.into(), detail: detail.into(), error: None, time,
                 current: true, route_id: (active.route > 0).then_some(active.route),
@@ -496,6 +612,154 @@ impl LiveState {
             .cloned()
             .filter(|label| !label.is_empty())
             .unwrap_or_else(|| fallback_child_label(child))
+    }
+}
+
+/// 履历查询的实时请求摘要；只有 trace 已确认会话/子身份的请求才会出现。
+#[derive(Clone, Debug)]
+pub struct LiveHistoryRoute {
+    pub route_id: i64,
+    /// trace 侧的原始会话 ID。
+    pub session: String,
+    /// 子 Agent ID；根请求为空。
+    pub subagent: String,
+    /// trace 的请求开始时间；不可解析时为 None，合并时无法与日志对齐。
+    pub started_ms: Option<i64>,
+    /// 终态尝试的发送模型与强度。
+    pub model: String,
+    pub effort: String,
+    /// 候选归属的账号与供应商；无法唯一认领时为空。
+    pub account: String,
+    pub provider: String,
+    /// 响应报告模型（终态尝试优先，回退路由级）。
+    pub served: String,
+    /// 已确认的组链；复用 route_chain 的歧义处理，不拼候选全集。
+    pub route_groups: Vec<String>,
+    pub rule_target: Option<String>,
+    pub rule_effort: Option<String>,
+    /// 本轮命中的意图摘要与置信度；仅实时 trace 保留期内可用。
+    pub rule_intent: Option<String>,
+    pub rule_sure: Option<f64>,
+    /// trace 记录的终态 HTTP 状态；与日志状态冲突说明不是同一请求。
+    pub status: Option<i64>,
+    /// running / waiting / awaiting_usage（done 但日志未到）。
+    pub phase: &'static str,
+    /// 只有近期的 done trace 才在日志未到时单独成行；更早的只用于补全已匹配日志行。
+    pub eligible_overlay: bool,
+}
+
+/// 履历查询的会话范围：根查询给显式别名家族，子查询精确到原始父会话＋子 ID。
+#[derive(Debug)]
+pub struct HistoryScope {
+    /// 日志按原始会话 ID 匹配的集合（查询 ID 与其显式别名双向闭包）。
+    pub family: HashSet<String>,
+    pub routes: Vec<LiveHistoryRoute>,
+    /// 当前范围内的轮次索引（route_id → 输入序号等）；trace 淘汰后仍可折叠日志行。
+    pub turns: HashMap<i64, TurnRecord>,
+}
+
+/// done 的 trace 若一直等不到 usage 记录，只保留最近 10 分钟，避免永久挂起。
+const HISTORY_SETTLE_MS: i64 = 10 * 60_000;
+
+impl LiveState {
+    /// 按需提取履历的实时部分；不克隆整个 routes，也不把未确认身份的请求当根请求。
+    pub fn history_scope(&self, session: &str, subagent: Option<&str>) -> HistoryScope {
+        // 显式别名家族：历史 CLI ID → 当前规范 ID，双向闭包；同名标题不建立关联。
+        let canonical = self.aliases.get(session).cloned();
+        let mut family = HashSet::new();
+        family.insert(session.to_owned());
+        if let Some(canonical) = &canonical {
+            family.insert(canonical.clone());
+        }
+        for (history_id, target) in &self.aliases {
+            if target == session || Some(target) == canonical.as_ref() {
+                family.insert(history_id.clone());
+            }
+        }
+        let now_ms = Local::now().timestamp_millis();
+        let mut routes = Vec::new();
+        for route in self.routes.values() {
+            if route.kind == "routing" || desktop_auxiliary(route) {
+                continue;
+            }
+            let child = route.subagent_id.trim();
+            match subagent {
+                // 子履历严格按原始父会话 ID 匹配，不把别名家族里其它会话的子请求搬过来。
+                Some(wanted) if route.session != session || child != wanted => continue,
+                // 根履历覆盖显式别名家族，并排除子请求。
+                None if !family.contains(&route.session) || !child.is_empty() => continue,
+                _ => {}
+            }
+            if route.session.is_empty() {
+                continue;
+            }
+            let started_ms = route.time.as_deref()
+                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                .map(|time| time.timestamp_millis());
+            // done 的 trace 始终保留，供已匹配的日志行补组链与规则；
+            // 只有近期的才在日志未到时单独成行，避免陈旧 trace 永久挂起。
+            let terminal = route.tries.as_deref().unwrap_or_default().last();
+            let candidate = terminal.and_then(|attempt| selected_candidate(route, attempt));
+            let activity = self.activity.active.iter().find(|active| active.route == route.id
+                && (active.session.is_empty() || active.session == route.session));
+            let eligible_overlay = if route.done {
+                started_ms.is_some_and(|start| now_ms.saturating_sub(start) <= HISTORY_SETTLE_MS)
+            } else {
+                activity.is_some()
+            };
+            routes.push(LiveHistoryRoute {
+                route_id: route.id,
+                session: route.session.clone(),
+                subagent: child.to_owned(),
+                started_ms,
+                model: terminal.map(|attempt| attempt.model.as_str()).filter(|m| !m.is_empty()).unwrap_or_default().to_owned(),
+                effort: terminal.map(|attempt| attempt.effort.as_str()).filter(|e| !e.is_empty()).unwrap_or_default().to_owned(),
+                account: candidate.map(|c| c.who.as_str()).filter(|w| !w.is_empty()).unwrap_or_default().to_owned(),
+                provider: candidate.map(|c| c.provider.as_str()).unwrap_or_default().to_owned(),
+                served: terminal.map(|a| a.served.as_str()).filter(|s| !s.is_empty()).unwrap_or(route.served.as_str()).to_owned(),
+                route_groups: route_chain(route, terminal, candidate),
+                rule_target: route.rule.as_ref().map(|rule| rule.use_target.as_str()).filter(|t| !t.is_empty()).map(str::to_owned),
+                rule_effort: route.rule.as_ref().map(|rule| rule.pick.as_str()).filter(|p| !p.is_empty()).map(str::to_owned),
+                rule_intent: route.rule.as_ref().map(|rule| rule.classified.intent.as_str()).filter(|i| !i.is_empty()).map(str::to_owned),
+                rule_sure: route.rule.as_ref().and_then(|rule| rule.classified.sure),
+                status: route.status,
+                phase: history_phase(route, activity),
+                eligible_overlay,
+            });
+        }
+        routes.sort_by(|a, b| b.route_id.cmp(&a.route_id));
+        // 轮次索引按同一范围规则过滤：根查询覆盖别名家族的根请求，子查询精确到该子线。
+        let turns = self
+            .turn_history
+            .iter()
+            .filter(|(_, record)| match subagent {
+                Some(wanted) => {
+                    record.session == session && record.subagent == wanted
+                }
+                None => family.contains(&record.session) && record.subagent.is_empty(),
+            })
+            .map(|(id, record)| (*id, record.clone()))
+            .collect();
+        HistoryScope { family, routes, turns }
+    }
+}
+
+/// 履历实时行的阶段：done=等待用量；其余按 concurrency 相同口径区分等待与运行。
+fn history_phase(route: &LiveRoute, activity: Option<&Active>) -> &'static str {
+    if route.done {
+        return "awaiting_usage";
+    }
+    let Some(active) = activity else { return "running"; };
+    let attempt = route.tries.as_deref().unwrap_or_default().last();
+    let retrying = attempt.is_some_and(|attempt| attempt.done);
+    let first_seen = route.first_text.is_some()
+        || attempt.is_some_and(|attempt| attempt.first_text.is_some());
+    let slow_first =
+        active.phase == "upstream" && active.ms >= FIRST_RESPONSE_WAIT_MS && !first_seen;
+    if retrying || slow_first || matches!(active.phase.as_str(), "slot" | "rpm") {
+        "waiting"
+    } else {
+        "running"
     }
 }
 
@@ -1858,5 +2122,198 @@ mod tests {
         assert_eq!(card.time.len(), 8);
         // 无子组信息时组链为空，不用模型名填充。
         assert!(card.route_groups.is_empty());
+    }
+
+    /// 规则白名单只取 use/pick；when 表达式与其余字段不进入结构，时间/状态/响应模型可用。
+    #[test]
+    fn history_whitelist_keeps_rule_summary_and_terminal_fields() {
+        let now = Local::now();
+        let payload = serde_json::json!({
+            "id": 31, "seq": 1, "time": now.to_rfc3339(), "session": "alpha", "agent": "test",
+            "model": "gpt-test", "provider": "codex", "status": 200, "served": "served-x", "done": true,
+            "rule": {"n": 2, "use": "group/worker", "when": ["tokens > 1000"], "held": true, "pick": "xhigh", "future": [1]},
+            "tries": [{"id": "seat", "model": "gpt-test", "effort": "high", "start": now.to_rfc3339(),
+                        "done": true, "status": 200, "served": "served-try", "firstText": 400}]
+        });
+        let route: LiveRoute = serde_json::from_value(payload).unwrap();
+        let rule = route.rule.as_ref().unwrap();
+        assert_eq!(rule.use_target, "group/worker");
+        assert_eq!(rule.pick, "xhigh");
+        assert_eq!(route.status, Some(200));
+        assert_eq!(route.served, "served-x");
+        let attempt = route.tries.as_deref().unwrap().last().unwrap();
+        assert_eq!(attempt.served, "served-try");
+        // 终态尝试的响应模型优先于路由级。
+        let mut live = LiveState::default();
+        live.routes.insert(31, route);
+        let scope = live.history_scope("alpha", None);
+        assert_eq!(scope.routes.len(), 1);
+        let summary = &scope.routes[0];
+        assert_eq!(summary.served, "served-try");
+        assert_eq!(summary.phase, "awaiting_usage");
+        assert_eq!(summary.rule_target.as_deref(), Some("group/worker"));
+        assert_eq!(summary.rule_effort.as_deref(), Some("xhigh"));
+    }
+
+    /// 履历范围：显式别名家族双向闭包、子身份精确匹配、分类器/辅助/过期 done 剔除、阶段口径。
+    #[test]
+    fn history_scope_filters_family_child_and_phase() {
+        let now = Local::now();
+        let mut live = LiveState::default();
+        live.aliases.insert("h1".into(), "cur".into());
+        live.aliases.insert("h2".into(), "cur".into());
+        live.aliases.insert("other".into(), "nope".into());
+        let rfc = |ms_ago: i64| (now - chrono::Duration::milliseconds(ms_ago)).to_rfc3339();
+        let base = |id: i64, session: &str| LiveRoute {
+            id, session: session.into(), time: Some(rfc(1_000)),
+            tries: Some(vec![Attempt { id: "seat".into(), model: "gpt-test".into(),
+                ..Attempt::default() }]),
+            ..LiveRoute::default()
+        };
+        // 当前规范 ID 的运行请求：上游阶段 → running。
+        live.routes.insert(1, base(1, "cur"));
+        live.activity.active.push(Active { id: 11, session: "cur".into(), agent: "test".into(),
+            started: rfc(1_000), ms: 2_000, phase: "upstream".into(), route: 1, ..Active::default() });
+        // 历史别名的子请求：只有精确 (家族, 子ID) 查询可见。
+        let mut child = base(2, "h1");
+        child.subagent_id = "c1".into();
+        live.routes.insert(2, child);
+        // 分类器调用不进履历。
+        let mut routing = base(3, "cur");
+        routing.kind = "routing".into();
+        live.routes.insert(3, routing);
+        // Desktop 临时辅助 fork 不进履历。
+        let mut auxiliary = base(4, "aux-s");
+        auxiliary.agent = "claude-desktop".into();
+        auxiliary.folder = "C:/x/ccd-session-secrets/fork-1".into();
+        live.routes.insert(4, auxiliary);
+        // 等待并发空位 → waiting。
+        live.routes.insert(5, base(5, "h2"));
+        live.activity.active.push(Active { id: 15, session: "h2".into(), agent: "test".into(),
+            started: rfc(1_000), ms: 100, phase: "slot".into(), route: 5, ..Active::default() });
+        // done 但日志迟迟未到：超过 10 分钟不再挂起。
+        let mut stale = base(6, "cur");
+        stale.done = true;
+        stale.time = Some(rfc(11 * 60_000));
+        live.routes.insert(6, stale);
+        // done 且仍在窗口内 → awaiting_usage。
+        let mut settling = base(7, "cur");
+        settling.done = true;
+        settling.time = Some(rfc(5 * 60_000));
+        live.routes.insert(7, settling);
+        // 无 trace 的活跃请求不能先当根请求；与其它会话的请求不串。
+        live.activity.active.push(Active { id: 18, session: "stranger".into(), agent: "test".into(),
+            started: rfc(1_000), ms: 100, phase: "upstream".into(), route: 99, ..Active::default() });
+
+        let scope = live.history_scope("h1", None);
+        assert_eq!(scope.family, ["h1", "cur", "h2"].iter().map(|id| id.to_string()).collect::<std::collections::HashSet<_>>());
+        let root_ids: Vec<i64> = scope.routes.iter().map(|route| route.route_id).collect();
+        // done 的 trace 始终保留用于补全日志行；6 号只是不再单独成行。
+        assert_eq!(root_ids, vec![7, 6, 5, 1], "根履历只含家族内的根请求，剔除子/分类器/辅助");
+        assert_eq!(scope.routes.iter().find(|r| r.route_id == 7).unwrap().phase, "awaiting_usage");
+        assert!(scope.routes.iter().find(|r| r.route_id == 7).unwrap().eligible_overlay);
+        assert!(!scope.routes.iter().find(|r| r.route_id == 6).unwrap().eligible_overlay);
+        assert_eq!(scope.routes.iter().find(|r| r.route_id == 1).unwrap().phase, "running");
+
+        // 子请求只归属原始父会话 h1，规范 ID 查不到它。
+        let child_scope = live.history_scope("h1", Some("c1"));
+        assert_eq!(child_scope.routes.len(), 1);
+        assert_eq!(child_scope.routes[0].subagent, "c1");
+        assert_eq!(child_scope.routes[0].route_id, 2);
+        assert!(!child_scope.routes[0].eligible_overlay, "无活跃证据的 trace 不生成运行行");
+        assert!(live.history_scope("cur", Some("c1")).routes.is_empty());
+
+        let waiting = live.history_scope("h2", None);
+        assert_eq!(waiting.routes.iter().find(|route| route.route_id == 5).unwrap().phase, "waiting");
+    }
+
+    /// 轮次累积：只记带 turn 的真实输入请求，范围过滤与网关重启清理同 routes 口径。
+    #[test]
+    fn turn_history_accumulates_filters_and_clears() {
+        let now = Local::now();
+        let mut live = LiveState::default();
+        let route = |id: i64, session: &str, sub: &str, kind: &str, turn: Option<i64>| LiveRoute {
+            id, session: session.into(), subagent_id: sub.into(), kind: kind.into(),
+            time: Some(now.to_rfc3339()),
+            rule: Some(TraceRule { turn, ..TraceRule::default() }),
+            ..LiveRoute::default()
+        };
+        live.update(TraceUpdate {
+            seq: 1,
+            pid: 7,
+            ids: vec![1, 2, 3, 4, 5],
+            routes: vec![
+                route(1, "s1", "", "", Some(3)),
+                // 标题生成自成一个合成轮，不属于用户输入，不参与折叠。
+                route(2, "s1", "", "title_generation", Some(1)),
+                // 子 Agent 线独立计数，只在子查询里可见。
+                route(3, "s1", "c1", "", Some(1)),
+                // 其它会话的轮次不进 s1 的履历。
+                route(4, "s2", "", "", Some(1)),
+                // 无 turn 的请求（非规则组）不记。
+                route(5, "s1", "", "", None),
+            ],
+        });
+        let root = live.history_scope("s1", None);
+        assert_eq!(root.turns.len(), 1);
+        assert_eq!(root.turns[&1].turn, 3);
+        assert_eq!(root.turns[&1].time_ms, now.timestamp_millis());
+        let child = live.history_scope("s1", Some("c1"));
+        assert_eq!(child.turns.len(), 1);
+        assert_eq!(child.turns[&3].turn, 1);
+        assert!(live.history_scope("s2", None).turns.iter().all(|(id, _)| *id != 1));
+
+        // 网关重启（pid 变化）清空累积，route_id 空间随之重置。
+        live.update(TraceUpdate { seq: 1, pid: 8, ids: vec![], routes: vec![] });
+        assert!(live.history_scope("s1", None).turns.is_empty());
+    }
+
+    /// 网关没有轮初判定的 waits 也是同轮续行，不能因缺少 held 就开新组。
+    #[test]
+    fn turn_history_recognizes_waits_and_grown_continuations() {
+        let mut live = LiveState::default();
+        let rules = [
+            serde_json::json!({"turn": 1}),
+            serde_json::json!({"turn": 1, "held": true}),
+            serde_json::json!({"turn": 1, "waits": true}),
+            serde_json::json!({"turn": 1, "grown": true}),
+            serde_json::json!({"turn": 1, "compact": true, "waits": true}),
+        ];
+        let routes: Vec<LiveRoute> = rules.into_iter().enumerate().map(|(index, rule)| {
+            serde_json::from_value(serde_json::json!({
+                "id": index + 1, "session": "s1",
+                "time": "2026-10-25T12:00:00+08:00", "rule": rule,
+            })).unwrap()
+        }).collect();
+        live.update(TraceUpdate { pid: 7, seq: 1, ids: vec![1, 2, 3, 4, 5], routes });
+        let scope = live.history_scope("s1", None);
+        assert_eq!(scope.turns.len(), 4, "压缩调用仍不参与折叠");
+        assert!(!scope.turns[&1].held, "无续行标记的请求是开口");
+        for id in [2, 3, 4] {
+            assert!(scope.turns[&id].held, "held、waits、grown 均是同轮续行");
+        }
+    }
+
+    /// 轮次索引有界：超出上限后最旧的条目被淘汰，不会无限增长。
+    #[test]
+    fn turn_history_evicts_oldest_beyond_cap() {
+        let now = Local::now();
+        let mut live = LiveState::default();
+        for batch in 0..=(TURN_HISTORY_CAP / 500) {
+            let routes: Vec<LiveRoute> = (0..500)
+                .map(|index| LiveRoute {
+                    id: (batch * 500 + index) as i64 + 1,
+                    session: "s1".into(),
+                    time: Some(now.to_rfc3339()),
+                    rule: Some(TraceRule { turn: Some(1), ..TraceRule::default() }),
+                    ..LiveRoute::default()
+                })
+                .collect();
+            let ids: Vec<i64> = routes.iter().map(|route| route.id).collect();
+            live.update(TraceUpdate { seq: 1, pid: 7, ids, routes });
+        }
+        assert_eq!(live.turn_history.len(), TURN_HISTORY_CAP);
+        assert!(!live.turn_history.contains_key(&1), "最旧条目已淘汰");
+        assert!(live.turn_history.contains_key(&(live.turn_history.len() as i64)));
     }
 }

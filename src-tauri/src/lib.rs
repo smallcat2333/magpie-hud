@@ -3,6 +3,7 @@
 mod backdrop;
 mod config;
 mod details;
+mod history;
 mod hourly;
 mod live;
 mod placement;
@@ -186,6 +187,7 @@ pub fn run() {
             open_usage_details,
             usage_details_context,
             query_usage_details,
+            query_route_history,
             set_pinned,
             reset_window_position,
             hide_window,
@@ -547,6 +549,34 @@ async fn query_usage_details(app: AppHandle, start: String, end: String, filters
     };
     tauri::async_runtime::spawn_blocking(move || details::query(&path, &host, &start, &end, &filters.unwrap_or_default()))
         .await.map_err(|e| format!("详情查询任务失败：{e}"))?
+}
+
+/// 按需查询一个会话（或其某个子 Agent）的近期请求履历；只接收身份与条数，
+/// 路径由配置解析，不触发费用、额度或快照克隆。
+#[tauri::command]
+async fn query_route_history(
+    app: AppHandle,
+    session: String,
+    subagent: Option<String>,
+    limit: Option<usize>,
+) -> Result<history::RouteHistoryData, String> {
+    let subagent = subagent.filter(|id| !id.trim().is_empty());
+    if session.trim().is_empty() {
+        return Err("缺少会话身份".into());
+    }
+    let limit = limit.unwrap_or(history::DEFAULT_LIMIT).clamp(1, history::MAX_LIMIT);
+    let (path, scope, today) = {
+        let state = app.state::<Arc<Mutex<Runtime>>>();
+        let runtime = state.lock().map_err(|_| "状态锁损坏")?;
+        (
+            usage_path(&runtime.config),
+            runtime.live.history_scope(&session, subagent.as_deref()),
+            Local::now().date_naive(),
+        )
+    };
+    tauri::async_runtime::spawn_blocking(move || history::query(&path, &session, subagent.as_deref(), limit, scope, today))
+        .await
+        .map_err(|e| format!("履历查询任务失败：{e}"))?
 }
 
 /// 查询指定本地日期的六项统计与 24 小时趋势；历史日期走只读缓存轨，不干扰当日实时账本。

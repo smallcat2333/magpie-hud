@@ -213,6 +213,10 @@ pub struct RouteCard {
     pub id: String,
     pub session_id: String,
     pub session_label: String,
+    /// 履历查询用的原始会话 ID。完成卡与展示 ID 相同（省略）；实时卡在
+    /// trace 原始会话与展示会话不同时给出，避免别名归并后丢掉请求归属。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_session: Option<String>,
     pub account: String,
     pub model: String,
     pub provider: String,
@@ -421,20 +425,7 @@ impl UsageLedger {
         if record_day < self.day || record_day > self.end_day {
             return;
         }
-        let identity = format!(
-            "{}|{}|{}|{}|{}",
-            value
-                .get("route_id")
-                .map(Value::to_string)
-                .unwrap_or_default(),
-            timestamp.timestamp_millis(),
-            string(&value, "providerAccount").unwrap_or(""),
-            value
-                .get("status")
-                .map(Value::to_string)
-                .unwrap_or_default(),
-            string(&value, "rid").unwrap_or("")
-        );
+        let identity = record_identity(&value, timestamp.timestamp_millis());
         if !self.seen.insert(identity.clone()) {
             return;
         }
@@ -550,6 +541,7 @@ impl UsageLedger {
                     id: record.identity.clone(),
                     session_id: session.into(),
                     session_label: label.clone(),
+                    history_session: None,
                     account: record.account.clone(),
                     model: record.model.clone(),
                     provider: record.provider.clone(),
@@ -963,6 +955,117 @@ fn finite_number(value: &Value, key: &str) -> Option<f64> {
         .get(key)
         .and_then(Value::as_f64)
         .filter(|n| n.is_finite() && *n >= 0.0)
+}
+
+/// 精确请求身份：route_id | 时间戳毫秒 | 原始账号 | 状态 | rid。
+/// 当日账本与按需履历查询共用同一口径去重，避免两处判定不一致。
+fn record_identity(value: &Value, timestamp_ms: i64) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        value
+            .get("route_id")
+            .map(Value::to_string)
+            .unwrap_or_default(),
+        timestamp_ms,
+        string(value, "providerAccount").unwrap_or(""),
+        value
+            .get("status")
+            .map(Value::to_string)
+            .unwrap_or_default(),
+        string(value, "rid").unwrap_or("")
+    )
+}
+
+/// 履历查询的单行解析结果。与账本记录不同，计数保留“未记录”与真实 0 的区别，
+/// 并单独保留响应报告模型与 handed_on 中间尝试标记。
+#[derive(Clone, Debug)]
+pub(crate) struct RawHistoryRecord {
+    pub identity: String,
+    pub route_id: Option<i64>,
+    pub session: String,
+    pub subagent: String,
+    pub timestamp_ms: i64,
+    /// 请求开始时间的本地日期，用于自然日窗口过滤。
+    pub day: NaiveDate,
+    /// 日志 model 字段（发送模型）；响应报告模型单独见 served。
+    pub model: String,
+    pub served: Option<String>,
+    pub provider: String,
+    pub account: String,
+    pub effort: String,
+    pub status: Option<u16>,
+    pub tries: u64,
+    /// 失败后转交下一尝试的计费行；不是请求的最终结果，不作为独立请求展示。
+    pub handed_on: bool,
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+    pub cache_read: Option<u64>,
+    pub duration_ms: Option<f64>,
+    pub ttft_ms: Option<f64>,
+}
+
+/// 履历单行解析结果：坏行计入提示，分类器调用与无会话身份按账本口径忽略。
+#[derive(Clone, Debug)]
+pub(crate) enum ParsedHistoryLine {
+    Malformed,
+    Ignored,
+    Record(RawHistoryRecord),
+}
+
+/// 与账本同一 JSON 契约的窄解析；仅供按需履历查询复用，不改变当日聚合口径。
+pub(crate) fn parse_history_line(line: &[u8]) -> ParsedHistoryLine {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return ParsedHistoryLine::Ignored;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(line) else {
+        return ParsedHistoryLine::Malformed;
+    };
+    if !value.is_object() {
+        return ParsedHistoryLine::Malformed;
+    }
+    if value.get("kind").and_then(Value::as_str) == Some("routing") {
+        return ParsedHistoryLine::Ignored;
+    }
+    // 无会话身份的记录无法准确归属会话，与账本一致直接忽略。
+    let session = string(&value, "session").unwrap_or("");
+    if session.is_empty() {
+        return ParsedHistoryLine::Ignored;
+    }
+    let Some(timestamp) = string(&value, "t").and_then(|text| DateTime::parse_from_rfc3339(text).ok()) else {
+        return ParsedHistoryLine::Malformed;
+    };
+    let count = |key: &str| value.get(key).and_then(Value::as_u64);
+    ParsedHistoryLine::Record(RawHistoryRecord {
+        identity: record_identity(&value, timestamp.timestamp_millis()),
+        route_id: value.get("route_id").and_then(Value::as_i64),
+        session: session.into(),
+        subagent: string(&value, "subagent").unwrap_or("").into(),
+        timestamp_ms: timestamp.timestamp_millis(),
+        day: timestamp.with_timezone(&Local).date_naive(),
+        model: string(&value, "model").unwrap_or("").into(),
+        served: string(&value, "served").map(str::to_owned),
+        provider: string(&value, "provider").unwrap_or("").into(),
+        account: string(&value, "providerAccount")
+            .filter(|s| !s.is_empty())
+            .or_else(|| string(&value, "host"))
+            .unwrap_or("账号未提供")
+            .into(),
+        effort: string(&value, "effort").unwrap_or("").into(),
+        status: value
+            .get("status")
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok()),
+        tries: count("tries").unwrap_or(1).max(1),
+        handed_on: value
+            .get("handed_on")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        input: count("in"),
+        output: count("out"),
+        cache_read: count("cache_read"),
+        duration_ms: finite_number(&value, "ms"),
+        ttft_ms: finite_number(&value, "ttft_ms"),
+    })
 }
 
 #[cfg(test)]
@@ -1654,5 +1757,36 @@ mod tests {
         let end = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
         let error = scan_month_usage(&missing, start, end).unwrap_err();
         assert!(error.contains("未找到"));
+    }
+
+    /// 履历窄解析与账本使用同一精确身份去重，并保留 served 与 handed_on 语义。
+    #[test]
+    fn history_parse_shares_ledger_identity() {
+        let now = Local::now();
+        let row = json!({"route_id":9,"t":now.to_rfc3339(),"session":"s","providerAccount":"a@b.c",
+            "status":200,"rid":"r1","model":"m","served":"s9","in":1,"out":2});
+        let bytes = row.to_string().into_bytes();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        ledger.ingest(&bytes);
+        ledger.ingest(&bytes);
+        assert_eq!(ledger.records.len(), 1, "账本按身份去重");
+        let record = match parse_history_line(&bytes) {
+            ParsedHistoryLine::Record(record) => record,
+            other => panic!("应当解析出记录，得到 {other:?}"),
+        };
+        assert_eq!(record.identity, ledger.records[0].identity);
+        assert_eq!(record.model, "m");
+        assert_eq!(record.served.as_deref(), Some("s9"));
+        assert_eq!((record.input, record.output, record.cache_read), (Some(1), Some(2), None));
+        assert_eq!(record.handed_on, false);
+        // handed_on 行有自己的身份，但不是最终请求，由履历查询在入口排除。
+        let handed = json!({"route_id":9,"t":now.to_rfc3339(),"session":"s","providerAccount":"c@d.e",
+            "status":402,"handed_on":true});
+        let record = match parse_history_line(handed.to_string().as_bytes()) {
+            ParsedHistoryLine::Record(record) => record,
+            other => panic!("应当解析出记录，得到 {other:?}"),
+        };
+        assert!(record.handed_on);
+        assert_ne!(record.identity, ledger.records[0].identity);
     }
 }

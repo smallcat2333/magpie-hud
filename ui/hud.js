@@ -311,6 +311,10 @@
       routeList.querySelectorAll('.route-card,.subagent-row').forEach(element => element.classList.toggle('selected', element === button));
       renderNotes([card.note], [session]);
     });
+    window.hudHistory?.attach(button, {
+      session: card.historySession || session.id, subagent: card.subagentId || '',
+      label: session.label, source: sourceLabel(session),
+    });
     return button;
   }
 
@@ -481,16 +485,13 @@
     button.dataset.grace = String(Boolean(card.grace));
     const label = subagentName(card, session);
     button.querySelector('.session-title').textContent = label;
-    button.title = `${label}\n子 Agent ID: ${card.subagentId || card.id}\n${button.title}`;
-    button.setAttribute('aria-label', button.title.replaceAll('\n', '，'));
+    button.setAttribute('aria-label', `${label}，子 Agent ID: ${card.subagentId || card.id}，${button.getAttribute('aria-label')}`);
     const metrics = button.querySelector('.card-metrics');
-    metrics.title = metrics.title.replaceAll('该会话', '该子 Agent');
     const copy = button.querySelector('.card-copy');
     const name = copy.querySelector('.session-title');
     name.title = label;
     const state = copy.querySelector('.state-tag');
     const model = copy.querySelector('.card-model');
-    const account = copy.querySelector('.card-account');
     const effort = copy.querySelector('.effort');
     const created = document.createElement('time');
     created.className = 'subagent-created';
@@ -500,8 +501,10 @@
     created.title = start ? `请求创建时间 ${card.time}` : '请求创建时间未提供';
     created.setAttribute('aria-label', created.title);
     button.replaceChildren(button.querySelector('.model-icon'), name, model, created, state, effort, metrics);
-    button.title += `\n账号: ${account.title}`;
-    button.setAttribute('aria-label', button.title.replaceAll('\n', '，'));
+    window.hudHistory?.attach(button, {
+      session: card.historySession || session.id, subagent: card.subagentId || card.id,
+      label, source: sourceLabel(session),
+    });
     return button;
   }
 
@@ -1228,6 +1231,7 @@
 
   /** 根据当前会话选择生成分支和两行说明，保留滚动位置。 */
   function render(animate) {
+    window.hudHistory?.beforeRender();
     const forceQuotaOrder = !quotaOrderTimer;
     if (!quotaOrderTimer) quotaOrderTimer = setTimeout(() => { quotaOrderTimer = 0; render(false); }, 60_000);
     hud.dataset.layout = innerWidth < 680 ? 'tall' : 'wide';
@@ -1342,6 +1346,7 @@
     const moving = window.hudMotion.layout(before, routeList.querySelectorAll('.route-card'), node => node.dataset.motionKey);
     requestDraw(animate ? newIds : []);
     if (moving) followCardMotion();
+    window.hudHistory?.reconcile();
   }
 
   /** 至少显示三个会话；窗口更高时按卡片高度增加，活跃会话始终全部保留。 */
