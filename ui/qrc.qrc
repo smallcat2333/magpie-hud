@@ -1,5 +1,0 @@
-<RCC>
- <qresource prefix="/common">
-  <file>img/play-circle.svg</file>
- </qresource>
-</RCC>

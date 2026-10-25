@@ -1,6 +1,13 @@
 /out/
 /dist/
 /rust/target/
+/src-tauri/target/
+/src-tauri/target-v008/
 /.codegraph/
 /CMakeUserPresets.json
 *.user
+/.codex_tmp/
+/.playwright-mcp/
+/.claude/launch.json
+__pycache__/
+*.py[cod]

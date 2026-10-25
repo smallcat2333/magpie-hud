@@ -1,0 +1,75 @@
+/* 日期导航始终可见，只约束统计；独立于卡片、额度与动效样式。 */
+.hud .daily-heading{display:flex;align-items:center;margin-bottom:7px;gap:0;min-width:0}
+.stats-date-nav{display:flex;align-items:center;gap:2px;width:100%;min-width:0}
+.stats-date-nav button{display:grid;place-items:center;flex:0 0 23px;width:23px;height:26px;padding:0;background:transparent;border:1px solid transparent;border-radius:4px;color:var(--muted)}
+.stats-date-nav button:hover:not(:disabled){background:rgb(70 72 80/.35);color:var(--ink);border-color:var(--edge)}
+.stats-date-nav button:disabled{opacity:.4;cursor:default}
+.stats-date-nav svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.stats-date-nav .stats-date-label{position:relative;flex:1 1 auto;width:auto;min-width:0;padding:0 1px;font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.stats-date-nav time{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;font-size:11px;color:inherit}
+.stats-date-nav #stats-today{flex-basis:auto;width:auto;padding:0 3px;font-size:10px;white-space:nowrap}
+.stats-date-nav{position:relative}
+.hud[data-stats-history="true"] .stats-date-label,.hud[data-stats-history="true"] #stats-today{color:var(--warning)}
+.stats-date-status{margin:0 0 5px;font-size:10px;line-height:15px;color:var(--muted);overflow-wrap:anywhere}
+.stats-date-status-row{display:flex;align-items:start;gap:4px;min-width:0}
+.stats-date-status-row #stats-retry{flex:none;padding:0;border:0;background:transparent;color:var(--ink);font-size:10px;line-height:15px;text-decoration:underline}
+.hud[data-stats-loading="true"] .daily dl,.hud[data-stats-loading="true"] #hourly-chart{opacity:.45}
+.hud[data-stats-unavailable="true"] .daily dl,.hud[data-stats-unavailable="true"] #hourly-chart{visibility:hidden}
+.hud[data-stats-history="true"] .quota-heading{display:flex}
+.stats-live-label{display:none;font-size:10px;color:var(--muted);line-height:14px}
+.hud[data-stats-history="true"] .stats-live-label{display:block}
+/* 单色热力日历：Token 越多颜色越深，无调用日期保持透明。 */
+.stats-calendar{--heat-0:transparent;--heat-1:#a9c9ef;--heat-2:#72a4cc;--heat-3:#4c7da5;--heat-4:#365a7a;position:fixed;z-index:60;width:280px;max-height:calc(100vh - 16px);overflow:auto;padding:12px;background:#202227;border:1px solid #555761;border-radius:8px;box-shadow:0 8px 24px rgb(0 0 0/.3);color:var(--ink);font-size:11px;font-variant-numeric:tabular-nums}
+.calendar-heading,.calendar-month-nav,.calendar-footer{display:flex;align-items:center;gap:8px}
+.calendar-heading{margin-bottom:7px}
+.calendar-heading strong{font-size:12px;font-weight:600;flex:1}
+.stats-calendar button{display:grid;place-items:center;min-width:24px;height:26px;padding:0 6px;border:1px solid transparent;border-radius:4px;color:var(--ink);background:transparent;font-size:12px}
+.stats-calendar button:hover:not(:disabled){background:#353840}
+.stats-calendar button:disabled{cursor:default;color:var(--muted)}
+.calendar-month-nav{justify-content:space-between;margin-bottom:8px}
+.calendar-month-nav strong{font-weight:500;font-size:12px}
+.calendar-month-nav button{font-size:18px}
+.calendar-weekdays,.calendar-days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px}
+.calendar-weekdays{margin-bottom:5px;text-align:center;line-height:19px;color:var(--muted)}
+.stats-calendar .calendar-day{height:29px;min-width:0;padding:0;position:relative;background:var(--heat-0);color:var(--ink);font-size:11px}
+.calendar-day[data-heat="1"],.calendar-legend i[data-heat="1"]{background:var(--heat-1)}
+.calendar-day[data-heat="2"],.calendar-legend i[data-heat="2"]{background:var(--heat-2)}
+.stats-calendar .calendar-day[data-heat="1"],.stats-calendar .calendar-day[data-heat="2"],.stats-calendar .calendar-day[data-heat="3"]{color:#05070a}
+.calendar-day[data-heat="3"],.calendar-legend i[data-heat="3"]{background:var(--heat-3)}
+.calendar-day[data-heat="4"],.calendar-legend i[data-heat="4"]{background:var(--heat-4)}
+.stats-calendar .calendar-day:hover:not(:disabled){background-color:var(--heat-0);box-shadow:inset 0 0 0 1px var(--ink)}
+.stats-calendar .calendar-day[data-heat="1"]:hover:not(:disabled){background-color:var(--heat-1)}
+.stats-calendar .calendar-day[data-heat="2"]:hover:not(:disabled){background-color:var(--heat-2)}
+.stats-calendar .calendar-day[data-heat="3"]:hover:not(:disabled){background-color:var(--heat-3)}
+.stats-calendar .calendar-day[data-heat="4"]:hover:not(:disabled){background-color:var(--heat-4)}
+.stats-calendar .calendar-day[aria-pressed="true"]{outline:2px solid var(--ink);outline-offset:1px}
+.calendar-day[data-today="true"]::after{content:"";position:absolute;bottom:3px;left:calc(50% - 2px);width:4px;height:2px;border-radius:1px;background:currentColor}
+.stats-calendar .calendar-day:disabled,.stats-calendar .calendar-day[data-outside="true"]{background:transparent;color:var(--muted)}
+.stats-calendar .calendar-day[data-outside="true"]{opacity:.45}
+.stats-calendar .calendar-day[data-heat="unknown"]:not(:disabled){background:transparent;border:1px dashed #6c717b}
+.calendar-readout{min-height:32px;margin:10px 0 8px;line-height:16px;color:var(--muted);overflow-wrap:anywhere}
+.calendar-legend{display:flex;align-items:center;gap:4px;color:var(--muted);font-size:10px;margin-bottom:9px}
+.calendar-legend i{width:13px;height:10px;border-radius:2px;background:var(--heat-0)}
+.calendar-legend span:first-child{margin-right:2px}
+.calendar-legend span:last-child{margin-left:2px}
+.calendar-footer{padding-top:7px;border-top:1px solid var(--edge);gap:5px}
+.calendar-footer>span{flex:1;color:var(--muted);font-size:10px}
+.calendar-footer button{font-size:11px;height:24px;padding:0 5px;white-space:nowrap}
+.calendar-table{display:block;position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip-path:inset(50%);contain:strict}
+@media(forced-colors:active){.stats-calendar .calendar-day{background:Canvas;color:CanvasText;border:1px solid CanvasText}.stats-calendar .calendar-day[aria-pressed="true"]{outline-color:Highlight}.calendar-day[data-today="true"]::after{background:Highlight}}
+@media(max-height:420px){
+.hud .daily-heading{display:flex;margin-bottom:2px}
+.stats-date-nav button{height:22px}
+.stats-date-status{font-size:10px;line-height:13px;margin-bottom:2px}
+.hud[data-stats-history="true"] .quota-heading{margin-bottom:3px}
+.stats-calendar{padding:9px}
+.calendar-heading{margin-bottom:3px}
+.calendar-heading button,.calendar-month-nav button{height:22px}
+.calendar-month-nav{margin-bottom:5px}
+.calendar-weekdays{line-height:16px;margin-bottom:3px}
+.calendar-days{gap:3px}
+.stats-calendar .calendar-day{height:25px}
+.calendar-readout{margin:7px 0 5px}
+.calendar-legend{margin-bottom:6px}
+.calendar-footer{padding-top:5px}
+}

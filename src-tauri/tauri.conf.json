@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Magpie HUD",
+  "version": "0.0.29",
+  "identifier": "com.smallcat.magpie-hud",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Magpie HUD V.0.0.29",
+        "width": 1120,
+        "height": 400,
+        "minWidth": 360,
+        "minHeight": 280,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "backgroundColor": "#00000000",
+        "windowEffects": { "effects": ["acrylic"], "color": [23, 25, 30, 128] },
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'ipc: http://ipc.localhost'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.ico"
+    ]
+  }
+}

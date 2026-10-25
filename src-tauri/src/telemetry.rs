@@ -1,0 +1,308 @@
+//! 只读 Magpie 额度与定价用量；账号精确关联，额度、余额、美元费用各保留自身单位。
+
+use crate::usage::{AgentStats, RouteSnapshot};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaWindow {
+    pub name: String,
+    pub used: Option<f64>,
+    pub remaining: Option<f64>,
+    pub resets_at: Option<String>,
+    #[serde(default)] pub unlimited: bool,
+    pub display: Option<String>,
+    pub amount: Option<f64>,
+    pub limit: Option<f64>,
+    pub unit: Option<String>,
+    pub family: Option<String>,
+    pub pool: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Quota {
+    pub provider: String,
+    pub name: String,
+    #[serde(default)] pub user: String,
+    #[serde(default)] pub kind: String,
+    #[serde(default)] pub plan: String,
+    #[serde(default)] pub windows: Vec<QuotaWindow>,
+    pub balance: Option<String>,
+    pub error: Option<String>,
+    pub read_at: Option<String>,
+    pub as_of: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+pub struct Quotas {
+    #[serde(default)] pub data: Vec<Quota>,
+}
+
+/// 用量页包含内部路由调用；保留其费用口径，不从日志拼凑或推算模型单价。
+#[derive(Clone, Default, Deserialize)]
+pub struct Usage {
+    #[serde(default)] pub period: String,
+    pub since: String,
+    pub calls: u64,
+    pub cost: f64,
+    #[serde(default)] pub unpriced: u64,
+    /// 全局小时费用；网关没有会话级序列，不能据此拆分会话。
+    #[serde(default, rename = "series")] pub hourly: Vec<HourlyCost>,
+    #[serde(default)] pub sessions: Vec<SessionCost>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+pub struct HourlyCost {
+    pub time: String,
+    pub cost: f64,
+    #[serde(default)] pub unpriced: u64,
+}
+
+#[derive(Clone, Default, Deserialize)]
+pub struct SessionCost {
+    pub id: String,
+    pub calls: u64,
+    pub cost: f64,
+    #[serde(default)] pub unpriced: u64,
+}
+
+/// 读取和使用时间都由网关返回；失联时保留最后读数，并明确标记旧数据。
+#[derive(Default)]
+pub struct Telemetry {
+    pub quotas: Vec<Quota>,
+    pub quota_error: Option<String>,
+    pub usage: Option<Usage>,
+    pub cost_error: Option<String>,
+    hourly: crate::hourly::HourlyCosts,
+}
+
+impl Telemetry {
+    /// 全局小时费用直接取网关序列；会话序列不存在，只记录之后的真实累计增量。
+    pub fn update_usage(&mut self, usage: Usage, host: &str) {
+        self.hourly.observe(&usage, chrono::Local::now(), host);
+        self.cost_error = self.hourly.error.clone();
+        self.usage = Some(usage);
+    }
+
+    /// 网关成功返回也可能有单个账号的供应商错误；留住该账号上次有效窗口。
+    pub fn update_quotas(&mut self, mut next: Vec<Quota>) {
+        for quota in &mut next {
+            if quota.error.is_none() { continue; }
+            let mut previous = self.quotas.iter().filter(|old| old.provider == quota.provider
+                && old.user == quota.user && old.kind == quota.kind && old.name == quota.name);
+            if let Some(old) = previous.next() {
+                if previous.next().is_none() {
+                    let error = quota.error.clone();
+                    *quota = old.clone();
+                    quota.error = error;
+                }
+            }
+        }
+        self.quotas = next;
+        self.quota_error = None;
+    }
+
+    pub fn apply(&self, view: &mut RouteSnapshot) {
+        view.quotas = self.quotas.clone();
+        view.quota_error = self.quota_error.clone();
+        view.cost_error = self.cost_error.clone();
+        let Some(usage) = &self.usage else { return };
+        // 跨日时不能把昨天缓存的金额盖到今天；费用由下一次独立轮询补齐。
+        let day = chrono::DateTime::parse_from_rfc3339(&usage.since).ok()
+            .map(|time| time.with_timezone(&chrono::Local).date_naive().to_string());
+        if day.as_deref() != Some(&view.date) {
+            view.cost_error = Some("等待 Magpie 当日费用刷新".into());
+            return;
+        }
+        fill_cost(&mut view.daily, usage.calls, usage.cost, usage.unpriced);
+        self.hourly.apply(view, usage);
+        for session in &mut view.sessions {
+            let mut matches = usage.sessions.iter().filter(|cost| cost.id == session.id);
+            if let Some(cost) = matches.next() {
+                if matches.next().is_none() {
+                    fill_cost(&mut session.daily, cost.calls, cost.cost, cost.unpriced);
+                }
+            }
+        }
+        apply_agent_usage(&mut view.agent_stats, usage);
+    }
+}
+
+fn fill_cost(stats: &mut crate::usage::DailyStats, calls: u64, cost: f64, unpriced: u64) {
+    if cost.is_finite() && cost >= 0.0 && unpriced <= calls {
+        // 所有请求未定价时 0 只是缺价格的结果，不能显示为真实零费用。
+        let priced = calls - unpriced;
+        stats.cost = (calls == 0 || priced > 0).then_some(cost);
+        stats.priced_requests = priced;
+        stats.unpriced_requests = unpriced;
+        // 分母是网关已定价调用，包含日志排除的内部路由；不是 JSONL 完成行数。
+        stats.cost_per_call = (priced > 0).then_some(cost / priced as f64);
+    }
+}
+
+/// 只在该来源分组自己的每个会话都有唯一、有效的网关费用时填写金额。
+/// 缺一个会话、ID 重复或费用字段无效都保持未知，不用全局今日费用分摊。
+pub fn apply_agent_usage(groups: &mut [AgentStats], usage: &Usage) {
+    let mut counts = std::collections::HashMap::<&str, usize>::new();
+    for session in &usage.sessions {
+        if session.id.is_empty() {
+            continue;
+        }
+        *counts.entry(session.id.as_str()).or_default() += 1;
+    }
+    let mut owners = std::collections::HashMap::<String, usize>::new();
+    for group in groups.iter() {
+        for id in &group.cost_sessions { *owners.entry(id.clone()).or_default() += 1; }
+    }
+    for group in groups {
+        if group.cost_sessions.is_empty() || group.cost_sessions.iter().any(|id| owners.get(id) != Some(&1)) {
+            continue;
+        }
+        let mut calls = 0_u64;
+        let mut cost = 0.0_f64;
+        let mut unpriced = 0_u64;
+        let mut covered = true;
+        for session_id in &group.cost_sessions {
+            let unique = counts.get(session_id.as_str()).copied() == Some(1);
+            let matched = usage.sessions.iter().find(|item| item.id == *session_id);
+            match matched.filter(|_| unique) {
+                Some(item) if item.cost.is_finite() && item.cost >= 0.0 && item.unpriced <= item.calls
+                    && (item.calls > 0 || item.unpriced < item.calls) =>
+                {
+                    calls += item.calls;
+                    cost += item.cost;
+                    unpriced += item.unpriced;
+                }
+                _ => covered = false,
+            }
+        }
+        if covered {
+            fill_cost(&mut group.daily, calls, cost, unpriced);
+        }
+    }
+}
+
+/// 将网关指定日期区间（YYYY-MM-DD..YYYY-MM-DD）的费用与 24 小时序列写入单日统计。
+pub fn apply_day_usage(
+    stats: &mut crate::usage::DailyStats,
+    day: chrono::NaiveDate,
+    expected_period: &str,
+    usage: &Usage,
+) -> Result<(), String> {
+    if usage.period != expected_period {
+        return Err(format!("Magpie 未返回所选日期费用（回显 {}）", usage.period));
+    }
+    let since_day = chrono::DateTime::parse_from_rfc3339(&usage.since)
+        .ok()
+        .map(|time| time.with_timezone(&chrono::Local).date_naive());
+    if since_day != Some(day) {
+        return Err("Magpie 返回的费用起始日期与所选日期不一致".into());
+    }
+    if !usage.cost.is_finite() || usage.cost < 0.0 || usage.unpriced > usage.calls {
+        return Err("Magpie 所选日期费用字段无效".into());
+    }
+    fill_cost(stats, usage.calls, usage.cost, usage.unpriced);
+    crate::hourly::apply_gateway_series_for_day(stats, usage, day);
+    Ok(())
+}
+
+/// 历史日期的全局费用与来源分组费用共用一次网关校验。校验失败时两者都保持未知。
+pub fn apply_history_usage(
+    daily: &mut crate::usage::DailyStats,
+    groups: &mut [AgentStats],
+    day: chrono::NaiveDate,
+    expected_period: &str,
+    usage: &Usage,
+) -> Result<(), String> {
+    apply_day_usage(daily, day, expected_period, usage)?;
+    apply_agent_usage(groups, usage);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usage::UsageLedger;
+
+    #[test]
+    fn cost_keeps_gateway_scope_and_cannot_leak_across_days() {
+        let now = chrono::Local::now();
+        let mut telemetry = Telemetry { usage: Some(Usage {
+            since: now.to_rfc3339(), calls: 5, cost: 1.25, unpriced: 2, ..Default::default()
+        }), ..Default::default() };
+        let mut view = UsageLedger::new(now.date_naive()).snapshot("h", "ready", None);
+        telemetry.apply(&mut view);
+        assert_eq!(view.daily.cost, Some(1.25));
+        assert_eq!(view.daily.priced_requests, 3);
+        assert_eq!(view.daily.cost_per_call, Some(1.25 / 3.0));
+        assert_eq!(view.daily.requests, 0); // 费用覆盖不会改写完成账本
+        view.date = (now.date_naive() + chrono::Duration::days(1)).to_string();
+        view.daily.cost = None;
+        view.daily.cost_per_call = None;
+        telemetry.apply(&mut view);
+        assert_eq!(view.daily.cost, None);
+        assert_eq!(view.daily.cost_per_call, None);
+        assert!(view.cost_error.is_some());
+        telemetry.usage.as_mut().unwrap().unpriced = 5;
+        view.date = now.date_naive().to_string();
+        telemetry.apply(&mut view);
+        assert_eq!(view.daily.cost, None);
+        assert_eq!(view.daily.cost_per_call, None);
+        telemetry.usage.as_mut().unwrap().unpriced = 9;
+        telemetry.apply(&mut view);
+        assert_eq!(view.daily.cost_per_call, None);
+    }
+
+    #[test]
+    fn per_account_error_retains_only_exact_previous_reading() {
+        let quota = Quota { provider: "codex".into(), name: "codex".into(), user: "KeyA".into(),
+            windows: vec![QuotaWindow { name: "5 hours".into(), remaining: Some(62.0), ..Default::default() }], ..Default::default() };
+        let mut telemetry = Telemetry { quotas: vec![quota.clone()], ..Default::default() };
+        let failed = Quota { windows: vec![], error: Some("vendor unavailable".into()), ..quota.clone() };
+        telemetry.update_quotas(vec![failed.clone()]);
+        assert_eq!(telemetry.quotas[0].windows[0].remaining, Some(62.0));
+        assert!(telemetry.quotas[0].error.is_some());
+        telemetry.update_quotas(vec![Quota { user: "keya".into(), ..failed }]);
+        assert!(telemetry.quotas[0].windows.is_empty());
+    }
+
+    #[test]
+    fn quota_missing_percent_is_unknown_instead_of_zero() {
+        let quotas: Quotas = serde_json::from_str(r#"{"object":"list","data":[{"provider":"codex","name":"codex","user":"test@example.com","kind":"subscription","windows":[{"name":"5 hours"}]}]}"#).unwrap();
+        assert_eq!(quotas.data[0].windows[0].remaining, None);
+    }
+
+    #[test]
+    fn historical_day_usage_validates_period_and_populates_hourly_costs() {
+        use chrono::TimeZone;
+        let target = chrono::Local.with_ymd_and_hms(2026, 10, 21, 9, 0, 0).unwrap();
+        let day = target.date_naive();
+        let period = format!("{day}..{day}");
+        let usage = Usage {
+            period: period.clone(),
+            since: target.to_rfc3339(),
+            calls: 4,
+            cost: 2.5,
+            unpriced: 1,
+            hourly: vec![HourlyCost {
+                time: target.to_rfc3339(),
+                cost: 1.25,
+                unpriced: 1,
+            }],
+            sessions: vec![],
+        };
+        let mut stats = crate::usage::DailyStats::default();
+        apply_day_usage(&mut stats, day, &period, &usage).unwrap();
+        assert_eq!(stats.cost, Some(2.5));
+        assert_eq!(stats.priced_requests, 3);
+        assert_eq!(stats.unpriced_requests, 1);
+        assert_eq!(stats.hourly[9].cost, Some(1.25));
+        assert!(stats.hourly[9].cost_partial);
+
+        let fallback = Usage { period: "30d".into(), ..usage };
+        let mut rejected = crate::usage::DailyStats::default();
+        assert!(apply_day_usage(&mut rejected, day, &period, &fallback).is_err());
+        assert_eq!(rejected.cost, None);
+    }
+}
