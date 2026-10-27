@@ -476,6 +476,7 @@ impl LiveState {
         // 稳定排序保持原完成顺序，活跃会话始终优先可见。
         view.sessions.sort_by_key(|s| !(active_sessions.contains(&s.id) || child_sessions.contains(&s.id)));
         let aliases_changed = self.suppress_alias_roots(view);
+        self.fold_model_usage(view);
         if let Some(session) = view.sessions.first() {
             view.notes = session.notes.clone();
         }
@@ -599,6 +600,30 @@ impl LiveState {
     /// 历史 CLI ID 归到标题元数据声明的当前 ID；没有显式关联时保持自身。
     fn canonical<'a>(&'a self, id: &'a str) -> &'a str {
         self.aliases.get(id).map(String::as_str).unwrap_or(id)
+    }
+
+    /// 把历史 CLI ID 的模型用量归到当前规范会话，前端选中展示 ID 时不会漏计。
+    fn fold_model_usage(&self, view: &mut RouteSnapshot) {
+        if self.aliases.is_empty() { return; }
+        let mut folded: Vec<crate::usage::ModelUsage> = Vec::new();
+        let mut index = HashMap::<(String, String, String, String, String, String, String), usize>::new();
+        for row in view.model_usage.drain(..) {
+            let session = self.canonical(&row.session).to_owned();
+            let key = (session.clone(), row.agent.clone(), row.caller_key_id.clone(), row.caller_key_name.clone(),
+                row.model.clone(), row.effort.clone(), row.outcome.clone());
+            if let Some(existing) = index.get(&key).copied() {
+                folded[existing].requests += row.requests;
+                folded[existing].tokens = folded[existing].tokens.saturating_add(row.tokens);
+                folded[existing].unknown_token_requests += row.unknown_token_requests;
+                folded[existing].output_tokens = folded[existing].output_tokens.saturating_add(row.output_tokens);
+                folded[existing].generation_ms += row.generation_ms;
+                folded[existing].speed_samples += row.speed_samples;
+            } else {
+                index.insert(key, folded.len());
+                folded.push(crate::usage::ModelUsage { session, ..row });
+            }
+        }
+        view.model_usage = folded;
     }
 
     /// 未找到标题时明确未命名；UUID 只保留在数据身份与悬停提示中。

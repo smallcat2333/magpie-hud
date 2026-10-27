@@ -1299,6 +1299,15 @@
       projectHistory: view => ({ ...view, daily: statsForSource(view), scope: statsScope() }),
     } }));
     renderQuotas(session ? [session] : filterAgent(snapshot.sessions), forceQuotaOrder);
+    // 模型统计来自完整当日账本，而不是屏幕上截断后的会话卡片。
+    const modelRows = (snapshot.modelUsage || []).filter(row =>
+      (!session || row.session === session.id) && (selectedAgent === '*' || sourceKey(row) === selectedAgent));
+    window.hudModelUsage?.update(modelRows, session ? session.label : statsScope(), {
+      date: snapshot.date || '',
+      session: session ? session.id : null,
+      sourceKey: selectedAgent === '*' ? null : selectedAgent,
+      revision: snapshot.ledgerRevision || 0,
+    });
     byId('empty-route').querySelector('strong').textContent = selectedAgent === '*' ? '尚无今日会话' : `${statsScope()} 暂无会话`;
     if (!agentOptions.hidden) positionAgentOptions();
     if (hud.dataset.layout === 'tall') {

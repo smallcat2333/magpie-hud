@@ -103,11 +103,16 @@ struct Record {
     account: String,
     model: String,
     provider: String,
+    handed_on: bool,
     effort: String,
     status: Option<u16>,
     error: Option<String>,
     tries: u64,
     tokens: u64,
+    /// in/out 字段均有效时 Token 合计可知，真实 0 不视为缺失。
+    tokens_known: bool,
+    /// 输出字段有效时可以参与 TPS 加权分子。
+    output_known: bool,
     input: u64,
     cache_read: u64,
     output: u64,
@@ -301,6 +306,8 @@ pub struct AgentStats {
 #[serde(rename_all = "camelCase")]
 pub struct RouteSnapshot {
     pub revision: u64,
+    /// 仅随当日账本变化递增，避免实时路由刷新反复触发逐请求费用查询。
+    pub ledger_revision: u64,
     pub date: String,
     /// 日志中最早有效记录的本地日期，供前端限制历史左翻边界。
     pub earliest_date: String,
@@ -312,6 +319,9 @@ pub struct RouteSnapshot {
     /// 全部已完成记录按原始 Agent 与 callerKeyId 分组。进行中请求没有调用方密钥，不在这里。
     #[serde(default)]
     pub agent_stats: Vec<AgentStats>,
+    /// 今日已结束外部请求按会话、来源、模型和强度展开，供前端按当前筛选合计。
+    #[serde(default)]
+    pub model_usage: Vec<ModelUsage>,
     /// 所有日期日志中同一密钥 ID 最新的名称，仅用于展示。
     pub caller_key_names: HashMap<String, String>,
     pub quotas: Vec<crate::telemetry::Quota>,
@@ -466,6 +476,7 @@ impl UsageLedger {
                 .or_else(|| string(&value, "served"))
                 .unwrap_or("服务模型未提供")
                 .into(),
+            handed_on: value.get("handed_on").and_then(Value::as_bool).unwrap_or(false),
             provider: string(&value, "provider").unwrap_or("").into(),
             effort: string(&value, "effort").unwrap_or("强度未提供").into(),
             status: value
@@ -477,6 +488,8 @@ impl UsageLedger {
             tokens: number("in")
                 .saturating_add(number("out"))
                 .saturating_add(number("cache_read")),
+            tokens_known: value.get("in").and_then(Value::as_u64).is_some() && value.get("out").and_then(Value::as_u64).is_some(),
+            output_known: value.get("out").and_then(Value::as_u64).is_some(),
             input: number("in"),
             cache_read: number("cache_read"),
             output: number("out"),
@@ -711,6 +724,7 @@ impl UsageLedger {
         };
         RouteSnapshot {
             revision: self.revision,
+            ledger_revision: self.revision,
             date: self.day.to_string(),
             earliest_date: self
                 .earliest_day
@@ -729,6 +743,7 @@ impl UsageLedger {
             sessions,
             daily,
             agent_stats,
+            model_usage: model_usage(&self.records),
             caller_key_names: self.caller_key_names.iter().map(|(id, (_, name))| (id.clone(), name.clone())).collect(),
             quotas: Vec::new(),
             quota_error: None,
@@ -737,6 +752,31 @@ impl UsageLedger {
             error: error
                 .or_else(|| (self.malformed > 0).then(|| "日志中有无效行，已保留有效记录".into())),
         }
+    }
+
+    /// 费用按需查询只复制当前范围的窄身份字段，不重新扫描日志。
+    pub fn model_cost_rows(&self, session: Option<&str>, source_key: Option<&str>, aliases: &HashMap<String, String>) -> Vec<UsageDetailRow> {
+        self.records.iter().filter(|r| {
+            if r.handed_on { return false; }
+            let canonical = aliases.get(&r.session).map(String::as_str).unwrap_or(&r.session);
+            if session.is_some_and(|s| s != canonical) { return false; }
+            let agent = canonical_agent(&r.agent);
+            let identity = if r.caller_key_id.is_empty() { &r.caller_key_name } else { &r.caller_key_id };
+            let key = serde_json::to_string(&[&agent, identity]).unwrap_or_default();
+            !source_key.is_some_and(|wanted| wanted != key)
+        }).map(|r| {
+            let agent = canonical_agent(&r.agent);
+            let identity = if r.caller_key_id.is_empty() { &r.caller_key_name } else { &r.caller_key_id };
+            UsageDetailRow {
+                id: r.identity.clone(), timestamp: r.timestamp_ms, date: r.day.to_string(), hour: r.hour,
+                // 保留原始会话：费用接口按日志会话精确匹配，规范别名只用于上面的筛选。
+                session: r.session.clone(), source_key: serde_json::to_string(&[&agent, identity]).unwrap_or_default(), agent,
+                caller_key_id: r.caller_key_id.clone(), caller_key_name: r.caller_key_name.clone(),
+                provider: r.provider.clone(), account: r.account.clone(), model: r.model.clone(), effort: r.effort.clone(),
+                outcome: r.outcome().into(), input: r.input, output: r.output, cache_read: r.cache_read, tokens: r.tokens,
+                generation_ms: if r.success() { r.generation_ms } else { None }, cost_matchable: r.tokens_known,
+            }
+        }).collect()
     }
 
     /// 汇总该账本日期内全部有效记录（历史按日查看不截断到最近 10 个会话）。
@@ -827,6 +867,9 @@ pub struct UsageDetailRow {
     pub cache_read: u64,
     pub tokens: u64,
     pub generation_ms: Option<f64>,
+    /// 用量不完整时不允许零填充后误配网关定价；仅后端内部使用。
+    #[serde(skip)]
+    pub cost_matchable: bool,
 }
 
 pub fn scan_detail_rows(path: &std::path::Path, start: NaiveDate, end: NaiveDate)
@@ -847,11 +890,73 @@ pub fn scan_detail_rows(path: &std::path::Path, start: NaiveDate, end: NaiveDate
                 .unwrap_or_else(|| r.caller_key_name.clone()),
             provider: r.provider.clone(), account: r.account.clone(), model: r.model.clone(), effort: r.effort.clone(),
             outcome: r.outcome().into(), input: r.input, output: r.output, cache_read: r.cache_read, tokens: r.tokens,
-            generation_ms: if r.success() { r.generation_ms } else { None },
+            generation_ms: if r.success() { r.generation_ms } else { None }, cost_matchable: r.tokens_known,
         }
     }).collect();
     rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| a.id.cmp(&b.id)));
     Ok(rows)
+}
+
+/// 一个会话来源下的模型/强度用量。空模型或强度保持账本的未知标记，不推测。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsage {
+    pub session: String,
+    pub agent: String,
+    pub caller_key_id: String,
+    pub caller_key_name: String,
+    /// success | failed | cancelled | unknown
+    pub outcome: String,
+    pub model: String,
+    pub effort: String,
+    pub requests: u64,
+    /// 已知 in/out 的请求 Token 合计；未完整记录的次数单独标识。
+    pub tokens: u64,
+    pub unknown_token_requests: u64,
+    /// 仅成功且输出与生成时长均有效的请求，按输出/时长加权 TPS。
+    pub output_tokens: u64,
+    pub generation_ms: f64,
+    pub speed_samples: u64,
+}
+
+/// 按现有会话与 Agent/caller 分组口径展开模型用量，保留首次出现顺序。
+fn model_usage(records: &[Record]) -> Vec<ModelUsage> {
+    let mut order = Vec::new();
+    let mut groups: HashMap<(String, String, String, String, String, String, String), ModelUsage> = HashMap::new();
+    for record in records.iter().filter(|record| !record.handed_on) {
+        let name_key = if record.caller_key_id.is_empty() { record.caller_key_name.clone() } else { String::new() };
+        let key = (record.session.clone(), record.agent.clone(), record.caller_key_id.clone(), name_key,
+            record.model.clone(), record.effort.clone(), record.outcome().into());
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+            groups.insert(key.clone(), ModelUsage {
+                session: record.session.clone(), agent: record.agent.clone(),
+                caller_key_id: record.caller_key_id.clone(),
+                caller_key_name: if record.caller_key_id.is_empty() { record.caller_key_name.clone() } else { String::new() },
+                outcome: record.outcome().into(), model: record.model.clone(), effort: record.effort.clone(),
+                requests: 0, tokens: 0, unknown_token_requests: 0,
+                output_tokens: 0, generation_ms: 0.0, speed_samples: 0,
+            });
+        }
+        let group = groups.get_mut(&key).expect("刚插入的模型用量");
+        if !record.caller_key_id.is_empty() && !record.caller_key_name.is_empty() {
+            group.caller_key_name.clone_from(&record.caller_key_name);
+        }
+        group.requests += 1;
+        if record.tokens_known {
+            group.tokens = group.tokens.saturating_add(record.tokens);
+        } else {
+            group.unknown_token_requests += 1;
+        }
+        if record.success() && record.output_known {
+            if let Some(duration) = record.generation_ms {
+                group.output_tokens = group.output_tokens.saturating_add(record.output);
+                group.generation_ms += duration;
+                group.speed_samples += 1;
+            }
+        }
+    }
+    order.into_iter().filter_map(|key| groups.remove(&key)).collect()
 }
 
 /// 按原始 Agent 与调用方身份汇总全部完成记录。费用不在这里填写。
@@ -1646,6 +1751,90 @@ mod tests {
             value["kind"] = json!(kind);
         }
         value.to_string()
+    }
+
+    #[test]
+    fn model_usage_groups_sessions_sources_models_and_efforts() {
+        let now = Local::now();
+        let line = |route, session, agent, key, name, model, effort, status, input, output, cache| json!({
+            "route_id": route, "t": now.to_rfc3339(), "session": session, "agent": agent,
+            "callerKeyId": key, "callerKeyName": name, "model": model, "effort": effort,
+            "providerAccount": "a@example.com", "status": status, "in": input, "out": output, "cache_read": cache,
+        }).to_string();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        for row in [
+            line(1, "s1", "claude-desktop", "k1", "旧名", "gpt", "high", 200, 10, 20, 5),
+            line(2, "s1", "claude-desktop", "k1", "新名", "gpt", "high", 500, 1, 1, 1),
+            line(3, "s1", "claude-desktop", "k1", "新名", "gpt", "none", 499, 2, 0, 0),
+            line(4, "s1", "claude-desktop", "k1", "新名", "gpt", "", 200, 3, 0, 0),
+            line(5, "s1", "codex", "k2", "Codex", "glm", "medium", 200, 100, 0, 0),
+            line(6, "s2", "claude-desktop", "k1", "新名", "gpt", "high", 200, 7, 0, 0),
+            line(7, "s2", "other", "", "", "", "low", 0, 4, 0, 0),
+        ] { ledger.ingest(row.as_bytes()); }
+        let mut handed: serde_json::Value = serde_json::from_str(&line(8, "s1", "claude-desktop", "k1", "新名", "gpt", "high", 500, 99, 0, 0)).unwrap();
+        handed["handed_on"] = json!(true);
+        ledger.ingest(handed.to_string().as_bytes());
+        // 同一真实完成行重复读入仍只计一次；中间尝试保留在全局账本，不进模型图。
+        let duplicate = line(1, "s1", "claude-desktop", "k1", "旧名", "gpt", "high", 200, 10, 20, 5);
+        ledger.ingest(duplicate.as_bytes());
+        let snapshot = ledger.snapshot("", "ready", None);
+        assert_eq!(snapshot.daily.requests, 8);
+        let usage = snapshot.model_usage;
+        assert_eq!(usage.len(), 7);
+        assert_eq!(usage.iter().map(|row| row.requests).sum::<u64>(), 7);
+        let gpt_high = usage.iter().find(|row| row.session == "s1" && row.effort == "high" && row.outcome == "success").unwrap();
+        assert_eq!((gpt_high.agent.as_str(), gpt_high.model.as_str(), gpt_high.requests, gpt_high.tokens, gpt_high.caller_key_name.as_str()),
+            ("Claude Desktop", "gpt", 1, 35, "旧名"));
+        assert!(usage.iter().any(|row| row.outcome == "failed" && row.tokens == 3));
+        assert!(usage.iter().any(|row| row.effort == "none" && row.outcome == "cancelled"));
+        assert!(usage.iter().any(|row| row.effort == "强度未提供" && row.model == "gpt"));
+        let unknown = usage.iter().find(|row| row.session == "s2" && row.agent == "other").unwrap();
+        assert_eq!((unknown.model.as_str(), unknown.outcome.as_str(), unknown.tokens), ("服务模型未提供", "failed", 4));
+        assert_eq!(usage.iter().filter(|row| row.session == "s2" && row.model == "gpt").map(|row| row.requests).sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn model_usage_preserves_unknown_tokens_and_weights_speed() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        for (id, input, output, status, ms, ttft) in [
+            (1, Some(10), Some(100), 200, 3000, 1000),
+            (2, Some(0), Some(0), 200, 2000, 1000),
+            (3, None, Some(50), 200, 2000, 1000),
+            (4, Some(10), None, 200, 2000, 1000),
+            (5, Some(10), Some(100), 500, 2000, 1000),
+        ] {
+            let row = json!({"route_id":id,"t":now.to_rfc3339(),"session":"s","model":"m","effort":"high",
+                "status":status,"in":input,"out":output,"ms":ms,"ttft_ms":ttft});
+            ledger.ingest(row.to_string().as_bytes());
+        }
+        let usage = ledger.snapshot("", "ready", None).model_usage;
+        let success = usage.iter().find(|row| row.outcome == "success").unwrap();
+        assert_eq!((success.requests, success.tokens, success.unknown_token_requests), (4, 110, 2));
+        assert_eq!((success.output_tokens, success.generation_ms, success.speed_samples), (150, 4000.0, 3));
+        let failed = usage.iter().find(|row| row.outcome == "failed").unwrap();
+        assert_eq!((failed.output_tokens, failed.generation_ms, failed.speed_samples), (0, 0.0, 0));
+    }
+
+    #[test]
+    fn model_cost_rows_filter_aliases_sources_and_handed_on() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        for (id, session, agent, caller, handed_on) in [
+            (1, "current", "claude-desktop", "k1", false),
+            (2, "prior", "claude-desktop", "k1", false),
+            (3, "current", "codex", "k2", false),
+            (4, "current", "claude-desktop", "k1", true),
+        ] {
+            let row = json!({"route_id":id,"t":now.to_rfc3339(),"session":session,"agent":agent,
+                "callerKeyId":caller,"model":"m","status":200,"in":1,"out":2,"handed_on":handed_on});
+            ledger.ingest(row.to_string().as_bytes());
+        }
+        let aliases = HashMap::from([("prior".into(), "current".into())]);
+        let rows = ledger.model_cost_rows(Some("current"), Some(r#"["Claude Desktop","k1"]"#), &aliases);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.session == "prior"));
+        assert!(rows.iter().any(|r| r.session == "current"));
     }
 
     /// 一次扫描整月：跨月按本地日归属，重复、分类器、匿名、坏行与超长行都不计入。
