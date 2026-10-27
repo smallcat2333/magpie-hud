@@ -904,6 +904,27 @@
     for (const view of quotaViews.values()) updateQuotaWindow(view, now);
   }
 
+  /** 侧栏与浮层共用周期口径；月窗口倒推一个日历月，月末夹到有效日期。 */
+  function quotaPeriod(span) {
+    const resetTime = span?.resetsAt && !Number.isNaN(Date.parse(span.resetsAt)) ? new Date(span.resetsAt) : null;
+    const credits = /credits?|积分/i.test(`${span?.name || ''} ${span?.unit || ''}`);
+    const period = windowRank(span);
+    const calendarMonth = /^(months?|monthly|月|每月|1\s*(months?|月))$/i.test((span?.name || '').trim());
+    let monthPeriod = NaN;
+    if (calendarMonth && resetTime) {
+      const start = new Date(resetTime);
+      const day = start.getUTCDate();
+      start.setUTCDate(1);
+      start.setUTCMonth(start.getUTCMonth() - 1);
+      const lastDay = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 0)).getUTCDate();
+      start.setUTCDate(Math.min(day, lastDay));
+      monthPeriod = resetTime.getTime() - start.getTime();
+    }
+    const periodMs = !credits && !span?.unlimited
+      ? calendarMonth ? monthPeriod : !/months?|月/i.test(span?.name || '') && Number.isFinite(period) ? period * 60_000 : NaN : NaN;
+    return { resetTime, credits, periodMs, calendarMonth };
+  }
+
   /** 固定周期的时间进度只在本地推进，不触发额度接口或重建卡片。 */
   function updateQuotaClocks() {
     const now = Date.now();
@@ -920,6 +941,13 @@
       const comparison = pace === 'ahead' ? '用量高于时间进度超过 5 个百分点' : pace === 'within' ? '用量低于时间进度超过 5 个百分点' : pace === 'balanced' ? '用量与时间进度相差不超过 5 个百分点' : '用量未知';
       const hint = `细竖线：周期已过 ${elapsed.toFixed(1)}%${view.monthEstimated ? '（按一个月估算：从下次重置时间倒推一个日历月）' : ''}；色条：已用额度；${comparison}`;
       view.track.setAttribute('aria-description', hint);
+    }
+    for (const marker of quotaTooltip.querySelectorAll('.quota-time-marker')) {
+      const elapsed = Math.min(100, Math.max(0, (1 - (Number(marker.dataset.resetAt) - now) / Number(marker.dataset.periodMs)) * 100));
+      const used = Number(marker.dataset.used);
+      marker.style.left = `${elapsed}%`;
+      marker.dataset.pace = !Number.isFinite(used) ? 'unknown' : used - elapsed > 5 ? 'ahead' : used - elapsed < -5 ? 'within' : 'balanced';
+      marker.parentElement.setAttribute('aria-description', `预测标线：周期已过 ${elapsed.toFixed(1)}%${marker.dataset.monthEstimated === 'true' ? '（月周期估算）' : ''}；与已用额度对照`);
     }
   }
 
@@ -998,6 +1026,16 @@
         fill.style.width = `${details.percent}%`;
         track.append(fill);
       }
+      const period = quotaPeriod(span);
+      if (details.percent !== null && Number.isFinite(period.periodMs) && period.periodMs > 0 && period.resetTime) {
+        const marker = node('span', 'quota-time-marker');
+        marker.setAttribute('aria-hidden', 'true');
+        marker.dataset.periodMs = String(period.periodMs);
+        marker.dataset.resetAt = String(period.resetTime.getTime());
+        marker.dataset.used = String(details.used);
+        marker.dataset.monthEstimated = String(period.calendarMonth);
+        track.append(marker);
+      }
       row.append(heading, track);
       if (details.quantity) row.append(node('div', 'quota-tooltip-quantity', details.quantity));
       const meta = node('div', 'quota-tooltip-meta');
@@ -1018,6 +1056,7 @@
     }
     const scroll = quotaTooltip.scrollTop;
     quotaTooltip.replaceChildren(...content);
+    updateQuotaClocks();
     quotaTooltip.scrollTop = scroll;
   }
 
@@ -1163,24 +1202,9 @@
     view.image.alt = quota.name || quota.provider;
     view.account.textContent = !quota.user && quota.kind === 'plan' ? quota.name || card.account : shortAccount(card.account);
     view.account.title = card.account;
-    const resetTime = span?.resetsAt && !Number.isNaN(Date.parse(span.resetsAt)) ? new Date(span.resetsAt) : null;
-    const credits = /credits?|积分/i.test(`${span?.name || ''} ${span?.unit || ''}`);
-    const period = windowRank(span);
-    // 月窗口按下次重置时间倒推一个日历月；月末夹到上月最后一天，并明确标为估算。
-    const calendarMonth = /^(months?|monthly|月|每月|1\s*(months?|月))$/i.test((span?.name || '').trim());
+    const { resetTime, credits, periodMs, calendarMonth } = quotaPeriod(span);
     view.monthEstimated = calendarMonth;
-    let monthPeriod = NaN;
-    if (calendarMonth && resetTime) {
-      const start = new Date(resetTime);
-      const day = start.getUTCDate();
-      start.setUTCDate(1);
-      start.setUTCMonth(start.getUTCMonth() - 1);
-      const lastDay = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 0)).getUTCDate();
-      start.setUTCDate(Math.min(day, lastDay));
-      monthPeriod = resetTime.getTime() - start.getTime();
-    }
-    view.periodMs = !credits && !span?.unlimited
-      ? calendarMonth ? monthPeriod : !/months?|月/i.test(span?.name || '') && Number.isFinite(period) ? period * 60_000 : NaN : NaN;
+    view.periodMs = periodMs;
     view.resetAt = resetTime ? resetTime.getTime() : NaN;
     if (!Number.isFinite(view.periodMs) || !Number.isFinite(view.resetAt)) view.track.removeAttribute('aria-description');
     let remainingCredits = null;
