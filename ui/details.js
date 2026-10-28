@@ -14,22 +14,32 @@
   const ns = 'http://www.w3.org/2000/svg';
   const number = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
   const compact = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
+  const unitsScale = [
+    [1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'k'],
+  ];
+  function compactUnits(value) {
+    const sign = value < 0 ? '-' : '';
+    const absolute = Math.abs(value);
+    const scale = unitsScale.find(([threshold]) => absolute >= threshold);
+    return scale ? `${sign}${(absolute / scale[0]).toFixed(1)}${scale[1]}` : number.format(value);
+  }
   const node = (tag, text, className) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; if (className) el.className = className; return el; };
   function localDate(date = new Date()) { return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`; }
   function offset(date, days) { const d = new Date(`${date}T12:00:00`); d.setDate(d.getDate()+days); return localDate(d); }
   function dayStart(date) { return new Date(`${date}T00:00:00`).getTime(); }
   function stamp(value) { return new Date(value).toLocaleString('zh-CN', { hour12:false }); }
-  function sourceLabel(r) { return `${r.agent} · ${r.callerKeyName || '本机'}`; }
+  function sourceLabel(r) { return `${r.agent} · ${r.callerKeyName && r.callerKeyName !== '本机' ? window.hudRedact.text(r.callerKeyName) : (r.callerKeyName || '本机')}`; }
   function rowLabel(key, value) {
     if (key === 'sourceKey') return labels.get(value) || '所选来源（此范围暂无记录）';
-    if (key === 'accountKey') { try { const [p,a] = JSON.parse(value); return `${p || '供应商未记录'} · ${a || '账号未记录'}`; } catch { return value; } }
+    if (key === 'accountKey') { try { const [p,a] = JSON.parse(value); return `${p || '供应商未记录'} · ${window.hudRedact.text(a) || '账号未记录'}`; } catch { return value; } }
     return value || '未记录';
   }
   function valueText(value, key = metric, short = false) {
     if (value === null || value === undefined || !Number.isFinite(value)) return '—';
     if (key === 'cost' || key === 'average') return value === 0 ? '0.00' : value.toFixed(value < .01 ? 4 : 2);
     if (key === 'cache' || key === 'speed') return value.toFixed(1);
-    return short ? compact.format(value) : number.format(value);
+    if (key === 'tokens') return compactUnits(value);
+    if (key === 'calls') return short ? compactUnits(value) : number.format(value);
   }
   function metricValue(stats) { return stats[metric]; }
   function clearDrill() { drill = null; page = 0; }
@@ -203,7 +213,7 @@
     // 不在每次指标/周期切换时替换原生下拉的选项，保留弹层和焦点状态。
     if(JSON.stringify([...control.options].map(o=>o.value))!==JSON.stringify(keys)) {
       control.replaceChildren();
-      keys.forEach(k => { const o=node('option',JSON.parse(k).map(x=>x || '未记录').join(' · ')); o.value=k; control.append(o); });
+      keys.forEach(k => { const [p,a,w] = JSON.parse(k); const o=node('option',[p || '未记录', window.hudRedact.text(a) || '未记录', w || '未记录'].join(' · ')); o.value=k; control.append(o); });
       if(keys.includes(selectedWindow)) control.value=selectedWindow;
     }
     const selected=control.value, previousCycle=cycleKey(cycle);
@@ -236,7 +246,7 @@
           :`窗口估值暂无法折算（${used==null?'无额度读数':'已用不足 1% 或暂无已定价费用'}）；周期累计 ${valueText(s.cost,'cost')} $ 见「实际使用估值」列`)
         :(entry.status==='error'?`窗口估值读取失败：${entry.error}`:'窗口估值加载中');
       const value=node('td',s?`${valueText(s[metric],metric)} ${units[metric]}`:'—','num');
-      value.title=s?`${metricNames[metric]} ${valueText(s[metric],metric)} ${units[metric]}${monetary?`；费用覆盖 ${s.priced}/${s.calls} 次；未覆盖部分不计入已知金额`:''}`
+      value.title=s?`${metricNames[metric]} ${valueText(s[metric],metric,true)} ${units[metric]}${monetary?`；费用覆盖 ${s.priced}/${s.calls} 次；未覆盖部分不计入已知金额`:''}`
         :(entry.status==='error'?`周期统计读取失败：${entry.error}`:'周期统计加载中');
       tr.append(value,estimateCell);
       const actual=node('td',s?`${valueText(s.cost,'cost')} $`:(entry.status==='error'?'读取失败':'加载中'),'num');
@@ -247,7 +257,7 @@
         spinner.setAttribute('aria-hidden','true');
         actual.prepend(spinner);
       }
-      actual.title=s?`周期开始至今累计 ${valueText(s.cost,'cost')} $ · ${number.format(s.tokens)} Token · ${s.calls} 次 · 费用覆盖 ${s.priced}/${s.calls}；按模型定价折算，非实际扣款；覆盖完整周期并遵循当前筛选${entry.data.warnings?.length?`；${entry.data.warnings.join('；')}`:''}`
+      actual.title=s?`周期开始至今累计 ${valueText(s.cost,'cost')} $ · ${valueText(s.tokens,'tokens',true)} Token · ${s.calls} 次 · 费用覆盖 ${s.priced}/${s.calls}；按模型定价折算，非实际扣款；覆盖完整周期并遵循当前筛选${entry.data.warnings?.length?`；${entry.data.warnings.join('；')}`:''}`
         :(entry.status==='error'?`实际使用读取失败：${entry.error}`:'实际使用加载中');
       tr.append(actual,s?node('td',String(s.calls),'num'):loadingCell(entry.status==='error'?'error':'loading'));
       if(monetary)tr.append(s?node('td',`${s.priced}/${s.calls} 次`,'num'):loadingCell(entry.status==='error'?'error':'loading'));
@@ -325,11 +335,11 @@
     thead.append(head);table.append(thead,tbody);
     entries.slice(page*pageSize,(page+1)*pageSize).forEach(entry=>{
       const tr=node('tr'); const cell=(text,numeric=false)=>{const td=node('td',text,numeric?'num':'');td.title=text;tr.append(td);};
-      if(requestMode){const r=entry.row;cell(stamp(r.timestamp));cell(`${r.model} · ${r.effort}`);cell(`${r.provider||'未记录'} · ${r.account}`);cell(sourceLabel(r));cell(({success:'成功',failed:'失败',cancelled:'取消',unknown:'未知'})[r.outcome]||'未知');}
+      if(requestMode){const r=entry.row;cell(stamp(r.timestamp));cell(`${r.model} · ${r.effort}`);cell(`${r.provider||'未记录'} · ${window.hudRedact.text(r.account)||'未记录'}`);cell(sourceLabel(r));cell(({success:'成功',failed:'失败',cancelled:'取消',unknown:'未知'})[r.outcome]||'未知');}
       else{const td=node('td'),b=node('button',entry.label);b.type='button';b.title=entry.label;b.addEventListener('click',()=>{drill={label:entry.label,ids:new Set(entry.rows.map(r=>r.id))};mode='requests';page=0;renderTable();});td.append(b);tr.append(td);}
       cell(`${valueText(entry.stats[metric])} ${units[metric]}`,true);
       if(!requestMode)cell(String(entry.stats.calls),true);
-      cell(number.format(entry.stats.input),true);cell(number.format(entry.stats.output),true);cell(number.format(entry.stats.cacheRead),true);
+      cell(compactUnits(entry.stats.input),true);cell(compactUnits(entry.stats.output),true);cell(compactUnits(entry.stats.cacheRead),true);
       if(!requestMode)cell(`${entry.stats.priced}/${entry.stats.calls} 次`,true);
       tbody.append(tr);
     });
@@ -359,7 +369,7 @@
     groupRows=makeBins(displayRows);
     $('chart-title').textContent=`${metricNames[metric]} · ${view==='trend'?'时间趋势':view==='cycles'?'周期内分组':'分组对比'}`;
     chart(groupRows);
-    const notes={tokens:`输入 ${number.format(stats.input)} + 输出 ${number.format(stats.output)} + 缓存读取 ${number.format(stats.cacheRead)} Token`,speed:`${stats.samples} 个有效成功样本 · 有效生成时间 ${(stats.generation/1000).toFixed(2)} 秒；不平均各请求速度`,cache:`缓存读取 /（输入 + 缓存读取），按 Token 加权`,calls:`成功 ${stats.success} · 失败 ${stats.failed} · 取消 ${stats.cancelled} · 未知 ${stats.unknown}`,cost:`费用覆盖 ${stats.priced}/${stats.calls} 次；按 Magpie 逐请求金额汇总，未覆盖部分不计入已知金额`,average:`已知费用 / ${stats.priced} 次已定价调用；未定价调用不参与均值`};
+    const notes={tokens:`输入 ${valueText(stats.input,'tokens',true)} + 输出 ${valueText(stats.output,'tokens',true)} + 缓存读取 ${valueText(stats.cacheRead,'tokens',true)} Token`,speed:`${stats.samples} 个有效成功样本 · 有效生成时间 ${(stats.generation/1000).toFixed(2)} 秒；不平均各请求速度`,cache:`缓存读取 /（输入 + 缓存读取），按 Token 加权`,calls:`成功 ${stats.success} · 失败 ${stats.failed} · 取消 ${stats.cancelled} · 未知 ${stats.unknown}`,cost:`费用覆盖 ${stats.priced}/${stats.calls} 次；按 Magpie 逐请求金额汇总，未覆盖部分不计入已知金额`,average:`已知费用 / ${stats.priced} 次已定价调用；未定价调用不参与均值`};
     $('metric-note').textContent=notes[metric]+(cycle&&view==='cycles'?' · 统计所选完整周期':'');
     renderTable();
   }
@@ -393,6 +403,8 @@
     $('start').value=context.date||localDate();$('end').value=context.date||localDate();$('grain').value='hour';view='trend';mode='groups';render();load();
   }
   $('range-form').addEventListener('submit',e=>{e.preventDefault();cycle=null;load();});$('refresh').addEventListener('click',load);
+  $('redact').addEventListener('click',()=>window.hudRedact.toggle());
+  window.addEventListener('hud-redact-change',()=>{if(data){labels=new Map(data.rows.map(r=>[r.sourceKey,sourceLabel(r)]));for(const o of $('cycle-window').options){const [p,a,w]=JSON.parse(o.value);o.textContent=[p||'未记录',window.hudRedact.text(a)||'未记录',w||'未记录'].join(' · ');}buildFilters();render();}});
   document.querySelectorAll('[data-days]').forEach(b=>b.addEventListener('click',()=>{const days=Number(b.dataset.days);const end=days===-1?offset(localDate(),-1):localDate();$('end').value=end;$('start').value=days>0?offset(end,1-days):end;$('grain').value=days>1?'day':'hour';cycle=null;load();}));
   $('clear').addEventListener('click',()=>{resetFilters();buildFilters();render();});
   document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>{view=b.dataset.view;clearDrill();render();}));

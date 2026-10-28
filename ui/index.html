@@ -4,30 +4,32 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Magpie HUD V.0.0.32</title>
+  <title>Magpie HUD V.0.1.0</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="hud.css?v=0.0.32-20261027-compact-metrics">
-  <script src="motion.js?v=0.0.32-20261025-continuous-motion" defer></script>
+  <link rel="stylesheet" href="hud.css?v=0.1.0-20261027-compact-metrics">
+  <script src="motion.js?v=0.1.0-20261025-continuous-motion" defer></script>
   <script src="hourly.js?v=0.0.28-20261022-endpoint-motion" defer></script>
   <link rel="stylesheet" href="dates.css?v=20261023-deeper-heat">
   <script src="dates.js?v=20261023-caller-stats" defer></script>
   <link rel="stylesheet" href="history.css?v=20261025-history-turn-groups">
-  <script src="history.js?v=20261025-history-4m-1s" defer></script>
+  <script src="history.js?v=20261028-redact" defer></script>
   <link rel="stylesheet" href="model-usage.css?v=20261027-model-usage-v31">
   <script src="model-usage.js?v=20261028-model-colors-v32" defer></script>
   <link rel="stylesheet" href="decision-route.css?v=20261028-decision-passed">
   <script src="decision-route.js?v=20261028-decision-passed" defer></script>
-  <script src="hud.js?v=0.0.32-20261028-jev-icon" defer></script>
+  <script src="redact.js?v=20261028-redact" defer></script>
+  <script src="hud.js?v=0.1.0-20261028-redact" defer></script>
 </head>
 <body>
 <main class="hud" id="hud" data-state="waiting" data-sources="compact" data-focus="true">
   <header class="window-bar" id="drag-region" data-tauri-drag-region>
     <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg>
-    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.0.0.32</span></h1><span class="brand-subtitle">路由监视</span>
+    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.0.1.0</span></h1><span class="brand-subtitle">路由监视</span>
     <span class="watch-state" id="watch-label" role="status">等待今日记录</span>
     <button id="agent-select" class="agent-select" type="button" role="combobox" aria-label="按 Agent 筛选路由" aria-haspopup="listbox" aria-expanded="false" aria-controls="agent-options"><span class="agent-caption">Agent</span><span class="agent-icon" aria-hidden="true">∗</span><span class="agent-value">全部</span><span class="agent-arrow" aria-hidden="true">⌄</span></button>
     <label class="scope-label" for="session-select">查看</label>
     <select id="session-select" aria-label="按会话查看路由"><option value="*">最近会话</option></select>
+    <button id="redact" class="window-button" type="button" data-redact aria-label="账号打码" aria-pressed="false" title="账号打码已关闭"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10s3-5 7-5 7 5 7 5-3 5-7 5-7-5-7-5Z"/><circle cx="10" cy="10" r="2.2"/></svg></button>
     <button id="pin" class="window-button" type="button" aria-label="置顶窗口" aria-pressed="true" title="置顶窗口"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3h6m-5 0v5l-3 3v1h10v-1l-3-3V3M10 12v5"/></svg></button>
     <button id="hide-window" class="window-button" type="button" aria-label="最小化到托盘" title="最小化到托盘"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10h10"/></svg></button>
     <button id="close-window" class="window-button" type="button" aria-label="关闭程序" title="关闭程序"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8"/></svg></button>

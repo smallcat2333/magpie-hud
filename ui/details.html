@@ -5,11 +5,12 @@
   <meta name="color-scheme" content="dark"><title>Magpie HUD · 用量详情</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
   <link rel="stylesheet" href="details.css?v=20261024-window-controls">
-  <script src="details-data.js?v=20261024-request-costs" defer></script><script src="details.js?v=20261024-cycle-scoped-pricing" defer></script>
+  <script src="redact.js?v=20261028-redact" defer></script>
+  <script src="details-data.js?v=20261024-request-costs" defer></script><script src="details.js?v=20261028-redact" defer></script>
 </head>
 <body>
 <main>
-  <header class="page-head" data-tauri-drag-region><div class="brand" data-tauri-drag-region><img src="icons/magpie.svg" alt="" data-tauri-drag-region><h1 data-tauri-drag-region>用量详情 <small data-tauri-drag-region>Magpie HUD</small></h1></div><div class="window-actions"><button id="refresh" type="button">刷新</button><button id="detail-minimize" class="window-control" type="button" aria-label="最小化" title="最小化">─</button><button id="detail-maximize" class="window-control" type="button" aria-label="最大化或还原" title="最大化或还原">□</button><button id="detail-close" class="window-control" type="button" aria-label="关闭用量详情" title="关闭（Esc）">×</button></div></header>
+  <header class="page-head" data-tauri-drag-region><div class="brand" data-tauri-drag-region><img src="icons/magpie.svg" alt="" data-tauri-drag-region><h1 data-tauri-drag-region>用量详情 <small data-tauri-drag-region>Magpie HUD</small></h1></div><div class="window-actions"><button id="redact" class="window-control" type="button" data-redact aria-label="账号打码" aria-pressed="false" title="账号打码已关闭">码</button><button id="refresh" type="button">刷新</button><button id="detail-minimize" class="window-control" type="button" aria-label="最小化" title="最小化">─</button><button id="detail-maximize" class="window-control" type="button" aria-label="最大化或还原" title="最大化或还原">□</button><button id="detail-close" class="window-control" type="button" aria-label="关闭用量详情" title="关闭（Esc）">×</button></div></header>
   <section aria-label="统计范围" class="filters">
     <form id="range-form" class="date-row">
       <label>开始日期<input id="start" type="date" required></label><span class="date-separator">—</span>

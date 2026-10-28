@@ -66,6 +66,11 @@
     return `${local.length > 10 ? `${local.slice(0, 5)}…${local.slice(-3)}` : local}${account.slice(at)}`;
   }
 
+  /** 打码开启时账号与网关密钥一律换成稳定占位，关闭时保持原文。 */
+  function maskAccount(value) {
+    return window.hudRedact.text(value);
+  }
+
   /** 按实际模型族选择随应用打包的图标，未知模型显示中性符号。 */
   function modelIcon(model) {
     const name = model.toLowerCase();
@@ -165,7 +170,7 @@
     button.setAttribute('role', 'listitem');
     const [symbol, state, status] = statusInfo(card);
     button.dataset.status = status;
-    const tooltip = `${card.account}\n${session.label}: ${session.id || '日志未提供会话 ID'}\n${card.model} · ${card.effort}\n${card.time} · ${card.detail}${card.error ? `\n${card.error}` : ''}`;
+    const tooltip = `${maskAccount(card.account)}\n${session.label}: ${session.id || '日志未提供会话 ID'}\n${card.model} · ${card.effort}\n${card.time} · ${card.detail}${card.error ? `\n${card.error}` : ''}`;
     button.title = tooltip;
     button.setAttribute('aria-label', tooltip.replaceAll('\n', '，'));
     const icon = document.createElement('span');
@@ -240,8 +245,8 @@
     bottom.className = 'card-bottom';
     const label = document.createElement('span');
     label.className = 'card-account';
-    label.textContent = /^(正在选择账号|账号未提供)$/.test(card.account) ? '待定' : shortAccount(card.account);
-    label.title = card.account;
+    label.textContent = /^(正在选择账号|账号未提供)$/.test(card.account) ? '待定' : shortAccount(maskAccount(card.account));
+    label.title = maskAccount(card.account);
     const separator = document.createElement('span');
     separator.className = 'divider';
     separator.textContent = '·';
@@ -300,7 +305,7 @@
     clock.title = card.updatedAt ? `最近请求活动 ${new Date(card.updatedAt).toLocaleString('zh-CN', { hour12: false })}` : '更新时间未提供';
     const headingAccount = label.cloneNode(true);
     headingAccount.classList.add('card-heading-account');
-    headingAccount.textContent = /^(正在选择账号|账号未提供)$/.test(card.account) ? '待定' : card.account;
+    headingAccount.textContent = /^(正在选择账号|账号未提供)$/.test(card.account) ? '待定' : maskAccount(card.account);
     const headingDivider = document.createElement('span');
     headingDivider.className = 'card-heading-divider';
     headingDivider.textContent = '|';
@@ -541,7 +546,7 @@
       byId(`line${index + 1}-text`).closest('.note-row').hidden = !note;
       text(`line${index + 1}-time`, note?.time || '');
       text(`line${index + 1}-kind`, note?.kind || '');
-      text(`line${index + 1}-text`, note?.text || '');
+      text(`line${index + 1}-text`, window.hudRedact.scrub(note?.text || ''));
     }
   }
 
@@ -617,7 +622,8 @@
   }
 
   function callerName(source) {
-    return (source.callerKeyId && snapshot?.callerKeyNames?.[source.callerKeyId]) || source.callerKeyName || '本机';
+    const name = (source.callerKeyId && snapshot?.callerKeyNames?.[source.callerKeyId]) || source.callerKeyName || '本机';
+    return name === '本机' ? name : maskAccount(name);
   }
 
   function sourceLabel(source) {
@@ -667,7 +673,7 @@
     [...sessions, ...(snapshot.agentStats || [])].forEach(source => sources.set(sourceKey(source), source));
     const agents = [...sources.keys()].sort((a, b) => sourceLabel(sources.get(a)).localeCompare(sourceLabel(sources.get(b))));
     if (!sources.has(selectedAgent)) selectedAgent = '*';
-    const key = JSON.stringify([selectedAgent, agents.map(key => [key, callerName(sources.get(key))])]);
+    const key = JSON.stringify([selectedAgent, agents.map(key => [key, callerName(sources.get(key))]), window.hudRedact.enabled]);
     if (key === agentOptionsKey) return;
     const focusedAgent = agentOptions.contains(document.activeElement) ? document.activeElement.dataset.agent : null;
     agentOptionsKey = key;
@@ -991,7 +997,7 @@
   /** 只在悬停或聚焦的账号上展开；渲染仍只使用 textContent。 */
   function renderQuotaTooltip(view) {
     const { card, models, quota, windows } = view.entry;
-    const key = JSON.stringify([quota, card.account, [...models], snapshot.quotaError]);
+    const key = JSON.stringify([quota, card.account, [...models], snapshot.quotaError, window.hudRedact.enabled]);
     if (key === quotaTooltipKey) return;
     quotaTooltipKey = key;
     const node = (tag, className, text) => {
@@ -1002,7 +1008,7 @@
     };
     const header = node('div', 'quota-tooltip-heading');
     const identity = node('div', 'quota-tooltip-identity');
-    identity.append(node('strong', '', quota.name || quota.provider), node('span', 'quota-tooltip-account', card.account));
+    identity.append(node('strong', '', window.hudRedact.scrub(quota.name || quota.provider)), node('span', 'quota-tooltip-account', maskAccount(card.account)));
     const count = quota.windows.length;
     header.append(identity, node('span', 'quota-tooltip-count', `${count} 个窗口`));
     const content = [header];
@@ -1201,9 +1207,9 @@
     if (family && view.image.getAttribute('src') !== iconPath) view.image.src = iconPath;
     view.image.hidden = !family;
     view.fallback.hidden = Boolean(family);
-    view.image.alt = quota.name || quota.provider;
-    view.account.textContent = !quota.user && quota.kind === 'plan' ? quota.name || card.account : shortAccount(card.account);
-    view.account.title = card.account;
+    view.image.alt = window.hudRedact.scrub(quota.name || quota.provider);
+    view.account.textContent = !quota.user && quota.kind === 'plan' ? window.hudRedact.scrub(quota.name) || maskAccount(card.account) : shortAccount(maskAccount(card.account));
+    view.account.title = maskAccount(card.account);
     const { resetTime, credits, periodMs, calendarMonth } = quotaPeriod(span);
     view.monthEstimated = calendarMonth;
     view.periodMs = periodMs;
@@ -1223,7 +1229,7 @@
     const percent = used === null ? null : Math.min(100, Math.max(0, used));
     const summary = percent !== null ? `已用 ${Number.isInteger(percent) ? percent : percent.toFixed(1)}%` : span?.unlimited ? '不限量' : quota.balance || '未提供';
     view.value.textContent = percent !== null ? `${Number.isInteger(percent) ? percent : percent.toFixed(1)}%` : span?.unlimited ? '∞' : '—';
-    view.track.setAttribute('aria-label', `${card.account} ${windowName} 已用额度`);
+    view.track.setAttribute('aria-label', `${maskAccount(card.account)} ${windowName} 已用额度`);
     view.track.setAttribute('aria-valuetext', summary);
     view.track.dataset.unknown = String(percent === null);
     if (percent !== null) {
@@ -1246,7 +1252,7 @@
       return [details.name, details.status, details.quantity, details.remaining, details.reset].filter(Boolean).join('，');
     });
     const readTime = read && !Number.isNaN(Date.parse(read)) ? new Date(read).toLocaleString('zh-CN', { hour12: false }) : read;
-    const description = [quota.name || quota.provider, card.account, [...models].join(' · '), ...windows,
+    const description = [window.hudRedact.scrub(quota.name || quota.provider), maskAccount(card.account), [...models].join(' · '), ...windows,
       quota.balance ? `余额 ${quota.balance}` : '', readTime ? `读数 ${readTime}` : '', snapshot.quotaError || quota.error || ''].filter(Boolean).join('，');
     // 系统 title 会遮住自绘浮层；完整口径保留在可访问名称中。
     [view.item, view.icon, view.account, view.reset, view.track, view.marker, view.value, view.label].forEach(element => element.removeAttribute('title'));
@@ -1559,7 +1565,7 @@
     sessions = filterAgent(sessions);
     const previous = selector.value;
     const options = [new Option('最近会话', '*')];
-    sessions.forEach(session => options.push(new Option(`${session.label} · ${shortAccount(session.routes[0]?.account || activeSubagents(session)[0]?.account || session.completedSubagents?.[0]?.account || '账号未提供')}`, session.id)));
+    sessions.forEach(session => options.push(new Option(`${session.label} · ${shortAccount(maskAccount(session.routes[0]?.account || activeSubagents(session)[0]?.account || session.completedSubagents?.[0]?.account || '账号未提供'))}`, session.id)));
     selector.replaceChildren(...options);
     selector.value = sessions.some(session => session.id === previous) ? previous : '*';
   }
@@ -1569,6 +1575,11 @@
     if (snapshot && next.revision < snapshot.revision) return;
     if (snapshot && next.revision === snapshot.revision) return;
     snapshot = next;
+    for (const session of next.sessions || []) {
+      window.hudRedact.remember(session.callerKeyName);
+      for (const card of [...(session.routes || []), ...(session.subagents || []), ...(session.completedSubagents || []), ...(session.quotaRoutes || [])]) window.hudRedact.remember(card.account);
+    }
+    Object.values(next.callerKeyNames || {}).forEach(window.hudRedact.remember);
     updateChildPresence(next);
     updateSessionOrder(next);
     updateSelector(sessionsForView());
@@ -1671,6 +1682,15 @@
     document.querySelector('.content').addEventListener('scroll', () => requestDraw(), { passive: true });
     reduced.addEventListener('change', () => requestDraw());
     document.addEventListener('visibilitychange', () => { if (!document.hidden) render(false); });
+    byId('redact').addEventListener('click', () => window.hudRedact.toggle());
+    window.addEventListener('hud-redact-change', () => {
+      agentOptionsKey = '';
+      quotaTooltipKey = '';
+      if (!snapshot) return;
+      updateSelector(sessionsForView());
+      render(false);
+      window.hudHistory?.redraw();
+    });
     if (!window.__TAURI__) {
       text('watch-label', '界面预览 · 等待演示数据');
       return;

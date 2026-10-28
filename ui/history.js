@@ -182,7 +182,7 @@
     routes.querySelectorAll('[aria-controls="route-history"]').forEach(element => element.setAttribute('aria-expanded', String(element === card)));
     title.textContent = `${scope.label || '未命名会话'} · 请求履历`;
     title.title = title.textContent;
-    subtitle.textContent = [scope.source, scope.subagent ? '子 Agent' : '主会话'].filter(Boolean).join(' · ');
+    subtitle.textContent = window.hudRedact.scrub([scope.source, scope.subagent ? '子 Agent' : '主会话'].filter(Boolean).join(' · '));
     subtitle.title = `${scope.session}${scope.subagent ? ` / ${scope.subagent}` : ''}`;
     updatePin();
     position();
@@ -280,8 +280,8 @@
     const fragment = document.createDocumentFragment();
     const cellOf = (tr, value, className = '', detail = '') => {
       const td = node('td', className);
-      const text = node('span', 'history-cell', value);
-      text.title = detail || String(value);
+      const text = node('span', 'history-cell', window.hudRedact.scrub(value));
+      text.title = window.hudRedact.scrub(detail || String(value));
       td.append(text);
       tr.append(td);
       return td;
@@ -364,7 +364,7 @@
         const childGroups = (row.routeGroups || []).join(' → ');
         cellOf(child, childGroups || row.ruleTarget || '—', 'history-decision', [row.ruleTarget && `规则目标 ${row.ruleTarget}`, childGroups && `实际路径 ${childGroups}`].filter(Boolean).join('\n') || '规则判定未记录');
         const model = row.served || row.model || '—';
-        cellOf(child, model, 'history-model', [`发送模型 ${row.model || '未记录'}`, `响应报告模型 ${row.served || '未记录'}`, row.account && `账号 ${row.account}`, row.provider && `供应商 ${row.provider}`].filter(Boolean).join('\n'));
+        cellOf(child, model, 'history-model', [`发送模型 ${row.model || '未记录'}`, `响应报告模型 ${row.served || '未记录'}`, row.account && `账号 ${window.hudRedact.text(row.account)}`, row.provider && `供应商 ${row.provider}`].filter(Boolean).join('\n'));
         effortOf(cellOf(child, '', 'history-effort'), row.effort);
         cellOf(child, compact(row.tokens), 'history-number', `最终日志条目 Token ${number(row.tokens)}\n输入 ${number(row.input)} · 输出 ${number(row.output)} · 缓存读取 ${number(row.cacheRead)}`);
         cellOf(child, Number.isFinite(row.tokensPerSecond) ? row.tokensPerSecond.toFixed(1) : '—', 'history-number', '输出 Token ÷（总耗时 − 首字耗时），单位 tok/s');
@@ -462,6 +462,12 @@
     beforeRender() {
       focusedScope = metaOf(cardAt(document.activeElement));
     },
+    redraw() {
+      if (view?.data) {
+        subtitle.textContent = window.hudRedact.scrub([view.scope.source, view.scope.subagent ? '子 Agent' : '主会话'].filter(Boolean).join(' · '));
+        render(view.data);
+      }
+    },
     reconcile() {
       if (focusedScope) {
         anchorFor(focusedScope)?.focus({ preventScroll: true });
@@ -478,7 +484,7 @@
         view.scope = metaOf(anchor);
         title.textContent = `${view.scope.label} · 请求履历`;
         title.title = title.textContent;
-        subtitle.textContent = [view.scope.source, view.scope.subagent ? '子 Agent' : '主会话'].filter(Boolean).join(' · ');
+        subtitle.textContent = window.hudRedact.scrub([view.scope.source, view.scope.subagent ? '子 Agent' : '主会话'].filter(Boolean).join(' · '));
       }
       position();
       if (containsInteraction()) clearTimeout(hideTimer);
