@@ -185,23 +185,29 @@ impl PricedRequest {
 
 /// 分页期间可能新增请求：按精确身份去重，不把重叠页重复收费。
 /// 无法配对、定价冲突或未返回的请求保持未知；不借用会话/模型合计补齐。
-fn request_costs<F>(rows: &[usage::UsageDetailRow], period: &str, mut fetch: F) -> (Vec<CostGroup>, Vec<String>)
+fn match_request_costs<F>(rows: &[usage::UsageDetailRow], period: &str, mut fetch: F) -> (HashMap<String, Option<PricedRequest>>, Vec<String>, bool)
 where F: FnMut(usize) -> Result<PricePage, String> {
-    let wanted: HashMap<_,_> = rows.iter().map(|r|(r.id.as_str(),r)).collect();
+    let wanted: HashMap<_,_> = rows.iter().filter(|r| r.cost_matchable).map(|r|(r.id.as_str(),r)).collect();
+    if wanted.is_empty() {
+        return (HashMap::new(), if rows.is_empty() { Vec::new() } else { vec![format!("逐请求费用匹配 0/{} 次；用量不完整，费用未知", rows.len())] }, false);
+    }
     let mut found: HashMap<String, Option<PricedRequest>> = HashMap::new();
     let mut warnings = Vec::new();
+    let mut fetch_failed = false;
     let started = Instant::now();
     let mut offset = 0;
     let mut scan_limit = None;
     loop {
         if started.elapsed() > Duration::from_secs(90) {
+            fetch_failed = true;
             warnings.push("逐请求费用读取超时，已匹配费用保留，其余未知".into()); break;
         }
         let page = match fetch(offset) {
             Ok(page) => page,
-            Err(_) => { warnings.push("逐请求费用接口读取失败，已匹配费用保留，其余未知".into()); break; }
+            Err(_) => { fetch_failed = true; warnings.push("逐请求费用接口读取失败，已匹配费用保留，其余未知".into()); break; }
         };
         if page.period != period || page.offset != offset || page.rows.len() > 500 {
+            fetch_failed = true;
             warnings.push("逐请求费用分页范围不匹配，该页未采用".into()); break;
         }
         // 有界扫描；多留一页容纳读取过程中前端新增的请求。
@@ -221,18 +227,92 @@ where F: FnMut(usize) -> Result<PricePage, String> {
         if found.len() == wanted.len() || count == 0 || offset + count >= page.total { break; }
         offset += count;
         if offset >= limit {
+            fetch_failed = true;
             warnings.push("逐请求费用达到本次读取上限，其余请求保持未知".into()); break;
         }
     }
-    let mut matched = 0;
+    let matched = rows.iter().filter(|row| found.get(&row.id).is_some_and(|p| p.is_some())).count();
+    if matched < rows.len() { warnings.push(format!("逐请求费用匹配 {matched}/{} 次；未匹配或冲突请求费用未知",rows.len())); }
+    (found, warnings, fetch_failed)
+}
+
+fn request_costs<F>(rows: &[usage::UsageDetailRow], period: &str, fetch: F) -> (Vec<CostGroup>, Vec<String>)
+where F: FnMut(usize) -> Result<PricePage, String> {
+    let (found, warnings, _) = match_request_costs(rows, period, fetch);
     let costs = rows.iter().filter_map(|row| {
         let priced = found.get(&row.id)?.as_ref()?;
-        matched += 1;
         let cost = priced.cost.filter(|cost|cost.is_finite() && *cost >= 0.0 && priced.priced)?;
         Some(CostGroup { session: row.session.clone(), row_ids: vec![row.id.clone()], cost, priced:1, unpriced:0 })
     }).collect();
-    if matched < rows.len() { warnings.push(format!("逐请求费用匹配 {matched}/{} 次；未匹配或冲突请求费用未知",rows.len())); }
     (costs, warnings)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCostData {
+    pub date: String,
+    pub ledger_revision: u64,
+    /// 接口、分页或读取预算出错时，不用这次不完整结果覆盖旧费用。
+    pub fetch_failed: bool,
+    pub rows: Vec<ModelCostRow>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCostRow {
+    pub model: String,
+    pub effort: String,
+    pub cost: Option<f64>,
+    pub priced: u64,
+    pub unpriced: u64,
+    pub unmatched: u64,
+}
+
+/// 费用只在前端请求时查询回环网关，按原始日志行精确匹配并只返回模型/强度合计。
+pub fn model_costs(rows: Vec<usage::UsageDetailRow>, host: &str, date: &str, ledger_revision: u64) -> ModelCostData {
+    let mut warnings = Vec::new();
+    let period = format!("{date}..{date}");
+    let mut fetch_failed = false;
+    let matched = if rows.is_empty() {
+        HashMap::new()
+    } else if let Ok(base) = live::gateway_url(host) {
+        let scope = pricing_scope(&rows);
+        let client = live::client(Duration::from_secs(5));
+        let (matched, messages, failed) = match_request_costs(&rows, &period, |offset| {
+            live::read_json::<PricePage>(&client, &format!("{base}/v1/magpie/usage/requests?period={period}&via=through&limit=500&offset={offset}{scope}"))
+        });
+        warnings.extend(messages);
+        fetch_failed = failed;
+        matched
+    } else {
+        fetch_failed = true;
+        warnings.push("网关地址无效，逐请求费用未读取".into());
+        HashMap::new()
+    };
+    let mut result = summarize_model_costs(&rows, &matched, date, warnings);
+    result.ledger_revision = ledger_revision;
+    result.fetch_failed = fetch_failed;
+    result
+}
+
+fn summarize_model_costs(rows: &[usage::UsageDetailRow], matched: &HashMap<String, Option<PricedRequest>>, date: &str, warnings: Vec<String>) -> ModelCostData {
+    let mut grouped = BTreeMap::<(String, String), ModelCostRow>::new();
+    for row in rows {
+        let key = (row.model.clone(), row.effort.clone());
+        let group = grouped.entry(key).or_insert_with(|| ModelCostRow {
+            model: row.model.clone(), effort: row.effort.clone(), cost: None, priced: 0, unpriced: 0, unmatched: 0,
+        });
+        match matched.get(&row.id).and_then(|p| p.as_ref()) {
+            None => group.unmatched += 1,
+            Some(price) if !price.priced => group.unpriced += 1,
+            Some(price) => match price.cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+                Some(cost) => { group.priced += 1; group.cost = Some(group.cost.unwrap_or(0.0) + cost); },
+                None => group.unmatched += 1,
+            }
+        }
+    }
+    ModelCostData { date: date.into(), ledger_revision: 0, fetch_failed: false, rows: grouped.into_values().collect(), warnings }
 }
 
 fn stamp(value: &str) -> Option<i64> { DateTime::parse_from_rfc3339(value).ok().map(|v|v.timestamp_millis()) }
@@ -304,7 +384,7 @@ mod tests {
             id:String::new(),timestamp:0,date:String::new(),hour:0,session:"s".into(),agent:String::new(),
             caller_key_id:String::new(),caller_key_name:String::new(),source_key:r#"["Claude Code","key-a"]"#.into(),
             provider:provider.into(),account:account.into(),model:model.into(),effort:effort.into(),
-            outcome:"success".into(),input:0,output:0,cache_read:0,tokens:0,generation_ms:None};
+            outcome:"success".into(),input:0,output:0,cache_read:0,tokens:0,generation_ms:None,cost_matchable:true};
         let account_key=serde_json::to_string(&["vendor","account"]).unwrap();
         let key_for=|p:&str,a:&str| serde_json::to_string(&[p,a]).unwrap();
         let decoded: DetailFilters = serde_json::from_value(serde_json::json!({
@@ -368,6 +448,8 @@ mod tests {
         assert_eq!(costs[0].cost,0.0);
         let (costs,_)=request_costs(&rows,period,|offset|Ok(PricePage{period:"wrong".into(),offset,total:1,rows:vec![priced.clone()]}));
         assert!(costs.is_empty());
+        let (_, _, fetch_failed) = match_request_costs(&rows,period,|_|Err("simulated disconnect".into()));
+        assert!(fetch_failed, "费用接口失败不能被当成成功结果覆盖旧值");
         let mut second=priced.clone();second.route_id=Some(2);
         let mut second_row=rows[0].clone();second_row.id=second.identity().unwrap();
         let both=vec![rows[0].clone(),second_row];
@@ -382,6 +464,65 @@ mod tests {
             Ok(PricePage{period:period.into(),offset,total:2,rows:vec![priced.clone()]})
         });
         assert_eq!(costs.len(),1);assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn model_cost_summary_distinguishes_zero_unpriced_and_unmatched() {
+        let row = |id: &str, effort: &str| usage::UsageDetailRow {
+            id:id.into(),timestamp:0,date:String::new(),hour:0,session:"s".into(),agent:String::new(),
+            caller_key_id:String::new(),caller_key_name:String::new(),source_key:String::new(),
+            provider:String::new(),account:String::new(),model:"m".into(),effort:effort.into(),
+            outcome:"success".into(),input:0,output:0,cache_read:0,tokens:0,generation_ms:None,cost_matchable:true,
+        };
+        let rows = vec![row("zero", "high"), row("unpriced", "high"), row("missing", "high"), row("conflict", "none")];
+        let priced: PricedRequest = serde_json::from_value(serde_json::json!({
+            "t":"2026-10-27T00:00:00Z", "route_id":1, "status":200, "priced":true, "cost":0.0,
+        })).unwrap();
+        let mut no_price = priced.clone();
+        no_price.priced = false;
+        let matched = HashMap::from([("zero".to_string(), Some(priced)), ("unpriced".to_string(), Some(no_price)), ("conflict".to_string(), None)]);
+        let data = summarize_model_costs(&rows, &matched, "2026-10-27", vec![]);
+        let high = data.rows.iter().find(|row| row.effort == "high").unwrap();
+        assert_eq!((high.cost, high.priced, high.unpriced, high.unmatched), (Some(0.0), 1, 1, 1));
+        let none = data.rows.iter().find(|row| row.effort == "none").unwrap();
+        assert_eq!((none.cost, none.priced, none.unpriced, none.unmatched), (None, 0, 0, 1));
+    }
+
+    #[test]
+    fn model_costs_match_simulated_pages_without_fabricating_prices() {
+        let price = |route_id: i64, cost: Option<f64>, priced: bool| -> PricedRequest {
+            serde_json::from_value(serde_json::json!({
+                "route_id": route_id, "t": "2026-10-27T00:00:00Z", "status": 200,
+                "session": "session-a", "provider": "vendor", "providerAccount": "account",
+                "in": 10, "out": 20, "cache_read": 5, "priced": priced, "cost": cost,
+            })).unwrap()
+        };
+        let row = |price: &PricedRequest, matchable| usage::UsageDetailRow {
+            id: price.identity().unwrap(), timestamp: stamp(&price.t).unwrap(), date: "2026-10-27".into(),
+            hour: 0, session: "session-a".into(), agent: "Claude Desktop".into(),
+            caller_key_id: "key".into(), caller_key_name: String::new(), source_key: String::new(),
+            provider: "vendor".into(), account: "account".into(), model: "model-a".into(), effort: "high".into(),
+            outcome: "success".into(), input: 10, output: 20, cache_read: 5, tokens: 35,
+            generation_ms: None, cost_matchable: matchable,
+        };
+        let zero = price(1, Some(0.0), true);
+        let unpriced = price(2, None, false);
+        let missing = price(3, Some(1.5), true);
+        let conflict = price(4, Some(1.0), true);
+        let mut conflicting = conflict.clone();
+        conflicting.cost = Some(2.0);
+        let rows = vec![row(&zero, true), row(&unpriced, true), row(&missing, false), row(&conflict, true)];
+        let period = "2026-10-27..2026-10-27";
+        let (matched, warnings, fetch_failed) = match_request_costs(&rows, period, |offset| Ok(PricePage {
+            period: period.into(), offset, total: 4,
+            rows: vec![zero.clone(), unpriced.clone(), conflict.clone(), conflicting.clone()],
+        }));
+        assert!(!fetch_failed);
+        let summary = summarize_model_costs(&rows, &matched, "2026-10-27", warnings);
+        assert_eq!(summary.rows.len(), 1);
+        let result = &summary.rows[0];
+        assert_eq!((result.cost, result.priced, result.unpriced, result.unmatched), (Some(0.0), 1, 1, 2));
+        assert!(!summary.warnings.is_empty(), "缺失与冲突行必须提示覆盖不完整");
     }
 
     #[test]

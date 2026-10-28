@@ -70,6 +70,7 @@
   function modelIcon(model) {
     const name = model.toLowerCase();
     const families = [
+      ['typesafe', /(?:^|\/)jev(?:[-/]|$)|typesafe/],
       ['feishu', /feishu|lark|飞书/],
       ['xiaomimimo', /mimo|xiaomi/],
       ['siliconcloud-color', /silicon/],
@@ -121,6 +122,7 @@
     const match = families.find(([, pattern]) => pattern.test(name));
     return match ? match[0] : null;
   }
+  window.hudModelIcon = modelIcon;
 
   /** 展示统一为完成、运行、异常三类；异常类别按取消、失败、未知区分。 */
   function statusInfo(card) {
@@ -1270,6 +1272,7 @@
     byId('active-sessions').title = activeHint;
     byId('active-sessions').setAttribute('aria-label', activeHint);
     hud.dataset.scope = session ? 'session' : 'all';
+    window.hudDecision?.update(snapshot.decisions || [], session ? [session] : allSessions, !session && selectedAgent === '*');
     const { protectedSessions, recent } = orderedSessions(visibleSessions);
     const chooseSessions = () => session ? [session] : [...protectedSessions, ...recent.slice(0, Math.max(0, visibleSessionCapacity() - protectedSessions.length))];
     let sessions = chooseSessions();
@@ -1299,6 +1302,16 @@
       projectHistory: view => ({ ...view, daily: statsForSource(view), scope: statsScope() }),
     } }));
     renderQuotas(session ? [session] : filterAgent(snapshot.sessions), forceQuotaOrder);
+    // 模型统计来自完整当日账本，而不是屏幕上截断后的会话卡片。
+    const modelRows = (snapshot.modelUsage || []).filter(row =>
+      (!session || row.session === session.id) && (selectedAgent === '*' || sourceKey(row) === selectedAgent));
+    // 费用查询只认当前账本日期；日期或版本变化后必须重新匹配，不能沿用上一天的合计。
+    window.hudModelUsage?.update(modelRows, session ? session.label : statsScope(), {
+      date: snapshot.date || '',
+      session: session ? session.id : null,
+      sourceKey: selectedAgent === '*' ? null : selectedAgent,
+      revision: snapshot.ledgerRevision || 0,
+    });
     byId('empty-route').querySelector('strong').textContent = selectedAgent === '*' ? '尚无今日会话' : `${statsScope()} 暂无会话`;
     if (!agentOptions.hidden) positionAgentOptions();
     if (hud.dataset.layout === 'tall') {

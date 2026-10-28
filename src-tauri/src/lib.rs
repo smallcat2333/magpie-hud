@@ -187,6 +187,7 @@ pub fn run() {
             open_usage_details,
             usage_details_context,
             query_usage_details,
+            query_model_costs,
             query_route_history,
             set_pinned,
             reset_window_position,
@@ -549,6 +550,21 @@ async fn query_usage_details(app: AppHandle, start: String, end: String, filters
     };
     tauri::async_runtime::spawn_blocking(move || details::query(&path, &host, &start, &end, &filters.unwrap_or_default()))
         .await.map_err(|e| format!("详情查询任务失败：{e}"))?
+}
+
+/// 模型图费用按需查询：锁内仅复制当前账本的窄字段，网络分页在后台线程执行。
+#[tauri::command]
+async fn query_model_costs(app: AppHandle, session: Option<String>, source_key: Option<String>) -> Result<details::ModelCostData, String> {
+    let (host, date, ledger_revision, rows) = {
+        let state = app.state::<Arc<Mutex<Runtime>>>();
+        let runtime = state.lock().map_err(|_| "状态锁损坏")?;
+        let selected = session.as_deref().filter(|s| !s.is_empty());
+        let canonical = selected.map(|s| runtime.live.aliases.get(s).map(String::as_str).unwrap_or(s));
+        (runtime.config.magpie_host.clone(), runtime.snapshot.date.clone(), runtime.ledger.revision,
+         runtime.ledger.model_cost_rows(canonical, source_key.as_deref().filter(|s| !s.is_empty()), &runtime.live.aliases))
+    };
+    tauri::async_runtime::spawn_blocking(move || details::model_costs(rows, &host, &date, ledger_revision))
+        .await.map_err(|_| "模型费用查询任务失败".to_string())
 }
 
 /// 按需查询一个会话（或其某个子 Agent）的近期请求履历；只接收身份与条数，

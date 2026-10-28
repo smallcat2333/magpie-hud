@@ -3,7 +3,7 @@
 
 use crate::usage::{DailyStats, Note, RouteCard, RouteSnapshot, SessionView};
 use chrono::{DateTime, Local};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -64,6 +64,22 @@ pub struct LiveRoute {
     /// 组规则判定的白名单摘要；when 表达式等其余字段不接收。
     #[serde(default)]
     pub rule: Option<TraceRule>,
+    /// 嵌套组判定，只保留组身份与规则白名单。
+    #[serde(default)]
+    pub nested: Vec<TraceNestedRule>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+pub struct TraceNestedRule {
+    /// 上游 NestedRule.group：子组的 id 或 ref，用来精确关联，不按组名匹配。
+    #[serde(default)]
+    pub group: String,
+    /// 上游给的组名只作反序列化兼容；展示名取精确匹配到的子组，不用它匹配。
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub name: String,
+    #[serde(default)]
+    pub rule: Option<TraceRule>,
 }
 
 /// 规则判定摘要：规则目标（use）、判定强度（pick）与本轮命中的意图（classified.intent）。
@@ -75,12 +91,21 @@ pub struct LiveRoute {
 /// 上游仅对配置了规则的组给出 rule，普通单账号路由没有 turn 可言。
 #[derive(Clone, Default, Deserialize)]
 pub struct TraceRule {
+    /// 命中的规则序号，从 1 起；显式 0 表示没有任何规则命中，缺字段则为未知。
+    #[serde(default)]
+    pub n: Option<i64>,
     #[serde(default, rename = "use")]
     pub use_target: String,
     #[serde(default, rename = "pick")]
     pub pick: String,
     #[serde(default)]
     pub turn: Option<i64>,
+    /// 规则优先目标当前无人可接，组按没有该规则来路由。
+    #[serde(default)]
+    pub unready: bool,
+    /// 优先目标无人可接时，实际先走的替代成员。
+    #[serde(default)]
+    pub instead: String,
     #[serde(default)]
     pub held: bool,
     #[serde(default)]
@@ -98,6 +123,14 @@ pub struct TraceRule {
 /// fallback=previous 表示分类失败沿用了上一轮意图，展示时应标注非本轮实测。
 #[derive(Clone, Default, Deserialize)]
 pub struct TraceClassified {
+    /// 实际分类器的模型标识，不预设具体供应商或模型。
+    #[serde(default)]
+    pub by: String,
+    /// 判定函数总耗时（毫秒）；缺失不当作零。
+    #[serde(default)]
+    pub ms: Option<i64>,
+    #[serde(default)]
+    pub cached: bool,
     #[serde(default)]
     pub intent: String,
     #[serde(default)]
@@ -108,11 +141,18 @@ pub struct TraceClassified {
     pub fallback: String,
 }
 
-/// 组链信息只保留组名与直接子组，不读取成员账号或规则。
+/// 组链信息只保留组身份、已知选择策略与直接子组，不读取成员账号或规则。
 #[derive(Clone, Default, Deserialize)]
 pub struct RouteGroup {
     #[serde(default)]
+    pub id: String,
+    #[serde(default, rename = "ref")]
+    pub reference: String,
+    #[serde(default)]
     pub name: String,
+    /// 已知选择策略的结构字符串：order / rotate / usage，或空。
+    #[serde(default)]
+    pub routing: String,
     #[serde(default)]
     pub subs: Vec<RouteSubgroup>,
 }
@@ -126,6 +166,12 @@ pub struct RouteSubgroup {
     pub reference: String,
     #[serde(default)]
     pub name: String,
+    /// 已知选择策略的结构字符串：order / rotate / usage，或空。
+    #[serde(default)]
+    pub routing: String,
+    /// 该子组所在的父组 id；用来核验父子关系，不按组名推断。
+    #[serde(default, rename = "in")]
+    pub parent: String,
 }
 
 /// 路由候选的账号归属，仅按尝试 id 精确匹配。
@@ -163,6 +209,8 @@ pub struct Attempt {
     pub picked: bool,
     #[serde(default)]
     pub done: bool,
+    #[serde(default)]
+    pub status: Option<i64>,
     #[serde(default, rename = "firstText")]
     pub first_text: Option<u64>,
     /// 响应报告模型；与发送模型分开。
@@ -214,6 +262,114 @@ pub struct TurnRecord {
     pub fallback: String,
     /// 请求开始时间（本地毫秒），与日志 t 对齐用。
     pub time_ms: i64,
+}
+
+/// 判定区只发送路由白名单；不包含请求正文、规则表达式、候选账号或原始错误。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionRuleView {
+    pub group: String,
+    pub classifier: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub cached: bool,
+    pub intent: Option<String>,
+    pub intent_source: &'static str,
+    pub confidence: Option<f64>,
+    pub target: Option<String>,
+    pub effort: Option<String>,
+    /// 命中的规则序号：正数是命中，显式 0 是未命中，缺字段为未知。
+    pub n: Option<i64>,
+    /// 该请求所在用户输入的轮次序号；普通单账号路由没有轮次。
+    pub turn: Option<i64>,
+    /// 规则优先目标当前无人可接。
+    pub unready: bool,
+    /// 优先目标无人可接时记录的替代目标。
+    pub instead: Option<String>,
+    pub state: &'static str,
+}
+
+/// 已确认的组身份；routing 只保留已知策略结构字符串，不读取配置。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionGroupView {
+    pub id: Option<String>,
+    #[serde(rename = "ref")]
+    pub reference: Option<String>,
+    pub name: String,
+    pub routing: Option<String>,
+}
+
+/// 判定上下文的一个阶段：按上游记录顺序排列，不是该请求的实际执行路径。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionStageView {
+    /// 稳定阶段键：根组为 root，嵌套组带序号与精确身份。
+    pub key: String,
+    pub group: DecisionGroupView,
+    pub rule: Option<DecisionRuleView>,
+    /// 该阶段只是入口顺序上的判定上下文，不表示请求按此顺序经过这些组。
+    pub context: &'static str,
+    /// 组身份已用 id/ref 精确关联，且父子关系有证据；否则为假，不能当成路径的一环。
+    pub confirmed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionAttemptView {
+    /// 该请求内的尝试序号，从 1 起，包含模型未记录的尝试。
+    pub ordinal: i64,
+    pub model: String,
+    pub effort: Option<String>,
+    pub state: &'static str,
+    /// 该次尝试自己确认的组链，不借用其它尝试的路径。
+    pub group_chain: Vec<DecisionGroupView>,
+    /// 公共前缀在未知层级截断，后续路径不能唯一确认。
+    pub path_incomplete: bool,
+}
+
+/// 计划尝试顺序的一项；只保留序号、模型与固定强度，不发送账号或供应商。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionCandidateItem {
+    pub ordinal: i64,
+    pub model: String,
+    pub fixed: Option<String>,
+}
+
+/// 计划尝试顺序，不是已经发生的尝试；超出上限的项只计数量。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionCandidatePlan {
+    pub items: Vec<DecisionCandidateItem>,
+    pub total: i64,
+    pub omitted: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionView {
+    /// 网关进程与路由组成的稳定身份；不使用用户输入内容作为标识。
+    pub id: String,
+    pub session: String,
+    pub label: String,
+    pub subagent: Option<String>,
+    pub subagent_id: Option<String>,
+    pub started_ms: Option<i64>,
+    pub active: bool,
+    pub state: &'static str,
+    /// 活跃请求的等待原因；非等待或已结束时为 null。
+    pub wait_reason: Option<&'static str>,
+    /// 活跃请求的网关阶段白名单；已结束时不发送。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<&'static str>,
+    pub rules: Vec<DecisionRuleView>,
+    pub route_groups: Vec<String>,
+    /// 根组与嵌套组的有序阶段，按上游原序。
+    pub stages: Vec<DecisionStageView>,
+    pub attempts: Vec<DecisionAttemptView>,
+    /// 计划尝试顺序；没有候选时不发送。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_plan: Option<DecisionCandidatePlan>,
 }
 
 /// 累积的轮次索引上限；超出后按 route_id 递增顺序淘汰最旧条目。
@@ -340,6 +496,14 @@ impl LiveState {
             if session_id.is_empty() {
                 continue;
             }
+            if let Some(route) = route {
+                // activity 与 trace 的身份不一致且没有显式别名时，不猜测归属。
+                if !route.session.is_empty()
+                    && (active.session.is_empty() || self.canonical(&active.session) == self.canonical(&route.session))
+                    && !route.rule.as_ref().is_some_and(|rule| rule.compact) {
+                    view.decisions.push(self.decision_view(route, active, session_id));
+                }
+            }
             let started = DateTime::parse_from_rfc3339(&active.started).ok();
             let time = started.map(|t| t.with_timezone(&Local).format("%H:%M:%S").to_string())
                 .unwrap_or_else(|| "--:--:--".into());
@@ -452,6 +616,17 @@ impl LiveState {
                     notes: [note, second], daily: DailyStats::default(), caller_key_id, caller_key_name });
             }
         }
+        for route in self.routes.values().filter(|route| route.done && route.kind.is_empty()
+            && !route.session.is_empty() && !desktop_auxiliary(route)
+            && !route.rule.as_ref().is_some_and(|rule| rule.compact)) {
+            if view.decisions.iter().any(|decision| decision.id == format!("{}:{}:{}:{}", self.pid, route.id, route.session, route.subagent_id)) {
+                continue;
+            }
+            let active = Active { session: route.session.clone(), ..Active::default() };
+            let mut decision = self.decision_view(route, &active, &route.session);
+            decision.active = false;
+            view.decisions.push(decision);
+        }
         for session in &mut view.sessions {
             session.label = self.name(&session.id);
             if let Some(rest) = session.notes[1].text.strip_prefix("未命名会话 · ") {
@@ -476,6 +651,7 @@ impl LiveState {
         // 稳定排序保持原完成顺序，活跃会话始终优先可见。
         view.sessions.sort_by_key(|s| !(active_sessions.contains(&s.id) || child_sessions.contains(&s.id)));
         let aliases_changed = self.suppress_alias_roots(view);
+        self.fold_model_usage(view);
         if let Some(session) = view.sessions.first() {
             view.notes = session.notes.clone();
         }
@@ -492,6 +668,51 @@ impl LiveState {
             view.state = "warning".into();
             view.watch_label = "实时连接中断 · 保留完成记录".into();
             view.error = Some(error.clone());
+        }
+    }
+
+    /// 单个活跃主请求或子请求的实时决策，不混入内部分类器请求。
+    fn decision_view(&self, route: &LiveRoute, active: &Active, session: &str) -> DecisionView {
+        let stages = decision_stages(route);
+        let rules = stages.iter().filter_map(|stage| stage.rule.clone()).collect();
+        let tries = route.tries.as_deref().unwrap_or_default();
+        let terminal = tries.last();
+        let candidate = terminal.and_then(|attempt| selected_candidate(route, attempt));
+        let attempts = tries.iter().enumerate().map(|(index, attempt)| {
+            let (chain, incomplete) = decision_attempt_chain(route, attempt);
+            DecisionAttemptView {
+                ordinal: index as i64 + 1,
+                model: attempt.model.trim().to_owned(),
+                effort: nonempty(&attempt.effort),
+                state: if !attempt.done { "running" } else { decision_status(attempt.status) },
+                group_chain: chain,
+                path_incomplete: incomplete,
+            }
+        }).collect();
+        let started_ms = route.time.as_deref().and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .or_else(|| DateTime::parse_from_rfc3339(&active.started).ok()).map(|value| value.timestamp_millis());
+        let (state, phase, wait_reason) = if route.done {
+            (decision_status(route.status), None, None)
+        } else {
+            let phase = decision_phase(active);
+            (history_phase(route, Some(active)), Some(phase), decision_wait_reason(route, active))
+        };
+        DecisionView {
+            id: format!("{}:{}:{}:{}", self.pid, route.id, route.session, route.subagent_id),
+            session: session.into(),
+            label: self.name(session),
+            subagent: (!route.subagent_id.trim().is_empty()).then(|| self.child_label(session, &route.subagent_id)),
+            subagent_id: nonempty(&route.subagent_id),
+            started_ms,
+            active: true,
+            state,
+            wait_reason,
+            phase,
+            rules,
+            route_groups: route_chain(route, terminal, candidate),
+            stages,
+            attempts,
+            candidate_plan: candidate_plan(route),
         }
     }
 
@@ -599,6 +820,30 @@ impl LiveState {
     /// 历史 CLI ID 归到标题元数据声明的当前 ID；没有显式关联时保持自身。
     fn canonical<'a>(&'a self, id: &'a str) -> &'a str {
         self.aliases.get(id).map(String::as_str).unwrap_or(id)
+    }
+
+    /// 把历史 CLI ID 的模型用量归到当前规范会话，前端选中展示 ID 时不会漏计。
+    fn fold_model_usage(&self, view: &mut RouteSnapshot) {
+        if self.aliases.is_empty() { return; }
+        let mut folded: Vec<crate::usage::ModelUsage> = Vec::new();
+        let mut index = HashMap::<(String, String, String, String, String, String, String), usize>::new();
+        for row in view.model_usage.drain(..) {
+            let session = self.canonical(&row.session).to_owned();
+            let key = (session.clone(), row.agent.clone(), row.caller_key_id.clone(), row.caller_key_name.clone(),
+                row.model.clone(), row.effort.clone(), row.outcome.clone());
+            if let Some(existing) = index.get(&key).copied() {
+                folded[existing].requests += row.requests;
+                folded[existing].tokens = folded[existing].tokens.saturating_add(row.tokens);
+                folded[existing].unknown_token_requests += row.unknown_token_requests;
+                folded[existing].output_tokens = folded[existing].output_tokens.saturating_add(row.output_tokens);
+                folded[existing].generation_ms += row.generation_ms;
+                folded[existing].speed_samples += row.speed_samples;
+            } else {
+                index.insert(key, folded.len());
+                folded.push(crate::usage::ModelUsage { session, ..row });
+            }
+        }
+        view.model_usage = folded;
     }
 
     /// 未找到标题时明确未命名；UUID 只保留在数据身份与悬停提示中。
@@ -761,6 +1006,220 @@ fn history_phase(route: &LiveRoute, activity: Option<&Active>) -> &'static str {
     } else {
         "running"
     }
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn decision_status(status: Option<i64>) -> &'static str {
+    match status {
+        Some(status) if (200..300).contains(&status) => "success",
+        Some(499) => "cancelled",
+        Some(status) if status >= 400 => "failed",
+        _ => "unknown",
+    }
+}
+
+fn decision_rule(group: &str, rule: &TraceRule) -> DecisionRuleView {
+    let classified = &rule.classified;
+    let state = if rule.waits { "missing" } else if rule.grown { "revised" }
+        else if rule.held { "held" } else if !classified.by.is_empty() || !classified.intent.is_empty() { "classified" }
+        else { "unknown" };
+    let (intent, intent_source) = if !classified.intent.trim().is_empty() {
+        (nonempty(&classified.intent), if classified.fallback == "previous" { "previous" } else { "measured" })
+    } else if !classified.after.trim().is_empty() {
+        (nonempty(&classified.after), "after")
+    } else { (None, "none") };
+    DecisionRuleView {
+        group: group.into(),
+        classifier: nonempty(&classified.by),
+        duration_ms: classified.ms.filter(|ms| *ms >= 0 && !rule.held && !rule.waits),
+        cached: classified.cached && !rule.held && !rule.waits,
+        intent,
+        intent_source,
+        confidence: classified.sure.filter(|value| value.is_finite() && (0.0..=1.0).contains(value)),
+        target: nonempty(&rule.use_target),
+        effort: nonempty(&rule.pick),
+        n: rule.n,
+        turn: rule.turn,
+        unready: rule.unready,
+        instead: nonempty(&rule.instead),
+        state,
+    }
+}
+
+/// 网关阶段白名单；slot / rpm / upstream 原样保留，其余一律 unknown。
+fn decision_phase(active: &Active) -> &'static str {
+    match active.phase.as_str() {
+        "slot" => "slot",
+        "rpm" => "rpm",
+        "upstream" => "upstream",
+        _ => "unknown",
+    }
+}
+
+/// 活跃请求的等待原因，与 history_phase 的 15 秒口径一致；非等待时为 null。
+fn decision_wait_reason(route: &LiveRoute, active: &Active) -> Option<&'static str> {
+    if history_phase(route, Some(active)) != "waiting" {
+        return None;
+    }
+    let attempt = route.tries.as_deref().unwrap_or_default().last();
+    if attempt.is_some_and(|attempt| attempt.done) {
+        return Some("retry");
+    }
+    let first_seen = route.first_text.is_some()
+        || attempt.is_some_and(|attempt| attempt.first_text.is_some());
+    if active.phase == "upstream" && active.ms >= FIRST_RESPONSE_WAIT_MS && !first_seen {
+        return Some("first_response");
+    }
+    match active.phase.as_str() {
+        "slot" => Some("slot"),
+        "rpm" => Some("rpm"),
+        _ => Some("unknown"),
+    }
+}
+
+/// 已知选择策略只认结构字符串；其它值（含配置内容）一律不外发。
+fn known_routing(value: &str) -> Option<String> {
+    matches!(value, "order" | "rotate" | "usage").then(|| value.to_owned())
+}
+
+/// 根组与嵌套组按上游记录顺序组成判定上下文，不表示实际执行路径。
+/// 嵌套组只按 id/ref 精确关联；父子关系必须有证据才算确认，同名不匹配。
+fn decision_stages(route: &LiveRoute) -> Vec<DecisionStageView> {
+    let Some(group) = route.group.as_ref().filter(|group| !group.name.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let mut stages = vec![DecisionStageView {
+        key: "root".into(),
+        group: DecisionGroupView {
+            id: nonempty(&group.id), reference: nonempty(&group.reference),
+            name: group.name.clone(), routing: known_routing(&group.routing),
+        },
+        rule: route.rule.as_ref().map(|rule| decision_rule(&group.name, rule)),
+        context: "recorded",
+        confirmed: true,
+    }];
+    // 只跟踪从根组开始、父子关系连续有证据的那一条；断掉之后不再确认。
+    let mut parent = group.id.trim().to_owned();
+    let mut lineage = !parent.is_empty();
+    for (index, nested) in route.nested.iter().enumerate() {
+        let Some(subgroup) = exact_subgroup(group, &nested.group) else { continue };
+        let linked = lineage && !subgroup.parent.is_empty() && subgroup.parent == parent && !subgroup.id.trim().is_empty();
+        if !linked {
+            lineage = false;
+        }
+        let identity = subgroup.id.trim();
+        let reference = subgroup.reference.trim();
+        stages.push(DecisionStageView {
+            key: format!("nested:{}:{}:{}", index, identity, reference),
+            group: DecisionGroupView {
+                id: nonempty(identity), reference: nonempty(reference),
+                name: subgroup.name.clone(), routing: known_routing(&subgroup.routing),
+            },
+            rule: nested.rule.as_ref().map(|rule| decision_rule(&subgroup.name, rule)),
+            context: "recorded",
+            confirmed: linked,
+        });
+        if linked {
+            parent = identity.to_owned();
+        }
+    }
+    stages
+}
+
+/// 子组身份只认 id 或 ref；身份缺失、重复或组名不唯一时不关联。
+fn exact_subgroup<'a>(group: &'a RouteGroup, identity: &str) -> Option<&'a RouteSubgroup> {
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return None;
+    }
+    let mut matched = group.subs.iter()
+        .filter(|subgroup| subgroup.id == identity || subgroup.reference == identity);
+    let subgroup = matched.next()?;
+    matched.next().is_none().then_some(subgroup)
+}
+
+/// 一次尝试自己确认的组链：入口组加上该尝试候选 via 的公共前缀。
+/// 认不出候选、父子证据缺失、层级未知或多条路径只剩公共前缀时，都标记不能唯一确认。
+fn decision_attempt_chain(route: &LiveRoute, attempt: &Attempt) -> (Vec<DecisionGroupView>, bool) {
+    let Some(group) = route.group.as_ref().filter(|group| !group.name.trim().is_empty()) else {
+        return (Vec::new(), false);
+    };
+    let root = DecisionGroupView {
+        id: nonempty(&group.id), reference: nonempty(&group.reference),
+        name: group.name.clone(), routing: known_routing(&group.routing),
+    };
+    // 有尝试但认不出唯一候选：路径无法确认，只保留入口组。
+    let Some(candidate) = selected_candidate(route, attempt) else {
+        return (vec![root], true);
+    };
+    let rows: Vec<_> = route.order.as_deref().unwrap_or_default().iter()
+        .filter(|row| row.id == attempt.id && row.model == candidate.model && row.fixed == attempt.fixed
+            && row.provider == candidate.provider && row.who == candidate.who)
+        .collect();
+    let mut paths = Vec::new();
+    let mut incomplete = false;
+    for row in &rows {
+        let mut path = Vec::new();
+        let mut parent = group.id.trim();
+        for via in &row.via {
+            let Some(subgroup) = exact_subgroup(group, via) else {
+                incomplete = true;
+                break;
+            };
+            if subgroup.name.trim().is_empty() {
+                incomplete = true;
+                break;
+            }
+            // 任一侧没有身份，或 in 与已确认的父组不符，都不能核验父子关系。
+            if parent.is_empty() || subgroup.parent.is_empty() || subgroup.parent != parent || subgroup.id.trim().is_empty() {
+                incomplete = true;
+                break;
+            }
+            path.push(DecisionGroupView {
+                id: nonempty(&subgroup.id), reference: nonempty(&subgroup.reference),
+                name: subgroup.name.clone(), routing: known_routing(&subgroup.routing),
+            });
+            parent = subgroup.id.trim();
+        }
+        paths.push(path);
+    }
+    if paths.is_empty() {
+        return (vec![root], true);
+    }
+    let mut common = paths.remove(0);
+    for path in &paths {
+        let length = common.iter().zip(path).take_while(|(left, right)| {
+            left.id == right.id && left.reference == right.reference
+        }).count();
+        // 其它路径比公共前缀更长或分叉：前缀之后不能唯一确认。
+        if length < path.len() || length < common.len() {
+            incomplete = true;
+        }
+        common.truncate(length);
+    }
+    let mut chain = vec![root];
+    chain.extend(common);
+    (chain, incomplete)
+}
+
+/// 计划尝试顺序最多展开 12 项；只保留序号、模型与固定强度。
+fn candidate_plan(route: &LiveRoute) -> Option<DecisionCandidatePlan> {
+    let order = route.order.as_deref().filter(|order| !order.is_empty())?;
+    let total = order.len() as i64;
+    let shown = order.len().min(12);
+    Some(DecisionCandidatePlan {
+        items: order.iter().take(shown).enumerate().map(|(index, candidate)| DecisionCandidateItem {
+            ordinal: index as i64 + 1,
+            model: candidate.model.trim().to_owned(),
+            fixed: nonempty(&candidate.fixed),
+        }).collect(),
+        total,
+        omitted: total - shown as i64,
+    })
 }
 
 /// 精确识别 Desktop 的临时辅助工作目录，普通 fork/未命名短请求不受影响。
@@ -1870,6 +2329,26 @@ mod tests {
         assert!(accounts(old).is_empty(), "保留的子 Agent 行不再持有已并入当前 ID 的额度来源");
     }
 
+    #[test]
+    fn model_usage_folds_only_explicit_session_aliases() {
+        let mut ledger = UsageLedger::new(Local::now().date_naive());
+        let now = Local::now().to_rfc3339();
+        for (id, session) in [(1, "current"), (2, "prior"), (3, "other")] {
+            let row = serde_json::json!({"route_id":id,"t":now,"session":session,"agent":"claude-desktop",
+                "model":"m","effort":"high","status":200,"in":10,"out":20,"ms":3000,"ttft_ms":1000});
+            ledger.ingest(row.to_string().as_bytes());
+        }
+        let mut view = ledger.snapshot("", "ready", None);
+        let mut live = LiveState::default();
+        live.aliases.insert("prior".into(), "current".into());
+        live.apply(&mut view);
+        assert_eq!(view.model_usage.iter().filter(|row| row.session == "current").map(|row| row.requests).sum::<u64>(), 2);
+        assert!(view.model_usage.iter().any(|row| row.session == "other"));
+        assert!(!view.model_usage.iter().any(|row| row.session == "prior"));
+        let canonical = view.model_usage.iter().find(|row| row.session == "current").unwrap();
+        assert_eq!((canonical.tokens, canonical.output_tokens, canonical.generation_ms, canonical.speed_samples), (60, 40, 4000.0, 2));
+    }
+
     /// 标题元数据里的显式 CLI 关联形成别名映射；同名、冲突声明与无当前 ID 时都不猜。
     #[test]
     fn title_aliases_follow_explicit_metadata_only() {
@@ -1982,9 +2461,9 @@ mod tests {
         let route = LiveRoute {
             group: Some(RouteGroup { name: "自动".into(),
                 subs: vec![
-                    RouteSubgroup { id: "sub-a".into(), reference: "ref-a".into(), name: "干活".into() },
-                    RouteSubgroup { id: "sub-b".into(), reference: "ref-b".into(), name: "deepseek".into() },
-                ] }),
+                    RouteSubgroup { id: "sub-a".into(), reference: "ref-a".into(), name: "干活".into(), ..Default::default() },
+                    RouteSubgroup { id: "sub-b".into(), reference: "ref-b".into(), name: "deepseek".into(), ..Default::default() },
+                ], ..Default::default() }),
             order: Some(vec![
                 Candidate { id: "seat".into(), provider: "p".into(), model: "m".into(), who: "a@example.com".into(), via: vec!["ref-a".into()], ..Default::default() },
                 Candidate { id: "other".into(), provider: "p".into(), model: "m".into(), who: "b@example.com".into(), via: vec!["sub-b".into()], ..Default::default() },
@@ -2067,8 +2546,8 @@ mod tests {
         let mut route = LiveRoute {
             group: Some(RouteGroup { name: "自动".into(), subs: vec![
                 RouteSubgroup { id: "worker".into(), name: "干活".into(), ..Default::default() },
-                RouteSubgroup { id: "gpt".into(), reference: "group/gpt".into(), name: "GPT重置狂欢".into() },
-            ] }),
+                RouteSubgroup { id: "gpt".into(), reference: "group/gpt".into(), name: "GPT重置狂欢".into(), ..Default::default() },
+            ], ..Default::default() }),
             order: Some(vec![candidate.clone()]), tries: Some(vec![attempt.clone()]), ..Default::default()
         };
         assert_eq!(route_chain(&route, Some(&attempt), Some(&candidate)), vec!["自动", "干活", "GPT重置狂欢"]);
@@ -2291,6 +2770,258 @@ mod tests {
         assert!(!scope.turns[&1].held, "无续行标记的请求是开口");
         for id in [2, 3, 4] {
             assert!(scope.turns[&id].held, "held、waits、grown 均是同轮续行");
+        }
+    }
+
+    /// 分类模型、嵌套判定、实际尝试和完成结果均来自同一路由的白名单字段。
+    #[test]
+    fn decision_view_uses_trace_evidence_and_ignores_unrelated_sessions() {
+        let mut live = LiveState::default();
+        let route: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id": 101, "session": "s1", "time": "2026-10-27T12:00:00+08:00",
+            "group": {"name": "自动", "subs": [{"id": "worker", "name": "干活"}]},
+            "order": [{"id": "seat", "provider": "test", "who": "fixture", "model": "m2", "via": ["worker"]}],
+            "rule": {"turn": 2, "use": "group/worker", "pick": "high",
+                "classified": {"by": "other/classifier", "intent": "编码", "sure": 0.8,
+                    "intents": ["PRIVATE"], "error": "PRIVATE"}, "when": ["PRIVATE"]},
+            "nested": [{"group": "worker", "name": "干活", "rule": {"turn": 2, "waits": true}}],
+            "tries": [{"id": "old", "model": "m1", "done": true, "status": 503},
+                {"id": "seat", "model": "m2", "effort": "high", "done": false}]
+        })).unwrap();
+        live.update(TraceUpdate { pid: 7, seq: 1, ids: vec![101], routes: vec![route.clone()] });
+        live.activity.active.push(Active { id: 20, session: "s1".into(), agent: "test".into(),
+            started: "2026-10-27T12:00:00+08:00".into(), route: 101, ..Active::default() });
+        let mut snapshot = crate::usage::UsageLedger::new(Local::now().date_naive()).snapshot("local", "ready", None);
+        live.apply(&mut snapshot);
+        assert_eq!(snapshot.decisions.len(), 1);
+        let decision = &snapshot.decisions[0];
+        assert!(decision.active);
+        assert_eq!(decision.rules[0].classifier.as_deref(), Some("other/classifier"));
+        assert_eq!(decision.rules[0].intent.as_deref(), Some("编码"));
+        assert_eq!(decision.rules[1].state, "missing");
+        assert_eq!(decision.route_groups, vec!["自动", "干活"]);
+        assert_eq!(decision.attempts[0].state, "failed");
+        assert_eq!(decision.attempts[1].state, "running");
+        assert!(!serde_json::to_string(decision).unwrap().contains("PRIVATE"));
+        live.activity.active[0].session = "other".into();
+        let mut conflicting = crate::usage::UsageLedger::new(Local::now().date_naive()).snapshot("local", "ready", None);
+        live.apply(&mut conflicting);
+        assert!(conflicting.decisions.is_empty(), "身份冲突不归到错误会话");
+        let mut completed = route;
+        completed.done = true;
+        completed.status = Some(200);
+        live.update(TraceUpdate { pid: 7, seq: 2, ids: vec![101], routes: vec![completed] });
+        live.activity.active.clear();
+        let mut snapshot = crate::usage::UsageLedger::new(Local::now().date_naive()).snapshot("local", "ready", None);
+        live.apply(&mut snapshot);
+        assert!(!snapshot.decisions[0].active);
+        assert_eq!(snapshot.decisions[0].state, "success");
+    }
+
+    /// 第 7 轮命中第 5 条规则且字段齐全；嵌套组按上游原序，缺身份的同名组不关联。
+    #[test]
+    fn decision_timing_keeps_missing_cache_and_reuse_distinct() {
+        for (record, duration, cached) in [
+            (serde_json::json!({"classified": {"by": "typesafe/jev-latest", "ms": 224}}), Some(224), false),
+            (serde_json::json!({"classified": {"by": "typesafe/jev-latest", "ms": 1220}}), Some(1220), false),
+            (serde_json::json!({"classified": {"ms": 0, "cached": true}}), Some(0), true),
+            (serde_json::json!({"classified": {"ms": -1}}), None, false),
+            (serde_json::json!({"classified": {"by": "typesafe/jev-latest"}}), None, false),
+            (serde_json::json!({"held": true, "classified": {"ms": 224, "cached": true}}), None, false),
+            (serde_json::json!({"waits": true, "classified": {"ms": 224}}), None, false),
+            (serde_json::json!({"grown": true, "classified": {"ms": 2100}}), Some(2100), false),
+        ] {
+            let rule: TraceRule = serde_json::from_value(record).unwrap();
+            let view = decision_rule("自动", &rule);
+            assert_eq!((view.duration_ms, view.cached), (duration, cached));
+            let serialized = serde_json::to_value(view).unwrap();
+            assert_eq!(serialized["durationMs"], serde_json::json!(duration));
+        }
+    }
+
+    #[test]
+    fn decision_stages_keep_rule_detail_and_source_order() {
+        let route: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id": 7,
+            "group": {"id": "root", "ref": "group/auto", "name": "自动", "routing": "order",
+                "subs": [
+                    {"id": "worker", "ref": "group/worker", "name": "干活", "routing": "rotate", "in": "root"},
+                    {"id": "later", "ref": "group/later", "name": "收尾", "routing": "usage", "in": "root"},
+                    {"id": "nameless", "name": "干活", "in": "root"}
+                ]},
+            "rule": {"n": 5, "turn": 7, "use": "group/worker", "pick": "high", "unready": true,
+                "instead": "group/later", "classified": {"by": "fixture/classifier", "intent": "编码"}},
+            "nested": [
+                {"group": "worker", "name": "同名干扰", "rule": {"n": 1, "turn": 7, "held": true}},
+                {"group": "later", "name": "同名干扰", "rule": {"n": 0, "turn": 7, "waits": true}},
+                {"name": "干活", "rule": {"n": 9, "turn": 7}}
+            ]
+        })).unwrap();
+        let stages = decision_stages(&route);
+        assert_eq!(stages.iter().map(|stage| stage.key.as_str()).collect::<Vec<_>>(),
+            vec!["root", "nested:0:worker:group/worker", "nested:1:later:group/later"]);
+        let root = &stages[0];
+        assert_eq!((root.group.id.as_deref(), root.group.reference.as_deref(), root.group.routing.as_deref()),
+            (Some("root"), Some("group/auto"), Some("order")));
+        let rule = root.rule.as_ref().unwrap();
+        assert_eq!((rule.n, rule.turn, rule.unready, rule.instead.as_deref()),
+            (Some(5), Some(7), true, Some("group/later")));
+        assert_eq!(rule.state, "classified");
+        assert_eq!(stages[1].group.name, "干活");
+        assert_eq!(stages[1].group.routing.as_deref(), Some("rotate"));
+        assert!(stages[1].confirmed, "in 指向根组，父子有证据");
+        assert_eq!(stages[1].rule.as_ref().unwrap().state, "held");
+        // later 的 in 也指向根组，不接在 worker 之后：保留记录顺序，但不确认成路径。
+        assert!(!stages[2].confirmed);
+        assert_eq!(stages[2].group.name, "收尾");
+        assert_eq!(stages[2].rule.as_ref().unwrap().n, Some(0));
+        assert_eq!(stages[2].rule.as_ref().unwrap().state, "missing");
+        assert!(stages.iter().all(|stage| stage.context == "recorded"));
+
+        // 缺 n 是未知，显式 0 才是未命中。
+        let missing: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id": 71, "group": {"name": "自动"}, "rule": {"turn": 7}
+        })).unwrap();
+        assert_eq!(decision_stages(&missing)[0].rule.as_ref().unwrap().n, None);
+    }
+
+    /// 两次尝试各自取自己的候选路径；模型未记录的尝试也保留。
+    #[test]
+    fn decision_attempts_keep_distinct_chains_without_dropping_blank_models() {
+        let route: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id": 8,
+            "group": {"id": "root", "name": "自动", "routing": "order", "subs": [
+                {"id": "worker", "name": "干活", "routing": "rotate", "in": "root"},
+                {"id": "fast", "name": "高速", "routing": "usage", "in": "root"}
+            ]},
+            "order": [
+                {"id": "first", "provider": "fixture", "who": "one", "model": "m1", "via": ["worker"]},
+                {"id": "second", "provider": "fixture", "who": "two", "model": "m2", "via": ["fast"]}
+            ],
+            "tries": [
+                {"id": "first", "model": "m1", "effort": "high", "done": true, "status": 503},
+                {"id": "second", "model": "", "done": false}
+            ]
+        })).unwrap();
+        let live = LiveState::default();
+        let decision = live.decision_view(&route, &Active::default(), "s1");
+        assert_eq!(decision.attempts.len(), 2);
+        assert_eq!(decision.attempts[0].ordinal, 1);
+        assert_eq!(decision.attempts[0].group_chain.iter().map(|group| group.name.as_str()).collect::<Vec<_>>(),
+            vec!["自动", "干活"]);
+        assert!(!decision.attempts[0].path_incomplete);
+        assert_eq!(decision.attempts[1].ordinal, 2);
+        assert!(decision.attempts[1].model.is_empty(), "模型未记录的尝试不跳过");
+        assert_eq!(decision.attempts[1].group_chain.iter().map(|group| group.name.as_str()).collect::<Vec<_>>(),
+            vec!["自动", "高速"]);
+        assert_eq!(decision.attempts[1].state, "running");
+    }
+
+    /// 同名子组只按身份关联；父子关系错误或未知层级截断，已确认的父级仍保留。
+    #[test]
+    fn decision_chain_rejects_ambiguous_names_and_broken_parents() {
+        let route: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id": 9,
+            "group": {"id": "root", "name": "自动", "subs": [
+                {"id": "worker-a", "name": "干活", "in": "root"},
+                {"id": "worker-b", "name": "干活", "in": "root"},
+                {"id": "child", "name": "深层", "in": "worker-a"},
+                {"id": "stray", "name": "错挂", "in": "other"}
+            ]},
+            "order": [{"id": "seat", "provider": "fixture", "who": "one", "model": "m",
+                "via": ["worker-a", "child", "stray", "missing"]}],
+            "tries": [{"id": "seat", "model": "m", "done": false}]
+        })).unwrap();
+        let (chain, incomplete) = decision_attempt_chain(&route, route.tries.as_ref().unwrap().last().unwrap());
+        assert_eq!(chain.iter().map(|group| group.name.as_str()).collect::<Vec<_>>(),
+            vec!["自动", "干活", "深层"]);
+        assert!(incomplete, "父子错误与未知层级之后的路径不确认");
+        let ambiguous: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id": 10,
+            "group": {"id": "root", "name": "自动", "subs": [
+                {"id": "worker-a", "ref": "shared", "name": "甲", "in": "root"},
+                {"id": "worker-b", "ref": "shared", "name": "乙", "in": "root"}
+            ]},
+            "order": [{"id": "seat", "provider": "fixture", "who": "one", "model": "m", "via": ["shared"]}],
+            "tries": [{"id": "seat", "model": "m"}]
+        })).unwrap();
+        let (chain, incomplete) = decision_attempt_chain(&ambiguous, ambiguous.tries.as_ref().unwrap().last().unwrap());
+        assert_eq!(chain.len(), 1, "同一 ref 指向两个子组时不按同名或同 ref 猜测");
+        assert!(incomplete);
+
+        // 认不出唯一候选：只留入口组，并标明路径不能确认。
+        let unknown: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id": 12, "group": {"id": "root", "name": "自动"},
+            "order": [
+                {"id": "seat", "provider": "a", "who": "one", "model": "m"},
+                {"id": "seat", "provider": "b", "who": "two", "model": "m"}
+            ],
+            "tries": [{"id": "seat", "model": "m"}]
+        })).unwrap();
+        let (chain, incomplete) = decision_attempt_chain(&unknown, unknown.tries.as_ref().unwrap().last().unwrap());
+        assert_eq!(chain.len(), 1);
+        assert!(incomplete, "候选身份冲突时不能把入口组当成完整路径");
+
+        // 多条路径只共享前缀：前缀之后不能唯一确认。
+        let forked: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id": 13, "group": {"id": "root", "name": "自动", "subs": [
+                {"id": "worker", "name": "干活", "in": "root"},
+                {"id": "left", "name": "甲", "in": "worker"},
+                {"id": "right", "name": "乙", "in": "worker"}
+            ]},
+            "order": [
+                {"id": "seat", "provider": "fixture", "who": "one", "model": "m", "via": ["worker", "left"]},
+                {"id": "seat", "provider": "fixture", "who": "one", "model": "m", "via": ["worker", "right"]}
+            ],
+            "tries": [{"id": "seat", "model": "m"}]
+        })).unwrap();
+        let (chain, incomplete) = decision_attempt_chain(&forked, forked.tries.as_ref().unwrap().last().unwrap());
+        assert_eq!(chain.iter().map(|group| group.name.as_str()).collect::<Vec<_>>(), vec!["自动", "干活"]);
+        assert!(incomplete, "公共前缀被截短后必须标路径不完整");
+
+        // 子组没有 in：父组身份再明确也不能核验，截断并标不完整。
+        let unlinked: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id": 14, "group": {"id": "root", "name": "自动", "subs": [
+                {"id": "worker", "name": "干活"}
+            ]},
+            "order": [{"id": "seat", "provider": "fixture", "who": "one", "model": "m", "via": ["worker"]}],
+            "tries": [{"id": "seat", "model": "m"}]
+        })).unwrap();
+        let (chain, incomplete) = decision_attempt_chain(&unlinked, unlinked.tries.as_ref().unwrap().last().unwrap());
+        assert_eq!(chain.len(), 1);
+        assert!(incomplete, "缺 in 不能当成已确认的父子关系");
+    }
+
+    /// 候选计划最多 12 项并标记省略数；账号、供应商与私有字段不外发。
+    #[test]
+    fn candidate_plan_truncates_and_keeps_account_identity_private() {
+        let order: Vec<_> = (0..15).map(|index| serde_json::json!({
+            "id": format!("account-{index}"), "provider": format!("provider-{index}"),
+            "who": format!("user-{index}@example.com"), "model": format!("model-{index}"),
+            "fixed": "max", "routing": "rotate", "name": "PRIVATE-ACCOUNT"
+        })).collect();
+        let route: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id": 11, "session": "s1", "group": {"name": "自动", "routing": "custom-secret"},
+            "rule": {"n": 1, "turn": 1, "when": ["PRIVATE"], "classified": {"error": "PRIVATE"}},
+            "order": order,
+            "tries": [{"id": "account-0", "model": "model-0", "fixed": "max", "done": false}]
+        })).unwrap();
+        let mut live = LiveState::default();
+        live.activity.active.push(Active { id: 1, session: "s1".into(), agent: "test".into(),
+            started: "2026-10-27T12:00:00+08:00".into(), phase: "mystery".into(), route: 11, ..Active::default() });
+        live.routes.insert(11, route);
+        let mut snapshot = crate::usage::UsageLedger::new(Local::now().date_naive()).snapshot("local", "ready", None);
+        live.apply(&mut snapshot);
+        let decision = &snapshot.decisions[0];
+        let plan = decision.candidate_plan.as_ref().unwrap();
+        assert_eq!((plan.items.len(), plan.total, plan.omitted), (12, 15, 3));
+        assert_eq!(plan.items[0].model, "model-0");
+        assert_eq!(plan.items[11].ordinal, 12);
+        assert_eq!(decision.phase, Some("unknown"));
+        assert_eq!(decision.stages[0].group.routing, None, "未知策略字符串不外发");
+        let json = serde_json::to_string(decision).unwrap();
+        for secret in ["account-0", "provider-0", "user-0@example.com", "PRIVATE", "custom-secret"] {
+            assert!(!json.contains(secret), "{secret} 不得进入判定区");
         }
     }
 

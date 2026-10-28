@@ -1,0 +1,53 @@
+/* 判定区只占右侧会话栏；组链与实际尝试保持有序，不画并行规则分支。 */
+.hud[data-layout="wide"] .content{grid-template-rows:minmax(0,1fr) auto;row-gap:0}
+.hud[data-layout="wide"] .sidebar{grid-column:1;grid-row:1/3}
+.hud[data-layout="wide"] .routing{grid-column:2;grid-row:1}
+.hud[data-layout="wide"] .decision-route{grid-column:2;grid-row:2}
+.decision-route{--decision-accent:var(--running);position:relative;z-index:2;min-width:0;height:76px;min-height:76px;padding:8px 0 5px 4px;border-top:1px solid var(--edge);color:var(--ink);overflow:hidden}
+.decision-heading{display:flex;align-items:center;gap:9px;min-width:0;font-size:10px;line-height:15px;color:var(--muted)}
+.decision-heading strong{font-size:11px;font-weight:600;color:var(--ink);white-space:nowrap}
+.decision-heading #decision-session{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.decision-heading #decision-status{margin-left:auto;flex:none;white-space:nowrap}
+.decision-route[data-state="running"] #decision-status,.decision-route[data-state="waiting"] #decision-status{color:var(--running)}
+.decision-route[data-state="success"]{--decision-accent:var(--completed)}
+.decision-route[data-state="success"] #decision-status{color:var(--completed)}
+.decision-route[data-state="failed"],.decision-route[data-state="cancelled"]{--decision-accent:var(--failed)}
+.decision-route[data-state="failed"] #decision-status,.decision-route[data-state="cancelled"] #decision-status{color:var(--failed)}
+.decision-content{position:relative;display:flex;align-items:center;min-width:0;height:42px;gap:60px;margin-top:4px;overflow:visible}
+.decision-empty{font-size:11px;line-height:28px;color:var(--muted)}
+.decision-step{position:relative;z-index:1;display:flex;flex:0 1 auto;align-items:center;min-width:0;max-width:280px;height:38px;gap:7px;padding:2px 0;border:0;background:transparent;text-align:left;font:inherit;color:var(--ink);cursor:help}
+.decision-step:focus-visible{outline:1px solid var(--running);outline-offset:-1px;border-radius:3px}
+.decision-step[data-kind="fold"]{flex:0 0 auto;color:var(--muted)}
+.decision-copy{display:flex;flex-direction:column;gap:2px;min-width:0}
+.decision-header{display:flex;align-items:baseline;gap:6px;min-width:0}
+.decision-value{font-size:11px;font-weight:600;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.decision-strategy{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--muted);font-size:10px;line-height:14px;white-space:nowrap;padding:0 3px;border-radius:2px;background:rgb(190 192 205/.12)}
+.decision-duration{fill:currentColor;font-size:10px;line-height:14px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.decision-duration[data-level="fast"]{color:var(--completed)}
+.decision-duration[data-level="moderate"]{color:#e6cf89}
+.decision-duration[data-level="slow"]{color:var(--failed)}
+.decision-label{color:var(--muted);font-size:10px;line-height:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.decision-value{font-size:11px;font-weight:500;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.decision-origin{display:grid;place-items:center;flex:0 0 22px;width:22px;height:22px;color:var(--muted)}
+.decision-origin img,.decision-origin svg{width:20px;height:20px;object-fit:contain}
+.decision-origin svg{fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.decision-origin[data-origin="reused"]{color:#e6cf89}
+.decision-origin[data-origin="unrecorded"]{color:#c6b6ec}
+.decision-step[data-state="failed"] .decision-value,.decision-step[data-state="cancelled"] .decision-value{color:var(--failed)}
+.decision-step[data-state="success"] .decision-label{color:var(--completed)}
+.decision-step[data-activity="slot"] .decision-origin,.decision-step[data-activity="rpm"] .decision-origin,.decision-step[data-activity="retry"] .decision-origin,.decision-step[data-activity="first_response"] .decision-origin,.decision-step[data-activity="upstream"] .decision-origin{animation:decision-breathe 2.4s ease-in-out infinite}
+.decision-wires{position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none}
+.decision-wire{fill:none;stroke:var(--edge);stroke-width:1;vector-effect:non-scaling-stroke}
+.decision-wire-attempt{stroke-dasharray:2 3}
+.decision-wire[data-passed="true"]{stroke:var(--completed);stroke-dasharray:none}
+.decision-packet{fill:var(--running);offset-distance:0%;animation:decision-travel 1s linear infinite}
+@keyframes decision-travel{0%{offset-distance:0%;opacity:0}12%,82%{opacity:1}100%{offset-distance:100%;opacity:0}}
+@keyframes decision-breathe{0%,100%{opacity:.55}50%{opacity:1}}
+.decision-detail{position:fixed;z-index:90;width:340px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow:auto;padding:12px 14px;border:1px solid var(--edge);border-radius:6px;background:var(--surface);box-shadow:0 8px 24px #0005;color:var(--ink);font-size:11px;line-height:17px;user-select:text}
+.decision-detail strong{display:block;margin-bottom:7px;font-size:12px}
+.decision-detail p{margin:3px 0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted)}
+.hud[data-layout="tall"] .decision-route{flex-shrink:0;padding-inline:0}
+@media(max-height:540px){.decision-route{height:56px;min-height:56px;padding-block:4px}.decision-content{height:28px;margin-top:4px;gap:54px}.decision-step{height:28px;gap:5px}.decision-copy{gap:0}.decision-value{line-height:14px}.decision-label{font-size:10px;line-height:12px}.decision-origin{flex-basis:18px;width:18px;height:18px}.decision-origin img,.decision-origin svg{width:17px;height:17px}}
+@media(max-width:480px){.decision-heading{gap:6px}.decision-content{gap:44px}.decision-origin{flex-basis:16px;width:16px}.decision-origin img,.decision-origin svg{width:16px;height:16px}}
+@media(prefers-reduced-motion:reduce){.decision-step .decision-origin{animation:none!important}.decision-packet{display:none}}
+@media(forced-colors:active){.decision-origin[data-origin],.decision-duration[data-level]{color:CanvasText}.decision-wire,.decision-wire[data-passed]{stroke:CanvasText}.decision-detail{background:Canvas;color:CanvasText}}

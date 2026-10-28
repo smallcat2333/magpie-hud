@@ -81,7 +81,7 @@
 .quota-heading{display:none}
 @media(min-height:541px){
 .quota-heading{display:flex}
-.hud[data-layout="wide"] .daily dl{grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 8px}
+.hud[data-layout="wide"] .daily dl{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 8px}
 .hud[data-layout="wide"] .daily .metric,.hud[data-layout="wide"] .daily #cost-metric{align-items:flex-start;gap:3px}
 .hud[data-layout="wide"] .daily .metric dt{position:static;width:auto;height:auto;margin:0;overflow:visible;clip-path:none;line-height:16px;white-space:nowrap}
 .hud[data-layout="wide"] .daily .metric dt span:not(.label-wide){display:none}
@@ -93,8 +93,8 @@
 .hud[data-layout="wide"] .quota-list{gap:16px}
 }
 @media(min-height:801px){
-.hud[data-layout="wide"] .daily .metric dd{font-size:20px;line-height:28px}
-.hud[data-layout="wide"] .daily dl{gap:18px 8px}
+.hud[data-layout="wide"] .daily .metric dd{font-size:20px;line-height:26px}
+.hud[data-layout="wide"] .daily dl{gap:12px 8px}
 .hud[data-layout="wide"] .hourly-plot{height:118px}
 }
 @media(max-width:1000px){
