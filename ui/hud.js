@@ -462,6 +462,14 @@
     return [...active, ...retained, ...completed];
   }
 
+  /** 每个会话只展示一张主卡；活跃时选最新路由，结束后沿用后端标记的当前记录。 */
+  function primaryCard(session) {
+    const active = session.routes.filter(card => ['running', 'waiting'].includes(card.state));
+    if (active.length) return active.reduce((latest, card) =>
+      (card.routeId || 0) > (latest.routeId || 0) ? card : latest);
+    return session.routes.find(card => card.current) || session.routes[0] || parentAnchor(session);
+  }
+
   /** 没有完成日志的临时会话也保留子项锚点，但不保留已失活的根请求。 */
   function sessionsForView() {
     const sessions = [...snapshot.sessions];
@@ -1341,13 +1349,11 @@
       group.className = 'session-group';
       group.dataset.sessionId = item.id;
       const children = subagentsForView(item, Boolean(session));
-      const parents = item.routes.length ? item.routes.slice(0, 4) : [parentAnchor(item)];
-      parents.forEach((card, index) => {
-        const node = createCard(card, item);
-        node.dataset.motionKey = JSON.stringify([item.id, 'parent', index === 0 ? 'current' : card.id]);
-        group.append(node);
-        rememberCard(card);
-      });
+      const card = primaryCard(item);
+      const node = createCard(card, item);
+      node.dataset.motionKey = JSON.stringify([item.id, 'parent', 'current']);
+      group.append(node);
+      rememberCard(card);
       if (children.length) {
         group.classList.add('has-subagents');
         const list = document.createElement('div');
@@ -1386,7 +1392,7 @@
     const hasRequests = sessions.some(item => item.routes.some(card => ['running', 'waiting'].includes(card.state)) || activeSubagents(item).length);
     inbound.classList.toggle('flowing', hasRequests);
     inbound.style.opacity = sessions.length ? '1' : '0';
-    const picked = sessions.flatMap(item => [...item.routes, ...subagentsForView(item, Boolean(session))]).find(card => card.id === selectedCard);
+    const picked = sessions.flatMap(item => [primaryCard(item), ...subagentsForView(item, Boolean(session))]).find(card => card.id === selectedCard);
     if (picked) renderNotes([picked.note], sessions.filter(item => item.id === picked.sessionId));
     else { selectedCard = null; renderNotes(session ? session.notes : selectedAgent !== '*' && sessions.length ? sessions[0].notes : snapshot.notes, sessions); }
     renderedIds = currentIds;
@@ -1572,7 +1578,7 @@
     sessions = filterAgent(sessions);
     const previous = selector.value;
     const options = [new Option('最近会话', '*')];
-    sessions.forEach(session => options.push(new Option(`${session.label} · ${shortAccount(maskAccount(session.routes[0]?.account || activeSubagents(session)[0]?.account || session.completedSubagents?.[0]?.account || '账号未提供'))}`, session.id)));
+    sessions.forEach(session => options.push(new Option(`${session.label} · ${shortAccount(maskAccount((session.routes.length ? primaryCard(session).account : '') || activeSubagents(session)[0]?.account || session.completedSubagents?.[0]?.account || '账号未提供'))}`, session.id)));
     selector.replaceChildren(...options);
     selector.value = sessions.some(session => session.id === previous) ? previous : '*';
   }
