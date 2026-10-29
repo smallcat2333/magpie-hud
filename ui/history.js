@@ -29,7 +29,9 @@
   const title = node('strong', '', '请求履历');
   title.id = 'history-title';
   const subtitle = node('span', 'history-subtitle');
-  identity.append(title, subtitle);
+  const route = node('span', 'history-route');
+  route.hidden = true;
+  identity.append(title, subtitle, route);
   const controls = node('div', 'history-controls');
   const refresh = action('刷新履历', '刷新', () => load(true));
   const pin = action('固定当前履历', '固定', () => {
@@ -98,8 +100,14 @@
   // data-history-scope is the identity tuple; display metadata belongs to the new node.
   const metaOf = card => {
     const tuple = scopeOf(card);
-    return tuple ? { session: tuple[0], subagent: tuple[1], label: card.dataset.historyLabel, source: card.dataset.historySource } : null;
+    return tuple ? { session: tuple[0], subagent: tuple[1], label: card.dataset.historyLabel,
+      source: card.dataset.historySource, route: card.dataset.historyRoute } : null;
   };
+
+  function updateRoute() {
+    route.textContent = window.hudRedact.scrub(view?.scope.route || '');
+    route.hidden = !route.textContent;
+  }
 
   function updatePin() {
     pin.setAttribute('aria-pressed', String(Boolean(view?.pinned)));
@@ -184,6 +192,7 @@
     title.title = title.textContent;
     subtitle.textContent = window.hudRedact.scrub([scope.source, scope.subagent ? '子 Agent' : '主会话'].filter(Boolean).join(' · '));
     subtitle.title = `${scope.session}${scope.subagent ? ` / ${scope.subagent}` : ''}`;
+    updateRoute();
     updatePin();
     position();
     load(false);
@@ -451,6 +460,7 @@
       card.dataset.historyScope = keyOf(scope);
       card.dataset.historyLabel = scope.label || '未命名会话';
       card.dataset.historySource = scope.source || '';
+      card.dataset.historyRoute = scope.route || '';
       card.removeAttribute('title');
       // 卡内原生提示会遮住共享面板，完整信息由履历单元格提供。
       card.querySelectorAll('[title]').forEach(element => element.removeAttribute('title'));
@@ -465,6 +475,7 @@
     redraw() {
       if (view?.data) {
         subtitle.textContent = window.hudRedact.scrub([view.scope.source, view.scope.subagent ? '子 Agent' : '主会话'].filter(Boolean).join(' · '));
+        updateRoute();
         render(view.data);
       }
     },
@@ -485,6 +496,7 @@
         title.textContent = `${view.scope.label} · 请求履历`;
         title.title = title.textContent;
         subtitle.textContent = window.hudRedact.scrub([view.scope.source, view.scope.subagent ? '子 Agent' : '主会话'].filter(Boolean).join(' · '));
+        updateRoute();
       }
       position();
       if (containsInteraction()) clearTimeout(hideTimer);

@@ -4,6 +4,7 @@
 .history-identity{display:flex;flex-direction:column;min-width:0;gap:2px;flex:1}
 .history-identity strong{font-size:12px;line-height:17px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .history-subtitle{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px;line-height:14px}
+.history-route{color:var(--muted);white-space:normal;overflow-wrap:anywhere;font-size:10px;line-height:14px}
 .history-controls{display:flex;gap:4px;align-items:center;flex-shrink:0}
 .route-history button{height:24px;padding:2px 6px;border:1px solid transparent;border-radius:3px;background:transparent;color:var(--muted);font:inherit;cursor:pointer;white-space:nowrap;user-select:none}
 .route-history button:hover,.route-history button[aria-pressed="true"]{background:var(--raised);border-color:var(--edge);color:var(--ink)}

@@ -137,6 +137,10 @@
 .card-bottom>.card-account{flex:0 2 auto;min-width:0;max-width:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .card-model{display:flex;align-items:baseline;line-height:16px}
 .card-model-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card-model.has-route-groups .card-model-name{flex:0 1 auto}
+.card-model.has-route-groups .card-route-groups{display:flex;flex:0 0 auto;max-width:calc(100% - 3ch);min-width:0;overflow:hidden;white-space:pre}
+.card-route-prefix,.card-route-group{flex:0 0 auto}
+.card-route-group:last-child{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
 .card-route-groups strong{font-weight:600;color:var(--ink)}
 @container(min-width:450px){
 .hud[data-layout="wide"][data-scope="session"] .subagent-row .subagent-created{display:block;flex:0 0 34px;margin-left:auto;text-align:center;font-size:11px;line-height:16px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -151,8 +155,6 @@
 .hud[data-layout="wide"] .route-card:not(.subagent-row) .card-bottom{grid-column:1;grid-template-columns:minmax(0,1fr)}
 .hud[data-layout="wide"] .route-card:not(.subagent-row) .card-bottom>.card-account,.hud[data-layout="wide"] .route-card:not(.subagent-row) .card-bottom>.divider{display:none}
 .hud[data-layout="wide"] .route-card:not(.subagent-row) .card-bottom>.card-model{flex:1 1 0}
-.hud[data-layout="wide"] .route-card:not(.subagent-row) .card-route-groups{display:block;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:pre}
-.hud[data-layout="wide"] .route-card:not(.subagent-row) .card-model-name{flex:0 0 auto;max-width:100%}
 }
 /* 数据过渡只使用局部图层，不改变卡片布局尺寸。 */
 .metric dd{position:relative}

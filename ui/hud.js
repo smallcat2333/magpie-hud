@@ -256,11 +256,20 @@
     const groups = Array.isArray(card.routeGroups) ? card.routeGroups.filter(group => typeof group === 'string' && group) : [];
     const chain = document.createElement('span');
     chain.className = 'card-route-groups';
+    const omitted = document.createElement('span');
+    omitted.className = 'card-route-prefix';
+    omitted.textContent = '… → ';
+    omitted.hidden = true;
+    chain.append(omitted);
     groups.forEach(group => {
+      const step = document.createElement('span');
+      step.className = 'card-route-group';
       const name = document.createElement('strong');
       name.textContent = group;
-      chain.append(name, document.createTextNode(' → '));
+      step.append(name, document.createTextNode(' → '));
+      chain.append(step);
     });
+    if (groups.length) model.classList.add('has-route-groups');
     const modelName = document.createElement('span');
     modelName.className = 'card-model-name';
     modelName.textContent = /^(正在选择账号|正在选择模型|模型待定)$/.test(card.model) ? '正在选路' : card.model;
@@ -321,9 +330,33 @@
     });
     window.hudHistory?.attach(button, {
       session: card.historySession || session.id, subagent: card.subagentId || '',
-      label: session.label, source: sourceLabel(session),
+      label: session.label, source: sourceLabel(session), route: groups.length ? model.title : '',
     });
     return button;
+  }
+
+  /** 路径放不下时从入口逐级折叠，省略号和最后一级组始终保留。 */
+  function fitRouteGroups() {
+    routeList.querySelectorAll('.card-bottom > .has-route-groups').forEach(model => {
+      const chain = model.querySelector('.card-route-groups');
+      const prefix = chain.querySelector('.card-route-prefix');
+      const steps = [...chain.querySelectorAll('.card-route-group')];
+      prefix.hidden = true;
+      steps.forEach(step => { step.hidden = false; });
+      const available = model.clientWidth;
+      if (!available) return;
+      const modelWidth = model.querySelector('.card-model-name').scrollWidth;
+      const widths = steps.map(step => step.scrollWidth);
+      let pathWidth = widths.reduce((sum, width) => sum + width, 0);
+      if (pathWidth + modelWidth <= available + 1 || steps.length < 2) return;
+      prefix.hidden = false;
+      pathWidth += prefix.getBoundingClientRect().width;
+      for (let index = 0; index < steps.length - 1; index += 1) {
+        pathWidth -= widths[index];
+        steps[index].hidden = true;
+        if (pathWidth + modelWidth <= available + 1) break;
+      }
+    });
   }
 
   /** 只挂载有活跃模型请求的子 Agent，编号在所属会话内保持稳定。 */
@@ -1397,6 +1430,7 @@
     else { selectedCard = null; renderNotes(session ? session.notes : selectedAgent !== '*' && sessions.length ? sessions[0].notes : snapshot.notes, sessions); }
     renderedIds = currentIds;
     updateCardTimes();
+    fitRouteGroups();
     const moving = window.hudMotion.layout(before, routeList.querySelectorAll('.route-card'), node => node.dataset.motionKey);
     requestDraw(animate ? newIds : []);
     if (moving) followCardMotion();
@@ -1568,7 +1602,7 @@
   /** 在一帧中合并布局重算，避免多次 ResizeObserver 通知造成抖动。 */
   function requestDraw(ids = []) {
     cancelAnimationFrame(frame);
-    frame = requestAnimationFrame(() => drawLines(ids));
+    frame = requestAnimationFrame(() => { fitRouteGroups(); drawLines(ids); });
   }
 
   /** 完整 ID 用于选择，显示会话名；不会把两个前缀相同的会话合并。 */
