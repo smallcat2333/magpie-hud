@@ -1509,7 +1509,9 @@
       const state = [...card.classList].find(name => ['running', 'waiting', 'success', 'recovered', 'failed', 'cancelled', 'unknown', 'delegating', 'intermission'].includes(name)) || 'unknown';
       const isChild = card.classList.contains('subagent-row');
       if (isChild) {
-        const parent = card.closest('.session-group').querySelector('.route-card:not(.subagent-row)').getBoundingClientRect();
+        // 子项排在整组主卡之后，从组末端引出，避免并发根请求时穿过中间主卡。
+        const parents = card.closest('.session-group').querySelectorAll(':scope > .route-card');
+        const parent = parents[parents.length - 1].getBoundingClientRect();
         const stemX = x - 10;
         path.setAttribute('d', `M${stemX} ${parent.bottom - layer.top}L${stemX} ${y - 7}C${stemX} ${y - 2} ${x - 5} ${y} ${x} ${y}`);
       } else if (tall) {
