@@ -13,7 +13,7 @@
   const sources = { classified: '本轮判定', held: '沿用轮初', missing: '轮初判定缺失', revised: '重新判定', unknown: '判定来源未记录' };
   const strategies = { order: '按顺序', rotate: '轮换', usage: '按用量' };
   const waits = { slot: '等待并发空位', rpm: '等待速率额度', retry: '等待路由切换', first_response: '首字状态未确认', unknown: '阶段未记录' };
-  const known = new Map(), retained = new Map();
+  const known = new Map(), retained = new Map(), turns = new Map();
   let current = null, latest = new Map(), pending = null, startedAt = 0, timer = 0;
   let hoverScope = null, focusScope = null, restoreTimer = 0;
   let geometry = '', frame = 0, detailAnchor = null, detailTimer = 0, wireTimer = 0;
@@ -126,7 +126,7 @@
   }
   function buildParts(view) {
     const recorded = Array.isArray(view.stages) ? view.stages : [];
-    const attempts = Array.isArray(view.attempts) ? view.attempts : [];
+    const attempts = !view.turnOpeningMissing && Array.isArray(view.attempts) ? view.attempts : [];
     const actualChain = attempts.at(-1)?.groupChain || [];
     const stages = actualChain.length ? actualChain.map((group, index) => {
       const evidence = recorded.find(stage => group.id && stage.group?.id === group.id
@@ -141,7 +141,9 @@
       const decision = decisionLabel(rule);
       const summary = [rule?.n != null && (rule.n > 0 ? `规则${rule.n}` : '未命中'),
         rule?.turn != null && `第${rule.turn}轮`, rule?.effort].filter(Boolean).join(' · ');
-      const lines = [strategy && `候选基础排序：${strategy}；规则命中的目标优先`, ...ruleLines(rule)];
+      const lines = [view.turnKey && '按用户输入轮次展示；同轮内部请求不单独切换',
+        view.turnOpeningMissing && '本轮开始时的决策未被观察到，仅保留首次可用记录',
+        strategy && `候选基础排序：${strategy}；规则命中的目标优先`, ...ruleLines(rule)].filter(Boolean);
       if (stages.length > 2 && index === stages.length - 1 && capacity < 5) {
         lines.push(`中间 ${stages.length - 2} 级：`);
         stages.slice(1, -1).forEach(stage => lines.push(stage.group?.name || '组名未记录', ...ruleLines(stage.rule)));
@@ -176,8 +178,8 @@
       const ordinal = attempt.ordinal || attempts.length - visible.length + index + 1;
       const last = index === visible.length - 1;
       const phase = view.phase || 'unknown';
-      const activity = last && active(view) ? (view.waitReason || (['slot', 'rpm'].includes(phase) ? phase : phase === 'upstream' ? 'upstream' : 'unknown')) : '';
-      const summary = activity ? activity === 'upstream' ? '请求中' : waits[activity] || waits.unknown : states[attempt.state] || states.unknown;
+      const activity = last && active(view) && !view.turnContinuation ? (view.waitReason || (['slot', 'rpm'].includes(phase) ? phase : phase === 'upstream' ? 'upstream' : 'unknown')) : '';
+      const summary = view.turnContinuation ? '本轮决策模型' : activity ? activity === 'upstream' ? '请求中' : waits[activity] || waits.unknown : states[attempt.state] || states.unknown;
       const chain = (attempt.groupChain || []).map(g => typeof g === 'string' ? g : g.name).filter(Boolean);
       const item = step(`attempt:${ordinal}`, attempt.model || '模型未记录', `尝试${ordinal} · ${summary}`, `实际尝试 ${ordinal}`, [
         `发送模型：${attempt.model || '未记录'}`, attempt.effort && `实际强度：${attempt.effort}`,
@@ -187,7 +189,9 @@
       ].filter(Boolean), icon(null, attempt.model), attempt.state, 'attempt');
       item.dataset.activity = activity; item.dataset.passed = 'true'; parts.push(item);
     });
-    if (!attempts.length) parts.push(step('attempt:pending', '等待尝试', waits[view.waitReason] || '尚未观察到模型请求', '实际尝试尚未记录', ['不以规则优先目标替代实际使用模型'], null, '', 'attempt'));
+    if (!attempts.length) parts.push(view.turnOpeningMissing
+      ? step('attempt:unobserved', '轮初决策未记录', '本轮内部请求已隐藏', '轮初决策未记录', ['HUD 没有观察到本轮开始时的请求，不用后续内部请求替代轮初模型'], null, '', 'attempt')
+      : step('attempt:pending', '等待尝试', waits[view.waitReason] || '尚未观察到模型请求', '实际尝试尚未记录', ['不以规则优先目标替代实际使用模型'], null, '', 'attempt'));
     return parts;
   }
 
@@ -304,7 +308,37 @@
       const candidate = latest.get(pending); pending = null; if (candidate) choose(candidate);
     }, Math.max(0, 1000 - (performance.now() - startedAt)));
   }
+  function userDecisions(decisions) {
+    const result = new Map();
+    const incoming = new Set(decisions.filter(item => item?.id).map(item => item.id));
+    for (const turn of turns.values()) {
+      if (!incoming.has(turn.latest.id) && !ended(turn.latest)) turn.latest = { ...turn.latest, active: false, state: 'unknown' };
+    }
+    const ordered = decisions.filter(item => item?.id).sort((a, b) =>
+      (a.startedMs || 0) - (b.startedMs || 0) || a.id.localeCompare(b.id));
+    for (const item of ordered) {
+      if (!item.turnKey) { result.set(item.id, item); continue; }
+      let turn = turns.get(item.turnKey);
+      if (!turn) turn = { opening: item, latest: item };
+      // 轮初请求可继续补齐自己的尝试；后续工具调用不能覆盖轮初决策。
+      if (turn.opening.id === item.id || (!item.continuation &&
+          (turn.opening.continuation || (item.startedMs || 0) < (turn.opening.startedMs || 0)))) turn.opening = item;
+      if (turn.latest.id === item.id || (item.startedMs || 0) > (turn.latest.startedMs || 0)
+          || ((item.startedMs || 0) === (turn.latest.startedMs || 0) && item.id.localeCompare(turn.latest.id) > 0)) turn.latest = item;
+      turns.delete(item.turnKey); turns.set(item.turnKey, turn);
+      while (turns.size > 128) turns.delete(turns.keys().next().value);
+      const opening = turn.opening, latestRequest = turn.latest;
+      result.set(item.turnKey, { ...opening, id: item.turnKey,
+        startedMs: latestRequest.startedMs, state: latestRequest.state, active: latestRequest.active,
+        phase: opening.id === latestRequest.id ? latestRequest.phase : null,
+        waitReason: opening.id === latestRequest.id ? latestRequest.waitReason : null,
+        turnContinuation: opening.id !== latestRequest.id,
+        turnOpeningMissing: opening.continuation === true });
+    }
+    return [...result.values()];
+  }
   function update(decisions, sessions, allSelected) {
+    decisions = userDecisions(decisions);
     const incoming = new Set(decisions.filter(Boolean).map(item => item.id));
     for (const [id, item] of known) if (!incoming.has(id) && !ended(item)) known.set(id, { ...item, active: false, state: 'unknown' });
     for (const item of decisions) {
@@ -318,7 +352,8 @@
     const eligible = decisions.filter(item => item?.id && (allSelected || allowed.has(item.session)));
     latest = new Map(eligible.map(item => [item.id, item]));
     const candidates = eligible.filter(item => item.active !== false).sort((a, b) => (a.startedMs || 0) - (b.startedMs || 0) || a.id.localeCompare(b.id));
-    const candidate = candidates.at(-1);
+    const candidate = candidates.at(-1) || [...eligible].sort((a, b) =>
+      (a.startedMs || 0) - (b.startedMs || 0) || a.id.localeCompare(b.id)).at(-1);
     if (current && !allSelected && !allowed.has(current.session)) { current = null; pending = null; clearTimeout(timer); }
     if (current) current = known.get(current.id) || { ...current, state: ended(current) ? current.state : 'unknown', active: false };
     if (!current) {

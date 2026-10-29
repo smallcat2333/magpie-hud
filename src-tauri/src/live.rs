@@ -355,6 +355,10 @@ pub struct DecisionView {
     pub subagent: Option<String>,
     pub subagent_id: Option<String>,
     pub started_ms: Option<i64>,
+    /// 明确用户轮次的身份；包含网关、原始会话、子项与入口组，不靠正文推测。
+    pub turn_key: Option<String>,
+    pub user_turn: Option<i64>,
+    pub continuation: bool,
     pub active: bool,
     pub state: &'static str,
     /// 活跃请求的等待原因；非等待或已结束时为 null。
@@ -704,6 +708,12 @@ impl LiveState {
             subagent: (!route.subagent_id.trim().is_empty()).then(|| self.child_label(session, &route.subagent_id)),
             subagent_id: nonempty(&route.subagent_id),
             started_ms,
+            turn_key: route.rule.as_ref().and_then(|rule| rule.turn.filter(|turn| *turn > 0)).map(|turn| {
+                let group = route.group.as_ref().map(|group| if group.id.is_empty() { &group.reference } else { &group.id });
+                serde_json::json!([self.pid, route.session, route.subagent_id, group, turn]).to_string()
+            }),
+            user_turn: route.rule.as_ref().and_then(|rule| rule.turn.filter(|turn| *turn > 0)),
+            continuation: route.rule.as_ref().is_some_and(|rule| rule.held || rule.waits || rule.grown),
             active: true,
             state,
             wait_reason,
@@ -2819,6 +2829,34 @@ mod tests {
     }
 
     /// 第 7 轮命中第 5 条规则且字段齐全；嵌套组按上游原序，缺身份的同名组不关联。
+    #[test]
+    fn decision_turn_identity_isolates_scope_and_tracks_continuations() {
+        let mut live = LiveState::default();
+        live.pid = 7;
+        let mut route: LiveRoute = serde_json::from_value(serde_json::json!({
+            "id": 1, "session": "s1", "group": {"id": "auto", "name": "自动"},
+            "rule": {"turn": 3, "classified": {"by": "typesafe/jev-latest", "ms": 224}}
+        })).unwrap();
+        let opening = live.decision_view(&route, &Active::default(), "s1");
+        assert_eq!(opening.user_turn, Some(3));
+        assert!(!opening.continuation);
+        route.id = 2;
+        route.rule.as_mut().unwrap().held = true;
+        let followup = live.decision_view(&route, &Active::default(), "s1");
+        assert_eq!(opening.turn_key, followup.turn_key);
+        assert!(followup.continuation);
+        route.subagent_id = "child".into();
+        assert_ne!(opening.turn_key, live.decision_view(&route, &Active::default(), "s1").turn_key);
+        route.subagent_id.clear();
+        route.rule.as_mut().unwrap().turn = Some(4);
+        assert_ne!(opening.turn_key, live.decision_view(&route, &Active::default(), "s1").turn_key);
+        route.rule.as_mut().unwrap().turn = None;
+        assert!(live.decision_view(&route, &Active::default(), "s1").turn_key.is_none());
+        route.rule.as_mut().unwrap().turn = Some(3);
+        live.pid = 8;
+        assert_ne!(opening.turn_key, live.decision_view(&route, &Active::default(), "s1").turn_key);
+    }
+
     #[test]
     fn decision_timing_keeps_missing_cache_and_reuse_distinct() {
         for (record, duration, cached) in [
