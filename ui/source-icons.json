@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "fallback": "icons/robot.svg",
+  "rules": [
+    { "agents": ["Claude Code", "claude", "claudecode"], "icon": "icons/claudecode-color.svg" },
+    { "agents": ["Claude Desktop", "claudedesktop"], "icon": "icons/claude-color.svg" },
+    { "agents": ["Codex"], "icon": "icons/codex-color.svg" }
+  ]
+}

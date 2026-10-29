@@ -607,13 +607,14 @@
     const icon = document.createElement('span');
     icon.className = className;
     icon.setAttribute('aria-hidden', 'true');
+    if (agent === '*') { icon.textContent = '∗'; return icon; }
     const family = /claude[\s-]*code/i.test(agent) ? 'claudecode-color' : /claude/i.test(agent) ? 'claude-color' : modelIcon(agent);
-    if (family) {
-      const image = document.createElement('img');
-      image.src = `icons/${family}.svg`;
-      image.alt = '';
-      icon.append(image);
-    } else icon.textContent = agent === '*' ? '∗' : '↗';
+    const fallback = window.hudSourceIcons.fallback();
+    const image = document.createElement('img');
+    image.src = window.hudSourceIcons.match(agent) || (family ? `icons/${family}.svg` : fallback);
+    image.alt = '';
+    image.addEventListener('error', () => { if (image.getAttribute('src') !== fallback) image.src = fallback; });
+    icon.append(image);
     return icon;
   }
 
@@ -1594,6 +1595,7 @@
 
   /** 先完成事件订阅，再拉取后端已缓存快照；只在 Tauri 环境访问原生 API。 */
   async function start() {
+    await window.hudSourceIcons.ready;
     // 焦点仅记录交互状态，聚焦与失焦使用相同的半透明背景。
     const syncFocus = focused => { hud.dataset.focus = String(focused); };
     window.addEventListener('focus', () => syncFocus(true));

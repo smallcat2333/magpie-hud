@@ -434,6 +434,7 @@ fn start_live(app: AppHandle) {
     std::thread::spawn(move || {
         let agent = live::client(Duration::from_secs(2));
         let mut titles = live::Titles::default();
+        let mut custom_titles = live::CustomTitles::default();
         let mut child_titles = live::ChildTitles::default();
         let mut names = std::collections::HashMap::new();
         let mut aliases = std::collections::HashMap::new();
@@ -442,7 +443,8 @@ fn start_live(app: AppHandle) {
         let mut last_children = Instant::now() - Duration::from_secs(8);
         loop {
             if last_titles.elapsed() >= Duration::from_secs(2) {
-                names = titles.scan(&live::desktop_roots());
+                names = custom_titles.scan();
+                names.extend(titles.scan(&live::desktop_roots()));
                 aliases = titles.aliases();
                 last_titles = Instant::now();
             }

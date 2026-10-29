@@ -1,5 +1,7 @@
 # 图标来源
 
+2026-10-29 自定义来源：`robot.svg` 为本项目绘制的通用机器人图标，用于未知 Agent 来源。匹配规则见 `ui/source-icons.json` 和 [自定义 Agent 接入说明](../../docs/integration/custom-agents.md)。
+
 2026-10-28 Jev 判定模型：`typesafe.svg` 封装 [TypeSafe 官方网站](https://typesafe.ai) 使用的 [原始 PNG favicon](https://framerusercontent.com/images/aNFzSFxM4fjICmnibw7npfZjcQ.png)，保留官方粉色与黑色图形，仅用于识别 TypeSafe/Jev；品牌权利归原权利人。资源随应用本地打包，匹配 `typesafe/jev-*` 和 `jev-*` 模型名称。
 
 2026-10-24 飞书图标：`feishu.svg` 来自字节跳动 Semi Design 的 [feishu_logo.svg](https://github.com/DouyinFE/semi-design/blob/4289eff2d6ddef19ee63c72dce4cf355132fafbb/packages/semi-icons/src/svgs/feishu_logo.svg)，固定上游提交 `4289eff2d6ddef19ee63c72dce4cf355132fafbb`；保留原路径，黑色填充改为深色界面使用的 `#f2f0f2`。MIT 版权声明见 [LICENSE-semi-design](LICENSE-semi-design)。匹配 feishu/lark/飞书；卡片已知模型优先使用模型图标，`feishu-codem/auto` 等无已知模型图标时按供应商显示飞书。

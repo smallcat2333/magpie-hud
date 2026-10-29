@@ -1520,6 +1520,71 @@ struct DesktopTitle {
     #[serde(default)] title: String,
 }
 
+/// 自定义 Agent 只提供会话 ID 与短标题，不读取对话正文。
+#[derive(Clone, Deserialize)]
+struct CustomTitleFile {
+    version: u32,
+    agent: String,
+    sessions: Vec<CustomSessionTitle>,
+}
+
+#[derive(Clone, Deserialize)]
+struct CustomSessionTitle {
+    session: String,
+    title: String,
+}
+
+#[derive(Default)]
+pub struct CustomTitles {
+    files: HashMap<PathBuf, (std::time::SystemTime, u64, CustomTitleFile)>,
+}
+
+impl CustomTitles {
+    pub fn scan(&mut self) -> HashMap<String, String> {
+        let directory = crate::config::config_path().with_file_name("session-titles");
+        self.scan_directory(&directory)
+    }
+
+    fn scan_directory(&mut self, directory: &Path) -> HashMap<String, String> {
+        use std::io::Read;
+        const MAX_BYTES: u64 = 1024 * 1024;
+        let mut paths: Vec<_> = fs::read_dir(directory).into_iter().flatten().flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry.path().extension().is_some_and(|extension| extension == "json"))
+            .map(|entry| entry.path()).collect();
+        paths.sort();
+        paths.truncate(128);
+        let mut found = HashSet::new();
+        let mut result = HashMap::new();
+        for path in paths {
+            found.insert(path.clone());
+            let Ok(metadata) = fs::metadata(&path) else { continue };
+            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+            if metadata.len() <= MAX_BYTES && !self.files.get(&path)
+                .is_some_and(|(time, len, _)| *time == modified && *len == metadata.len()) {
+                let mut bytes = Vec::new();
+                if fs::File::open(&path).and_then(|file| file.take(MAX_BYTES + 1).read_to_end(&mut bytes)).is_ok()
+                    && bytes.len() as u64 <= MAX_BYTES {
+                    if let Ok(data) = serde_json::from_slice::<CustomTitleFile>(&bytes) {
+                        if data.version == 1 && !data.agent.trim().is_empty() && data.sessions.len() <= 4096 {
+                            self.files.insert(path.clone(), (modified, metadata.len(), data));
+                        }
+                    }
+                }
+            }
+            if let Some((_, _, data)) = self.files.get(&path) {
+                for entry in &data.sessions {
+                    if entry.session.len() > 256 || !safe_child_id(&entry.session) { continue; }
+                    let title: String = entry.title.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect();
+                    if !title.is_empty() { add_title(&mut result, &entry.session, &title, 0); }
+                }
+            }
+        }
+        self.files.retain(|path, _| found.contains(path));
+        result.into_iter().filter(|(_, (_, title))| !title.is_empty()).map(|(id, (_, title))| (id, title)).collect()
+    }
+}
+
 /// 缓存未变的标题文件；外部文件短暂写坏时保留上次有效标题，删除则移除。
 #[derive(Default)]
 pub struct Titles {
@@ -2357,6 +2422,38 @@ mod tests {
         assert!(!view.model_usage.iter().any(|row| row.session == "prior"));
         let canonical = view.model_usage.iter().find(|row| row.session == "current").unwrap();
         assert_eq!((canonical.tokens, canonical.output_tokens, canonical.generation_ms, canonical.speed_samples), (60, 40, 4000.0, 2));
+    }
+
+    #[test]
+    fn custom_titles_read_exact_sessions_and_retain_valid_snapshot() {
+        let directory = std::env::temp_dir().join(format!("magpie-hud-custom-titles-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("example-agent.json");
+        let data = serde_json::json!({"version": 1, "agent": "Example Agent", "sessions": [
+            {"session": "example-session-1", "title": "  Example Agent /\n设备排查  ", "updatedAt": "2026-10-29T14:00:00+08:00"},
+            {"session": "../invalid", "title": "不能匹配"},
+            {"session": "empty", "title": "  "}
+        ]});
+        fs::write(&path, data.to_string()).unwrap();
+        let mut titles = CustomTitles::default();
+        let initial = titles.scan_directory(&directory);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial["example-session-1"], "Example Agent / 设备排查");
+        fs::write(&path, "{\"version\":").unwrap();
+        assert_eq!(titles.scan_directory(&directory), initial, "写入中保留上次有效快照");
+        fs::write(&path, serde_json::json!({"version": 2, "agent": "Example Agent", "sessions": []}).to_string()).unwrap();
+        assert_eq!(titles.scan_directory(&directory), initial, "未知协议不替换已有快照");
+        fs::write(directory.join("other.json"), serde_json::json!({"version": 1, "agent": "Other", "sessions": [
+            {"session": "example-session-1", "title": "冲突名称"},
+            {"session": "separate", "title": "独立会话"}
+        ]}).to_string()).unwrap();
+        let conflicting = titles.scan_directory(&directory);
+        assert!(!conflicting.contains_key("example-session-1"));
+        assert_eq!(conflicting["separate"], "独立会话");
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(directory.join("other.json")).unwrap();
+        assert!(titles.scan_directory(&directory).is_empty(), "删除文件应移除标题");
+        fs::remove_dir(&directory).unwrap();
     }
 
     /// 标题元数据里的显式 CLI 关联形成别名映射；同名、冲突声明与无当前 ID 时都不猜。
