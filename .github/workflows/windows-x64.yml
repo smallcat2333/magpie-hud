@@ -1,0 +1,53 @@
+name: Build Windows x64
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 executable
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-ci
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust for Windows x64
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+          rustup default stable
+
+      - name: Test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked --target x86_64-pc-windows-msvc
+
+      - name: Build executable
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Prepare download
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $name = "magpie-hud-$version-windows-x64.exe"
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/magpie-hud.exe" "dist/$name"
+          $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          "ARTIFACT_NAME=magpie-hud-$version-windows-x64" >> $env:GITHUB_ENV
+
+      - name: Upload executable and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30

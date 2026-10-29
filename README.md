@@ -19,6 +19,12 @@ V.0.0.32 当前运行窗口（2026-10-28，真实数据，账号信息已脱敏�
 
 路由决策按已确认的组路径和实际模型尝试展示，支持 Jev 等判定模型图标、轮初沿用、规则与轮次、判定耗时及会话悬停联动。耗时位于连线上方，低于 1 秒为绿、1 至不足 2 秒为黄、达到 2 秒为红；已确认经过的连线先展示至少 1 秒光点，再转为绿色实线，尚未确认部分保持浅灰。详见 [路由决策说明](docs/ui/decision-route.md)。
 
+## Windows x64 下载
+
+[GitHub Actions · Build Windows x64](https://github.com/smallcat2333/magpie-hud/actions/workflows/windows-x64.yml) 在推送到 `main`、推送 `v*` 标签或手动运行时执行 Rust 测试并构建 Windows x64 独立程序。
+
+打开成功的运行记录，在 **Artifacts** 中下载 `magpie-hud-版本号-windows-x64`，解压后包含 exe 和 `SHA256SUMS.txt`。构建产物保留 30 天，下载通常需要登录 GitHub。这是独立 exe，运行环境仍需 Windows 10/11 WebView2 Runtime 和本机 Magpie。
+
 ## 运行
 
 需要 Rust stable、Windows 10/11 WebView2 Runtime 和 **Tauri CLI 2**。本机已于 2026-10-20 确认安装 `tauri-cli 2.12.3`，替换原来的 1.6.1。
