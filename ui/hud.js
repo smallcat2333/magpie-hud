@@ -78,6 +78,7 @@
       ['typesafe', /(?:^|\/)jev(?:[-/]|$)|typesafe/],
       ['feishu', /feishu|lark|飞书/],
       ['xiaomimimo', /mimo|xiaomi/],
+      ['devin-color', /(?:^|[\s/])swe[-_]?2(?:$|[-_\s/])|devin/i],
       ['siliconcloud-color', /silicon/],
       ['modelscope-color', /modelscope/],
       ['qwen-color', /qwen|qwq|qvq/],
@@ -1009,7 +1010,10 @@
     };
     const header = node('div', 'quota-tooltip-heading');
     const identity = node('div', 'quota-tooltip-identity');
-    identity.append(node('strong', '', window.hudRedact.scrub(quota.name || quota.provider)), node('span', 'quota-tooltip-account', maskAccount(card.account)));
+    const icon = view.icon.cloneNode(true);
+    icon.className = 'quota-tooltip-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    identity.append(icon, node('strong', '', window.hudRedact.scrub(quota.name || quota.provider)), node('span', 'quota-tooltip-account', maskAccount(card.account)));
     const count = quota.windows.length;
     header.append(identity, node('span', 'quota-tooltip-count', `${count} 个窗口`));
     const content = [header];

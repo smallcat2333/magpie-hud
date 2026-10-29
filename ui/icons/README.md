@@ -1,5 +1,7 @@
 # 图标来源
 
+2026-10-29 Devin / SWE-2：`devin-color.svg` 来自 [`@lobehub/icons-static-svg@1.97.0`](https://unpkg.com/@lobehub/icons-static-svg@1.97.0/icons/devin-color.svg)，保留上游彩色 SVG 路径与配色，许可证见本目录 [LICENSE](LICENSE)。SWE-2 模型使用 Devin 品牌图标；Devin 供应商额度和来源也复用此图标。
+
 2026-10-29 自定义来源：`robot.svg` 为本项目绘制的通用机器人图标，用于未知 Agent 来源。匹配规则见 `ui/source-icons.json` 和 [自定义 Agent 接入说明](../../docs/integration/custom-agents.md)。
 
 2026-10-28 Jev 判定模型：`typesafe.svg` 封装 [TypeSafe 官方网站](https://typesafe.ai) 使用的 [原始 PNG favicon](https://framerusercontent.com/images/aNFzSFxM4fjICmnibw7npfZjcQ.png)，保留官方粉色与黑色图形，仅用于识别 TypeSafe/Jev；品牌权利归原权利人。资源随应用本地打包，匹配 `typesafe/jev-*` 和 `jev-*` 模型名称。
