@@ -46,7 +46,10 @@
 .decision-detail{position:fixed;z-index:90;width:340px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow:auto;padding:12px 14px;border:1px solid var(--edge);border-radius:6px;background:var(--surface);box-shadow:0 8px 24px #0005;color:var(--ink);font-size:11px;line-height:17px;user-select:text}
 .decision-detail strong{display:block;margin-bottom:7px;font-size:12px}
 .decision-detail p{margin:3px 0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted)}
-.hud[data-layout="tall"] .decision-route{flex-shrink:0;padding-inline:0}
+/* 竖向布局内容区可滚动且滚动条隐藏；决策栏吸附在可视底部，高度再矮也保持可见。 */
+.hud[data-layout="tall"] .decision-route{position:sticky;bottom:0;flex-shrink:0;padding-inline:0;background:rgb(23 25 30/.97);border-top:1px solid var(--edge)}
+/* 宽布局矮窗时中转区内容不再向决策栏溢出重叠。 */
+.hud[data-layout="wide"] .transit{overflow:hidden}
 @media(max-height:540px){.decision-route{height:56px;min-height:56px;padding-block:4px}.decision-content{height:28px;margin-top:4px;gap:54px}.decision-step{height:28px;gap:5px}.decision-copy{gap:0}.decision-value{line-height:14px}.decision-label{font-size:10px;line-height:12px}.decision-origin{flex-basis:18px;width:18px;height:18px}.decision-origin img,.decision-origin svg{width:17px;height:17px}}
 @media(max-width:480px){.decision-heading{gap:6px}.decision-content{gap:44px}.decision-origin{flex-basis:16px;width:16px}.decision-origin img,.decision-origin svg{width:16px;height:16px}}
 @media(prefers-reduced-motion:reduce){.decision-step .decision-origin{animation:none!important}.decision-packet{display:none}}
