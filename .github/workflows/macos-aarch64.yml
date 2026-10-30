@@ -1,0 +1,76 @@
+name: Build macOS Apple Silicon
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: macOS ARM64 app and disk image
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-ci
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+
+      - name: Install stable Rust for Apple Silicon
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
+          rustup default stable
+
+      - name: Test on macOS
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked --target aarch64-apple-darwin
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version '2.12.3' --locked
+
+      - name: Build app and disk image
+        run: cargo tauri build --ci --target aarch64-apple-darwin --bundles app,dmg -- --locked
+
+      - name: Prepare download
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+
+          version = json.loads(Path('src-tauri/tauri.conf.json').read_text())['version']
+          release = Path(os.environ['CARGO_TARGET_DIR']) / 'aarch64-apple-darwin/release'
+          bundle = release / 'bundle'
+          app = bundle / 'macos/Magpie HUD.app'
+          images = list((bundle / 'dmg').glob('*.dmg'))
+          assert app.is_dir() and len(images) == 1, 'Expected one ARM64 app and DMG'
+          subprocess.run(['lipo', '-verify_arch', 'arm64', str(app / 'Contents/MacOS/magpie-hud')], check=True)
+          destination = Path('dist')
+          destination.mkdir()
+          name = f'magpie-hud-{version}-macos-arm64'
+          shutil.copy2(images[0], destination / f'{name}.dmg')
+          subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(destination / f'{name}.app.zip')], check=True)
+          files = sorted(destination.iterdir())
+          (destination / 'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in files))
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'ARTIFACT_NAME={name}\n')
+          PY
+
+      - name: Upload app, disk image and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30

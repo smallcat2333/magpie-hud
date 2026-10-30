@@ -1369,8 +1369,8 @@ pub struct ChildTitles {
 impl ChildTitles {
     /// 只查当天快照里出现的父会话和子 ID。
     pub fn scan(&mut self, wanted: &HashSet<(String, String)>) -> HashMap<(String, String), String> {
-        let root = std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".claude").join("projects"));
-        self.scan_root(root.as_deref(), wanted)
+        let root = crate::config::directories_base().join(".claude").join("projects");
+        self.scan_root(Some(&root), wanted)
     }
 
     /// 在指定 projects 根下按精确父会话和子 ID 读取短标签。
@@ -1635,7 +1635,7 @@ impl Titles {
         self.files.retain(|path, _| found.contains(path));
         self.aliases = alias_links(self.files.values().map(|(_, _, title)| title));
         let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("USERPROFILE").expect("缺少用户目录")).join(".codex")
+            crate::config::directories_base().join(".codex")
         }).join("session_index.jsonl");
         // Magpie 也从此只追加索引读取名称，未换行记录留到下次扫描。
         if let Ok(file) = fs::File::open(codex) {
@@ -1724,6 +1724,11 @@ pub fn desktop_roots() -> Vec<PathBuf> {
         if let Some(base) = std::env::var_os(var) {
             for name in ["Claude", "Claude-3p"] { roots.push(PathBuf::from(&base).join(name)); }
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let base = crate::config::directories_base().join("Library").join("Application Support");
+        for name in ["Claude", "Claude-3p"] { roots.push(base.join(name)); }
     }
     roots
 }
@@ -2692,6 +2697,15 @@ mod tests {
     }
 
     /// 活跃卡 updatedAt 取 start + 已用毫秒，按 UTC 毫秒精度输出。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_desktop_roots_include_application_support() {
+        let base = crate::config::directories_base().join("Library/Application Support");
+        let roots = desktop_roots();
+        assert!(roots.contains(&base.join("Claude")));
+        assert!(roots.contains(&base.join("Claude-3p")));
+    }
+
     #[test]
     fn active_card_updated_at_tracks_elapsed_time() {
         let now = Local::now();

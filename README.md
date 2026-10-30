@@ -7,7 +7,7 @@ cargo install tauri-cli --version "^2.0.0" --locked
 cargo tauri dev
 ```
 
-使用 **Tauri 2 + 系统 WebView** 构建 Windows 独立悬浮窗。完成用量只读 Magpie 的 `usage.jsonl`，进行中状态只读本机网关 `/v1/magpie/trace` 与 `/v1/magpie/concurrency`；显示会话名称、流动路由及本次 Token/TPS，底部默认显示两行带本地时间的说明，高度不超过 420px 时收为 28px 单行。不修改 Magpie、不读取密钥、不集成进 rs_agent_router。
+使用 **Tauri 2 + 系统 WebView** 构建桌面悬浮窗，支持 Windows，并提供 macOS Apple Silicon 构建配置。完成用量只读 Magpie 的 `usage.jsonl`，进行中状态只读本机网关 `/v1/magpie/trace` 与 `/v1/magpie/concurrency`；显示会话名称、流动路由及本次 Token/TPS，底部默认显示两行带本地时间的说明，高度不超过 420px 时收为 28px 单行。不修改 Magpie、不读取密钥、不集成进 rs_agent_router。
 
 **当前状态：支持自由缩放、横竖布局、实时路由、账号额度和费用估值。** 标题为 Magpie HUD，主背景 50% 不透明度配合 Windows 桌面合成 Acrylic 磨砂，聚焦和失焦保持相同底色，文字保持清晰。横窗来源不超过两个时与 Magpie 纵向排列；竖窗并排，保留来源图标并放大 Magpie。默认窗口 1120×400；拖动边缘/角落调整宽高，长宽比小于 1.25 或宽度小于 680px 时自动使用纵向布局；来源超过两个且宽度小于 980px 时也使用纵向布局。统计、来源与会话块随尺寸重排；高度不超过 420px 时，统计精简为 `Token | TPS | 费用`，日志收为 28px 单行，拉高后自动恢复。完整需求见 [SPEC](docs/spec/magpie-route-float-SPEC.md)，2026-10-20 的会话/统计增量见 [M2 档案](docs/feat/Feat_261019_2_分流图与托盘.md)。原始 [HTML 原型](docs/ui/magpie-hud.html) 保留为早期设计参考，实际程序使用 `ui/index.html`、`ui/hud.css` 和 `ui/hud.js`。
 
@@ -24,6 +24,16 @@ V.0.0.32 当前运行窗口（2026-10-28，真实数据，账号信息已脱敏�
 [GitHub Actions · Build Windows x64](https://github.com/smallcat2333/magpie-hud/actions/workflows/windows-x64.yml) 在推送到 `main`、推送 `v*` 标签或手动运行时执行 Rust 测试并构建 Windows x64 独立程序。
 
 打开成功的运行记录，在 **Artifacts** 中下载 `magpie-hud-版本号-windows-x64`，解压后包含 exe 和 `SHA256SUMS.txt`。构建产物保留 30 天，下载通常需要登录 GitHub。这是独立 exe，运行环境仍需 Windows 10/11 WebView2 Runtime 和本机 Magpie。
+
+## macOS Apple Silicon 下载
+
+[GitHub Actions · Build macOS Apple Silicon](https://github.com/smallcat2333/magpie-hud/actions/workflows/macos-aarch64.yml) 在推送到 `main`、`v*` 标签或手动运行时，在 ARM64 Mac 上执行 Rust 测试并构建原生 `aarch64-apple-darwin` 应用，适用于 M 系列芯片，最低 macOS 11。
+
+成功运行的 **Artifacts** 中提供 `magpie-hud-版本号-macos-arm64`：包含 `.dmg`、保留应用结构的 `.app.zip` 和 `SHA256SUMS.txt`，保留 30 天。打开 DMG 后将应用拖入 Applications。当前构建没有 Developer ID 签名和 Apple 公证，macOS 可能阻止首次打开；确认来源后可在“系统设置 → 隐私与安全性”中允许打开。需要本机运行 Magpie；不读取另一台电脑的数据。
+
+macOS 配置位于 `~/Library/Application Support/magpie-hud/config.json`，自定义标题位于同目录的 `session-titles/`；默认用量日志为 `~/.config/magpie/usage.jsonl`。Desktop 标题从 `~/Library/Application Support/Claude`、`Claude-3p` 读取；Codex 使用 `CODEX_HOME` 或 `~/.codex`；子 Agent 元数据使用 `~/.claude/projects`。缺少数据目录时保留未知状态。
+
+透明窗口采用 macOS 原生 HUD 磨砂材质。ARM64 编译与测试由 Actions 验证；菜单栏、置顶、多屏和磨砂视觉仍需 Mac 实机验收。此构建不面向 Mac App Store。
 
 ## 运行
 
@@ -123,7 +133,9 @@ python scripts/verify_routing_window.py
 
 ## 变更记录
 
-当前程序版本是 `1.0.4`，标题显示为 `Magpie HUD V.1.0.4`。上方截图来自 v0.0.32，保留为实际运行示例。
+当前程序版本是 `1.0.5`，标题显示为 `Magpie HUD V.1.0.5`。上方截图来自 v0.0.32，保留为实际运行示例。
+
+2026-10-30 | 1.0.5 | 增加 macOS Apple Silicon 平台配置、原生 HUD 磨砂和 ARM64 GitHub Actions 打包；适配配置、Desktop、Codex 与子 Agent 标题路径，补齐跨平台显示器工作区回退。
 
 2026-10-30 | 1.0.4 | 修复窄高窗口竖向布局下“路由决策”被排到滚动区底部而不显示的问题：现在吸附在会话栏可视底部；宽布局中转区内容不再压到决策栏。
 

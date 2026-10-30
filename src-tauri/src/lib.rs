@@ -518,6 +518,11 @@ async fn open_usage_details(app: AppHandle, context: details::DetailContext) -> 
             window.set_position(LogicalPosition::new(saved.x,saved.y)).map_err(|e|e.to_string())?;
         }
         constrain_current(&window).map_err(|e|e.to_string())?;
+        #[cfg(target_os = "macos")]
+        window.set_effects(tauri::utils::config::WindowEffectsConfig {
+            effects: vec![tauri::utils::WindowEffect::HudWindow],
+            ..Default::default()
+        }).map_err(|e| e.to_string())?;
         backdrop::apply(&window).map_err(|e| e.to_string())?;
         window.show().map_err(|e|e.to_string())?;
         let _ = remember_details(&app);
@@ -1017,7 +1022,14 @@ fn current_work_area(window: &WebviewWindow, current: PhysicalRect) -> Option<Ph
             return Some(PhysicalRect { x: area.position.x, y: area.position.y, width: area.size.width, height: area.size.height });
         }
     }
-    monitor_for_window(current, &winmon::work_areas())
+    let mut areas = winmon::work_areas();
+    if areas.is_empty() {
+        areas = window.available_monitors().ok()?.iter().map(|monitor| {
+            let area = monitor.work_area();
+            PhysicalRect { x: area.position.x, y: area.position.y, width: area.size.width, height: area.size.height }
+        }).filter(|area| area.width > 0 && area.height > 0).collect();
+    }
+    monitor_for_window(current, &areas)
 }
 
 /// 启动和托盘恢复时按实际工作区限制整窗。

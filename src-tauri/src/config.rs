@@ -50,14 +50,22 @@ pub fn default_usage_path() -> PathBuf {
     directories_base().join(".config").join("magpie").join("usage.jsonl")
 }
 
-/// 解析 `%APPDATA%\magpie-hud\config.json`。
+/// Windows 使用 APPDATA；macOS 使用用户的 Application Support。
 pub fn config_path() -> PathBuf {
-    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(directories_base).join("magpie-hud").join("config.json")
+    #[cfg(target_os = "macos")]
+    let base = directories_base().join("Library").join("Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(directories_base);
+    base.join("magpie-hud").join("config.json")
 }
 
-/// 获取用户主目录；环境变量缺失时退回当前目录，便于测试显式传入其他配置路径。
-fn directories_base() -> PathBuf {
-    std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+/// 获取用户主目录；不因某个平台没有 Windows 环境变量而中断后台线程。
+pub(crate) fn directories_base() -> PathBuf {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// 读取配置。
@@ -87,6 +95,17 @@ pub fn usage_path(config: &AppConfig) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_config_uses_application_support() {
+        assert_eq!(config_path(), directories_base().join("Library/Application Support/magpie-hud/config.json"));
+    }
+
+    #[test]
+    fn default_usage_stays_in_magpie_home() {
+        assert_eq!(default_usage_path(), directories_base().join(".config/magpie/usage.jsonl"));
+    }
 
     #[test]
     fn details_geometry_roundtrips_and_old_config_still_loads() {

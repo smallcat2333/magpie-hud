@@ -23,11 +23,10 @@ HUD 从应用内的 `ui/source-icons.json` 读取规则。以下是通用示例�
 
 ## 对话标题文件（协议版本 1）
 
-自定义 Agent 写入运行 HUD 的 Windows 用户目录，每个生产者使用独立文件：
+自定义 Agent 写入运行 HUD 的本机用户目录，每个生产者使用独立文件：
 
-```text
-%APPDATA%\magpie-hud\session-titles\example-agent.json
-```
+- Windows：`%APPDATA%\magpie-hud\session-titles\example-agent.json`
+- macOS：`~/Library/Application Support/magpie-hud/session-titles/example-agent.json`
 
 UTF-8 JSON 示例：
 

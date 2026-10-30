@@ -1,7 +1,7 @@
 [package]
 name = "magpie-hud"
-version = "1.0.4"
-description = "只读监视 Magpie 路由结果的 Windows 悬浮窗"
+version = "1.0.5"
+description = "只读监视 Magpie 路由结果的桌面悬浮窗"
 authors = ["smallcat_SY"]
 edition = "2021"
 
@@ -19,4 +19,8 @@ tauri = { version = "2.11.3", features = ["tray-icon"] }
 notify = "8"
 ureq = { version = "3", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri = { version = "2.11.3", features = ["macos-private-api"] }
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_LibraryLoader"] }
