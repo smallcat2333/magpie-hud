@@ -46,6 +46,7 @@ jobs:
           import json
           import os
           from pathlib import Path
+          import plistlib
           import shutil
           import subprocess
 
@@ -54,8 +55,12 @@ jobs:
           bundle = release / 'bundle'
           app = bundle / 'macos/Magpie HUD.app'
           images = list((bundle / 'dmg').glob('*.dmg'))
-          assert app.is_dir() and len(images) == 1, 'Expected one ARM64 app and DMG'
-          subprocess.run(['lipo', '-verify_arch', 'arm64', str(app / 'Contents/MacOS/magpie-hud')], check=True)
+          if not app.is_dir() or len(images) != 1:
+              subprocess.run(['find', str(bundle), '-maxdepth', '3'], check=False)
+              raise SystemExit('Expected one ARM64 app and DMG')
+          # Tauri 2 以 productName 命名包内可执行文件，从 Info.plist 读取实际名称。
+          executable = plistlib.loads((app / 'Contents/Info.plist').read_bytes())['CFBundleExecutable']
+          subprocess.run(['lipo', '-verify_arch', 'arm64', str(app / 'Contents/MacOS' / executable)], check=True)
           destination = Path('dist')
           destination.mkdir()
           name = f'magpie-hud-{version}-macos-arm64'
