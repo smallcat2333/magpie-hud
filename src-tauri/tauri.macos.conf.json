@@ -1,26 +1,4 @@
 {
-  "app": {
-    "macOSPrivateApi": true,
-    "windows": [
-      {
-        "label": "main",
-        "title": "Magpie HUD V.1.0.5",
-        "width": 1120,
-        "height": 400,
-        "minWidth": 360,
-        "minHeight": 280,
-        "resizable": true,
-        "decorations": false,
-        "transparent": true,
-        "backgroundColor": "#00000000",
-        "windowEffects": { "effects": ["hudWindow"] },
-        "shadow": false,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "visible": false
-      }
-    ]
-  },
   "bundle": {
     "targets": ["app", "dmg"],
     "icon": ["icons/128x128.png", "icons/icon.icns"],

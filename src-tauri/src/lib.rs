@@ -518,11 +518,6 @@ async fn open_usage_details(app: AppHandle, context: details::DetailContext) -> 
             window.set_position(LogicalPosition::new(saved.x,saved.y)).map_err(|e|e.to_string())?;
         }
         constrain_current(&window).map_err(|e|e.to_string())?;
-        #[cfg(target_os = "macos")]
-        window.set_effects(tauri::utils::config::WindowEffectsConfig {
-            effects: vec![tauri::utils::WindowEffect::HudWindow],
-            ..Default::default()
-        }).map_err(|e| e.to_string())?;
         backdrop::apply(&window).map_err(|e| e.to_string())?;
         window.show().map_err(|e|e.to_string())?;
         let _ = remember_details(&app);

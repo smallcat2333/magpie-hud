@@ -52,7 +52,12 @@ pub fn apply(window: &tauri::WebviewWindow) -> tauri::Result<()> {
             }
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    window.set_effects(tauri::utils::config::WindowEffectsConfig {
+        effects: vec![tauri::utils::WindowEffect::HudWindow],
+        ..Default::default()
+    })?;
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = window;
     Ok(())
 }

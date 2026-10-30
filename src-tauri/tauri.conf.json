@@ -1,17 +1,18 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Magpie HUD",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "identifier": "com.smallcat.magpie-hud",
   "build": {
     "frontendDist": "../ui"
   },
   "app": {
     "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
-        "title": "Magpie HUD V.1.0.5",
+        "title": "Magpie HUD V.1.0.6",
         "width": 1120,
         "height": 400,
         "minWidth": 360,
@@ -20,7 +21,7 @@
         "decorations": false,
         "transparent": true,
         "backgroundColor": "#00000000",
-        "windowEffects": { "effects": ["acrylic"], "color": [23, 25, 30, 128] },
+        "windowEffects": { "effects": ["acrylic", "hudWindow"], "color": [23, 25, 30, 128] },
         "shadow": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,

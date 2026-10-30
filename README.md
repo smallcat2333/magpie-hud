@@ -133,7 +133,9 @@ python scripts/verify_routing_window.py
 
 ## 变更记录
 
-当前程序版本是 `1.0.5`，标题显示为 `Magpie HUD V.1.0.5`。上方截图来自 v0.0.32，保留为实际运行示例。
+当前程序版本是 `1.0.6`，标题显示为 `Magpie HUD V.1.0.6`。上方截图来自 v0.0.32，保留为实际运行示例。
+
+2026-10-30 | 1.0.6 | 统一 Tauri 的 macOS 私有 API 配置与依赖 feature，修复平台配置与构建检查不一致的问题；主窗口和详情窗口共用原生磨砂设置，保留 CI 锁文件校验。
 
 2026-10-30 | 1.0.5 | 增加 macOS Apple Silicon 平台配置、原生 HUD 磨砂和 ARM64 GitHub Actions 打包；适配配置、Desktop、Codex 与子 Agent 标题路径，补齐跨平台显示器工作区回退。
 
