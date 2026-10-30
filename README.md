@@ -133,9 +133,10 @@ python scripts/verify_routing_window.py
 
 ## 变更记录
 
-当前程序版本是 `1.0.7`，标题显示为 `Magpie HUD V.1.0.7`。上方截图来自 v0.0.32，保留为实际运行示例。
+当前程序版本是 `1.0.8`，标题显示为 `Magpie HUD V.1.0.8`。上方截图来自 v0.0.32，保留为实际运行示例。
 
 2026-10-30 | 1.0.7 | 修复 macOS Actions 打包后整理产物失败：从 Info.plist 读取 App 内实际可执行文件名再校验 ARM64，找不到产物时打印 bundle 目录便于排查。
+2026-10-30 | 1.0.8 | 按 Magpie 图标清单补齐 Agent 与模型图标：Kiro、Cursor、Windsurf、Trae、Qoder、CodeBuddy、Roo Code、Goose，以及 Llama、Gemma、Perplexity、Cohere、Yi、百川、文心、讯飞星火、书生、元宝、LongCat、Hugging Face；修正 codex-spark 被误识别为火山引擎。
 
 2026-10-30 | 1.0.6 | 统一 Tauri 的 macOS 私有 API 配置与依赖 feature，修复平台配置与构建检查不一致的问题；主窗口和详情窗口共用原生磨砂设置，保留 CI 锁文件校验。
 

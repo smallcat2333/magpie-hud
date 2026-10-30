@@ -4,6 +4,14 @@
   "rules": [
     { "agents": ["Claude Code", "claude", "claudecode"], "icon": "icons/claudecode-color.svg" },
     { "agents": ["Claude Desktop", "claudedesktop"], "icon": "icons/claude-color.svg" },
-    { "agents": ["Codex"], "icon": "icons/codex-color.svg" }
+    { "agents": ["Codex"], "icon": "icons/codex-color.svg" },
+    { "agents": ["Kiro"], "icon": "icons/kiro-color.svg" },
+    { "agents": ["Cursor"], "icon": "icons/cursor.svg" },
+    { "agents": ["Windsurf", "codeium"], "icon": "icons/windsurf.svg" },
+    { "agents": ["Trae"], "icon": "icons/trae.svg" },
+    { "agents": ["Qoder"], "icon": "icons/qoder.svg" },
+    { "agents": ["CodeBuddy"], "icon": "icons/codebuddy-color.svg" },
+    { "agents": ["Roo Code", "roo", "roocode"], "icon": "icons/roocode.svg" },
+    { "agents": ["Goose"], "icon": "icons/goose.svg" }
   ]
 }

@@ -77,6 +77,14 @@
     const families = [
       ['typesafe', /(?:^|\/)jev(?:[-/]|$)|typesafe/],
       ['feishu', /feishu|lark|飞书/],
+      ['kiro-color', /kiro/],
+      ['cursor', /cursor/],
+      ['windsurf', /windsurf|codeium/],
+      ['trae', /\btrae\b/],
+      ['qoder', /qoder/],
+      ['codebuddy-color', /codebuddy/],
+      ['roocode', /roo-?code|\broo\b/],
+      ['goose', /goose/],
       ['xiaomimimo', /mimo|xiaomi/],
       ['devin-color', /(?:^|[\s/])swe[-_]?2(?:$|[-_\s/])|devin/i],
       ['siliconcloud-color', /silicon/],
@@ -97,7 +105,7 @@
       ['tencentcloud-color', /tencent|tcloud/],
       ['hunyuan-color', /hunyuan|混元/],
       ['huaweicloud-color', /huawei|盘古/],
-      ['volcengine-color', /volcengine|ark|火山/],
+      ['volcengine-color', /volcengine|(?:^|\/)ark(?:[-/]|$)|火山/],
       ['doubao-color', /doubao|豆包/],
       ['zai', /\bzai\b|glm|zhipu|智谱/],
       ['together-color', /together/],
@@ -118,6 +126,18 @@
       ['cherrystudio-color', /cherry/],
       ['fishaudio', /fish|鱼/],
       ['bailian-color', /bailian|百炼/],
+      ['yuanbao-color', /yuanbao|元宝/],
+      ['wenxin-color', /wenxin/],
+      ['spark-color', /iflytek|讯飞|sparkdesk/],
+      ['internlm-color', /internlm|书生/],
+      ['baichuan-color', /baichuan|百川/],
+      ['yi', /(?:^|\/)yi-|01-?ai|零一/],
+      ['longcat', /longcat/],
+      ['huggingface-color', /huggingface|\bhf\b/],
+      ['perplexity-color', /perplexity|sonar/],
+      ['cohere-color', /cohere|command-[ra]/],
+      ['meta-color', /llama|\bmeta\b/],
+      ['gemma-color', /gemma/],
       ['codex-color', /codex/],
       ['openai', /gpt|o[134](?:-|$)/],
       ['claude-color', /claude|sonnet|opus|haiku|fable/],
@@ -642,6 +662,8 @@
     if (key === 'claudedesktop') return 'Claude Desktop';
     if (key === 'claude' || key === 'claudecode') return 'Claude Code';
     if (key === 'codex') return 'Codex';
+    const known = { kiro: 'Kiro', cursor: 'Cursor', windsurf: 'Windsurf', codeium: 'Windsurf', trae: 'Trae', qoder: 'Qoder', codebuddy: 'CodeBuddy', roocode: 'Roo Code', roo: 'Roo Code', goose: 'Goose', kilocode: 'Kilo Code', kilo: 'Kilo Code', cline: 'Cline', opencode: 'OpenCode', cherrystudio: 'Cherry Studio', copilot: 'GitHub Copilot', geminicli: 'Gemini CLI', antigravity: 'Antigravity' };
+    if (known[key]) return known[key];
     return name || 'Agent 未提供';
   }
 
