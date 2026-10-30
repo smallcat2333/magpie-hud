@@ -80,7 +80,7 @@ jobs:
           executable = plistlib.loads((app / 'Contents/Info.plist').read_bytes())['CFBundleExecutable']
           exec_path = app / 'Contents/MacOS' / executable
           print(f'Checking binary architecture for: {exec_path}', flush=True)
-          subprocess.run(['lipo', '-verify_arch', 'arm64', str(exec_path)], check=True)
+          subprocess.run(['lipo', str(exec_path), '-verify_arch', 'arm64'], check=True)
 
           destination = Path('dist')
           destination.mkdir(parents=True, exist_ok=True)
