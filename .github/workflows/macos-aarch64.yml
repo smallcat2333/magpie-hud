@@ -49,27 +49,49 @@ jobs:
           import plistlib
           import shutil
           import subprocess
+          import sys
 
           version = json.loads(Path('src-tauri/tauri.conf.json').read_text())['version']
           release = Path(os.environ['CARGO_TARGET_DIR']) / 'aarch64-apple-darwin/release'
           bundle = release / 'bundle'
-          app = bundle / 'macos/Magpie HUD.app'
-          images = list((bundle / 'dmg').glob('*.dmg'))
-          if not app.is_dir() or len(images) != 1:
-              subprocess.run(['find', str(bundle), '-maxdepth', '3'], check=False)
-              raise SystemExit('Expected one ARM64 app and DMG')
-          # Tauri 2 以 productName 命名包内可执行文件，从 Info.plist 读取实际名称。
+
+          print(f'Looking for bundle artifacts under: {bundle}', flush=True)
+          if bundle.is_dir():
+              subprocess.run(['find', str(bundle), '-maxdepth', '4'], check=False)
+          else:
+              print(f'Bundle directory does not exist! Contents of release dir {release}:', flush=True)
+              if release.is_dir():
+                  subprocess.run(['ls', '-la', str(release)], check=False)
+              raise SystemExit('Bundle directory missing')
+
+          apps = list(bundle.glob('macos/*.app'))
+          images = list(bundle.glob('dmg/*.dmg'))
+          print(f'Found apps: {apps}', flush=True)
+          print(f'Found dmgs: {images}', flush=True)
+
+          if not apps:
+              raise SystemExit('No .app found in bundle/macos')
+          if not images:
+              raise SystemExit('No .dmg found in bundle/dmg')
+
+          app = apps[0]
+          dmg = images[0]
+
           executable = plistlib.loads((app / 'Contents/Info.plist').read_bytes())['CFBundleExecutable']
-          subprocess.run(['lipo', '-verify_arch', 'arm64', str(app / 'Contents/MacOS' / executable)], check=True)
+          exec_path = app / 'Contents/MacOS' / executable
+          print(f'Checking binary architecture for: {exec_path}', flush=True)
+          subprocess.run(['lipo', '-verify_arch', 'arm64', str(exec_path)], check=True)
+
           destination = Path('dist')
-          destination.mkdir()
+          destination.mkdir(parents=True, exist_ok=True)
           name = f'magpie-hud-{version}-macos-arm64'
-          shutil.copy2(images[0], destination / f'{name}.dmg')
+          shutil.copy2(dmg, destination / f'{name}.dmg')
           subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(destination / f'{name}.app.zip')], check=True)
           files = sorted(destination.iterdir())
           (destination / 'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in files))
           with open(os.environ['GITHUB_ENV'], 'a') as output:
               output.write(f'ARTIFACT_NAME={name}\n')
+          print('Prepared download artifacts successfully.', flush=True)
           PY
 
       - name: Upload app, disk image and checksums
