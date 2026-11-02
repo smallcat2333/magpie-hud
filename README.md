@@ -133,11 +133,13 @@ python scripts/verify_routing_window.py
 
 ## 变更记录
 
-当前程序版本是 `1.0.11`，标题显示为 `Magpie HUD V.1.0.11`。上方截图来自 v0.0.32，保留为实际运行示例。
+当前程序版本是 `1.0.12`，标题显示为 `Magpie HUD V.1.0.12`。上方截图来自 v0.0.32，保留为实际运行示例。
 
 2026-10-30 | 1.0.10 | 修复 macOS Actions 整理产物时 `lipo` 参数顺序错误（应为 `lipo <文件> -verify_arch arm64`）导致校验 ARM64 失败的问题；此前 1.0.7、1.0.9 误判为文件名问题。
 
 2026-10-30 | 1.0.11 | 缓存命中统计跳过 `cache_unknown` 记录：Kiro 等不回报 cache_read/cache_write 的供应商不再被当成 0 计入分母，缓存指标只覆盖真正回报该字段的请求。
+
+2026-11-02 | 1.0.12 | 移除账号打码按钮的系统 tooltip（title）悬停提示，开关状态仅靠图标与 aria-pressed 表达。
 2026-10-30 | 1.0.9 | 优化 macOS CI 打包脚本：通配匹配 bundle/macos 与 dmg 产物，增强产物探测与调试日志，支持任意产品名称构建。
 
 2026-10-30 | 1.0.8 | 按 Magpie 图标清单补齐 Agent 与模型图标：Kiro、Cursor、Windsurf、Trae、Qoder、CodeBuddy、Roo Code、Goose，以及 Llama、Gemma、Perplexity、Cohere、Yi、百川、文心、讯飞星火、书生、元宝、LongCat、Hugging Face；修正 codex-spark 被误识别为火山引擎。
