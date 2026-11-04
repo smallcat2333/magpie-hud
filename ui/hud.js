@@ -889,7 +889,7 @@
       const quota = candidates[0];
       const read = quota.readAt || quota.asOf;
       if (read && !Number.isNaN(Date.parse(read))) readings.push(new Date(read));
-      const windows = quota.windows.length ? [...quota.windows].sort((a, b) => windowRank(a) - windowRank(b)) : [balanceQuotaWindow(quota)];
+      const windows = quota.windows.length ? [...quota.windows].sort((a, b) => windowRank(a) - windowRank(b)) : [null];
       entries.push({ key, card, models, quota, windows });
     }
     const orderKey = entries.map(entry => entry.key).join('\n');
@@ -952,23 +952,6 @@
     const scale = /^(months?|月)$/.test(unit) ? 43200 : /^(weeks?|w|周)$/.test(unit) ? 10080
       : /^(days?|d|天)$/.test(unit) ? 1440 : /^(hours?|hrs?|h|小时)$/.test(unit) ? 60 : 1;
     return Number(match[1]) * scale;
-  }
-
-  /** 无额度窗口的供应商：从余额文本合成月度窗口，例如
-   *  "637.6 credits (monthly 500 · long-term 157.6)" → 月限额 500、月剩余 637.6−157.6=480。
-   *  解析不出月度限额时返回 null，保持原有占位显示。 */
-  function balanceQuotaWindow(quota) {
-    const text = String(quota.balance || '');
-    const total = text.match(/([\d.]+)\s*(?:credits?|积分)/i);
-    const monthly = text.match(/monthly\s+([\d.]+)/i);
-    if (!total || !monthly) return null;
-    const limit = Number(monthly[1]);
-    if (!(limit > 0)) return null;
-    const longTerm = text.match(/long[-\s]?term\s+([\d.]+)/i);
-    const remaining = Math.max(0, Number(total[1]) - (longTerm ? Number(longTerm[1]) : 0));
-    return { name: '月', unit: /积分/.test(text) ? '积分' : 'credits', limit,
-      amount: Math.max(0, limit - remaining), remaining: Math.min(100, remaining / limit * 100), display: text,
-      resetsAt: quota.until || undefined };
   }
 
   /** 在同一根条内切换窗口，账号行与色条节点始终复用。 */
@@ -1094,15 +1077,13 @@
     icon.className = 'quota-tooltip-icon';
     icon.setAttribute('aria-hidden', 'true');
     identity.append(icon, node('strong', '', window.hudRedact.scrub(quota.name || quota.provider)), node('span', 'quota-tooltip-account', maskAccount(card.account)));
-    // 生效窗口含余额文本合成的月窗口；计数与列表同源，避免「0 个窗口」却画出一行。
-    const shown = windows.filter(Boolean);
-    const count = shown.length;
+    const count = quota.windows.length;
     header.append(identity, node('span', 'quota-tooltip-count', `${count} 个窗口`));
     const content = [header];
     const context = [quota.plan, [...models].join(' · ')].filter(Boolean).join(' · ');
     if (context) content.push(node('p', 'quota-tooltip-context', context));
     const list = node('div', 'quota-tooltip-windows');
-    for (const span of shown) {
+    for (const span of windows.filter(Boolean)) {
       const details = quotaWindowDetails(span);
       const row = node('div', 'quota-tooltip-window');
       row.dataset.severity = details.severity;
@@ -1311,11 +1292,15 @@
     view.reset.textContent = credits ? remainingCredits === null ? '余量未知' : `余 ${Number(remainingCredits.toFixed(2)).toLocaleString('zh-CN')}` : resetRemaining(resetTime);
     view.reset.dateTime = !credits && resetTime ? span.resetsAt : '';
     view.reset.title = resetTime ? `${resetTime.toLocaleString('zh-CN', { hour12: false })} 重置` : '重置时间未提供';
-    view.label.textContent = credits ? '积分' : windowName;
+    const balanceOnly = !span && typeof quota.balance === 'string' && Boolean(quota.balance.trim());
+    view.item.dataset.balanceOnly = String(balanceOnly);
+    view.track.hidden = balanceOnly;
+    view.reset.hidden = balanceOnly;
+    view.label.textContent = balanceOnly ? '余额' : credits ? '积分' : windowName;
     const used = span && !span.unlimited ? (Number.isFinite(span.used) ? span.used : Number.isFinite(span.remaining) ? 100 - span.remaining : null) : null;
     const percent = used === null ? null : Math.min(100, Math.max(0, used));
     const summary = percent !== null ? `已用 ${Number.isInteger(percent) ? percent : percent.toFixed(1)}%` : span?.unlimited ? '不限量' : quota.balance || '未提供';
-    view.value.textContent = percent !== null ? `${Number.isInteger(percent) ? percent : percent.toFixed(1)}%` : span?.unlimited ? '∞' : '—';
+    view.value.textContent = balanceOnly ? window.hudRedact.scrub(quota.balance) : percent !== null ? `${Number.isInteger(percent) ? percent : percent.toFixed(1)}%` : span?.unlimited ? '∞' : '—';
     view.track.setAttribute('aria-label', `${maskAccount(card.account)} ${windowName} 已用额度`);
     view.track.setAttribute('aria-valuetext', summary);
     view.track.dataset.unknown = String(percent === null);

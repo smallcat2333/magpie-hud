@@ -61,6 +61,8 @@
 .quota-meta,.quota-window{grid-column:2}
 /* 用量标签统一两字宽，超出省略，所有账号保留两行。 */
 .hud[data-layout] .quota-window{grid-template-columns:2em minmax(0,1fr) 32px}
+.hud[data-layout] .quota-item[data-balance-only="true"] .quota-window{grid-template-columns:2em minmax(0,1fr)}
+.quota-item[data-balance-only="true"] .quota-window strong{min-width:0;overflow:hidden;text-overflow:ellipsis;text-align:left}
 .quota-meta:has(.quota-stale){grid-template-columns:minmax(0,1fr) auto auto}
 /* 细线对比周期时间与已用比例，伸出色条上下各 2px。 */
 .quota-track{position:relative;overflow:visible}
