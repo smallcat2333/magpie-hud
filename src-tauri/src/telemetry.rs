@@ -32,6 +32,8 @@ pub struct Quota {
     pub error: Option<String>,
     pub read_at: Option<String>,
     pub as_of: Option<String>,
+    /// 订阅到期或重置时间；部分供应商只给它与余额文本，不给额度窗口。
+    #[serde(default)] pub until: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
