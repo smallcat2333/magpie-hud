@@ -7,6 +7,7 @@ mod history;
 mod hourly;
 mod live;
 mod placement;
+mod single;
 mod tail;
 mod telemetry;
 mod usage;
@@ -166,6 +167,9 @@ struct StartupState {
 
 /// 窗口创建尚未完成时，后续双击等待同一轮创建，避免并发注册相同标签。
 struct DetailsWindowLock(tauri::async_runtime::Mutex<()>);
+
+/// 已有同一路径实例时唤醒其窗口；第二个实例由 main.rs 调用后退出。
+pub use single::raise_existing_instance;
 
 /// 运行独立桌面应用；不修改 Magpie，不开启 HTTP 接口。
 pub fn run() {

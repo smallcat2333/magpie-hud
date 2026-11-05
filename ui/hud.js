@@ -1292,11 +1292,15 @@
     view.reset.textContent = credits ? remainingCredits === null ? '余量未知' : `余 ${Number(remainingCredits.toFixed(2)).toLocaleString('zh-CN')}` : resetRemaining(resetTime);
     view.reset.dateTime = !credits && resetTime ? span.resetsAt : '';
     view.reset.title = resetTime ? `${resetTime.toLocaleString('zh-CN', { hour12: false })} 重置` : '重置时间未提供';
-    view.label.textContent = credits ? '积分' : windowName;
+    const balanceOnly = !span && typeof quota.balance === 'string' && Boolean(quota.balance.trim());
+    view.item.dataset.balanceOnly = String(balanceOnly);
+    view.track.hidden = balanceOnly;
+    view.reset.hidden = balanceOnly;
+    view.label.textContent = balanceOnly ? '余额' : credits ? '积分' : windowName;
     const used = span && !span.unlimited ? (Number.isFinite(span.used) ? span.used : Number.isFinite(span.remaining) ? 100 - span.remaining : null) : null;
     const percent = used === null ? null : Math.min(100, Math.max(0, used));
     const summary = percent !== null ? `已用 ${Number.isInteger(percent) ? percent : percent.toFixed(1)}%` : span?.unlimited ? '不限量' : quota.balance || '未提供';
-    view.value.textContent = percent !== null ? `${Number.isInteger(percent) ? percent : percent.toFixed(1)}%` : span?.unlimited ? '∞' : '—';
+    view.value.textContent = balanceOnly ? window.hudRedact.scrub(quota.balance) : percent !== null ? `${Number.isInteger(percent) ? percent : percent.toFixed(1)}%` : span?.unlimited ? '∞' : '—';
     view.track.setAttribute('aria-label', `${maskAccount(card.account)} ${windowName} 已用额度`);
     view.track.setAttribute('aria-valuetext', summary);
     view.track.dataset.unknown = String(percent === null);

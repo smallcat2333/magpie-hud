@@ -37,7 +37,7 @@
     document.documentElement.dataset.redact = enabled ? 'on' : 'off';
     document.querySelectorAll('[data-redact]').forEach(button => {
       button.setAttribute('aria-pressed', String(enabled));
-      button.title = enabled ? '账号打码已开启' : '账号打码已关闭';
+      button.title = ''; // 不打系统 tooltip：按钮本身图标与按下态足以表达开关
     });
   }
 

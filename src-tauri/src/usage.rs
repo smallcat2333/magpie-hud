@@ -61,7 +61,7 @@ impl DailyStats {
         self.tokens += record.tokens;
         self.hourly[record.hour].tokens = self.hourly[record.hour].tokens.saturating_add(record.tokens);
         let denominator = record.input.saturating_add(record.cache_read);
-        if denominator > 0 {
+        if !record.cache_unknown && denominator > 0 {
             self.cache_read_tokens = self.cache_read_tokens.saturating_add(record.cache_read);
             self.cache_denominator_tokens = self.cache_denominator_tokens.saturating_add(denominator);
             self.cache_hit_rate = Some(self.cache_read_tokens as f64 / self.cache_denominator_tokens as f64);
@@ -115,6 +115,8 @@ struct Record {
     output_known: bool,
     input: u64,
     cache_read: u64,
+    /// 上游标记缓存用量未知时，不将输入计入缓存命中率的分母。
+    cache_unknown: bool,
     output: u64,
     duration_ms: Option<f64>,
     ttft_ms: Option<f64>,
@@ -495,10 +497,15 @@ impl UsageLedger {
             output_known: value.get("out").and_then(Value::as_u64).is_some(),
             input: number("in"),
             cache_read: number("cache_read"),
+            cache_unknown: value.get("cache_unknown").and_then(Value::as_bool).unwrap_or(false),
             output: number("out"),
             duration_ms: duration,
             ttft_ms: finite_number(&value, "ttft_ms"),
-            cache_hit_percent: finite_number(&value, "in").zip(finite_number(&value, "cache_read")).and_then(|(input, cache)| (input + cache > 0.0).then(|| cache / (input + cache) * 100.0)),
+            cache_hit_percent: if value.get("cache_unknown").and_then(Value::as_bool).unwrap_or(false) {
+                None
+            } else {
+                finite_number(&value, "in").zip(finite_number(&value, "cache_read")).and_then(|(input, cache)| (input + cache > 0.0).then(|| cache / (input + cache) * 100.0))
+            },
             generation_ms: generation,
             credits: finite_number(&value, "credits"),
         });
@@ -1638,6 +1645,36 @@ mod tests {
         assert!(after.revision > before.revision);
         ledger.change_day(ledger.day.succ_opt().unwrap());
         assert_eq!(ledger.snapshot("h", "ready", None).caller_key_names["stable-key"], "最新名称");
+    }
+
+    #[test]
+    fn unknown_cache_is_excluded_without_dropping_usage() {
+        let mut ledger = ledger();
+        let mut unknown = fixture(1, "unknown-cache", 200);
+        unknown["in"] = json!(200_000);
+        unknown["cache_read"] = json!(0);
+        unknown["cache_unknown"] = json!(true);
+        ledger.ingest(unknown.to_string().as_bytes());
+        let only_unknown = ledger.snapshot("h", "ready", None);
+        assert_eq!(only_unknown.daily.cache_hit_rate, None);
+        assert_eq!(only_unknown.daily.cache_denominator_tokens, 0);
+        assert_eq!(only_unknown.daily.tokens, 200_100);
+        assert!(!only_unknown.notes[0].text.contains("缓存命中率"));
+
+        let mut hit = fixture(2, "known-cache", 200);
+        hit["cache_unknown"] = json!(false);
+        ledger.ingest(hit.to_string().as_bytes());
+        let mut miss = fixture(3, "known-cache", 200);
+        miss["cache_read"] = json!(0);
+        ledger.ingest(miss.to_string().as_bytes());
+        let mixed = ledger.snapshot("h", "ready", None);
+        assert_eq!(mixed.daily.cache_hit_rate, Some(0.8));
+        assert_eq!(mixed.daily.cache_read_tokens, 800);
+        assert_eq!(mixed.daily.cache_denominator_tokens, 1000);
+        assert_eq!(mixed.daily.requests, 3);
+        assert_eq!(mixed.agent_stats[0].daily.cache_hit_rate, Some(0.8));
+        assert_eq!(mixed.sessions.iter().find(|s| s.id == "unknown-cache").unwrap().daily.cache_hit_rate, None);
+        assert_eq!(mixed.sessions.iter().find(|s| s.id == "known-cache").unwrap().daily.cache_hit_rate, Some(0.8));
     }
 
     #[test]
