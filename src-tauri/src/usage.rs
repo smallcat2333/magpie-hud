@@ -513,6 +513,11 @@ impl UsageLedger {
         self.revision += 1;
     }
 
+    /// 快照缓存还要观察历史最早日期：历史行不计当日请求，但可能扩展日历范围。
+    pub(crate) fn snapshot_key(&self) -> (u64, Option<NaiveDate>) {
+        (self.revision, self.earliest_day)
+    }
+
     /// 生成排序稳定的当日会话视图；仅展示会话最新请求和仍有失败依据的账号。
     pub fn snapshot(&self, host: &str, file_state: &str, error: Option<String>) -> RouteSnapshot {
         let mut grouped: BTreeMap<&str, Vec<&Record>> = BTreeMap::new();

@@ -8,6 +8,7 @@ mod health;
 mod hourly;
 mod live;
 mod placement;
+mod reader;
 mod single;
 mod tail;
 mod telemetry;
@@ -22,12 +23,15 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(test)]
 use tail::LogCursor;
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
     WebviewWindow,
 };
-use usage::{RouteSnapshot, UsageLedger};
+use usage::RouteSnapshot;
+#[cfg(test)]
+use usage::UsageLedger;
 
 /// 历史日期统计缓存项，与主账本和实时游标完全隔离。
 #[derive(Clone)]
@@ -57,8 +61,9 @@ struct DateStatsView {
 struct Runtime {
     config: AppConfig,
     config_error: Option<String>,
-    ledger: UsageLedger,
-    cursor: LogCursor,
+    reader: Arc<Mutex<reader::LogReader>>,
+    /// 不含活动、额度及通道错误的完成记录底稿；日志线程在锁外构建后替换。
+    base: Arc<RouteSnapshot>,
     live: live::LiveState,
     health: health::Health,
     telemetry: telemetry::Telemetry,
@@ -77,15 +82,16 @@ impl Runtime {
             Ok(config) => (config, None),
             Err(error) => (AppConfig::default(), Some(error)),
         };
-        let ledger = UsageLedger::new(Local::now().date_naive());
-        let snapshot = ledger.snapshot(&config.magpie_host, "waiting", config_error.clone());
+        let mut reader = reader::LogReader::new(Local::now().date_naive());
+        let update = reader.update(&usage_path(&config), &config.magpie_host, config_error.clone());
+        let snapshot = (*update.base).clone();
         let saved_window = config.window.filter(|placement| stable_window(placement));
         let saved_details = config.details_window.filter(|placement| stable_window(placement));
         let mut runtime = Self {
             config,
             config_error,
-            ledger,
-            cursor: LogCursor::default(),
+            reader: Arc::new(Mutex::new(reader)),
+            base: update.base,
             live: live::LiveState::default(),
             health: health::Health::with_log(config::config_path().with_file_name("diagnostics.jsonl")),
             telemetry: telemetry::Telemetry::default(),
@@ -95,6 +101,7 @@ impl Runtime {
             window_save: Arc::new(WindowSave::new(saved_window)),
             details_save: Arc::new(WindowSave::new(saved_details)),
         };
+        runtime.health.set(health::Source::UsageLog, update.error);
         runtime.refresh();
         runtime
     }
@@ -113,28 +120,14 @@ impl Runtime {
         }
     }
 
-    /// 每次只消费新增日志；相同内容不发事件，跨日和文件状态也会产生新快照。
+    /// 仅叠加最新活动/额度/健康状态；文件 I/O 和当日记录聚合由日志线程完成。
     fn refresh(&mut self) -> Option<RouteSnapshot> {
-        let path = usage_path(&self.config);
-        let read_error = self.cursor.update(&path, &mut self.ledger).err();
-        self.health.set(health::Source::UsageLog, read_error);
-        let mut snapshot = self.ledger.snapshot(
-            &self.config.magpie_host,
-            if self.cursor.missing {
-                "missing"
-            } else {
-                "ready"
-            },
-            self.config_error.clone(),
-        );
+        let mut snapshot = (*self.base).clone();
         // 只有新完成记录才触发额度补刷；启动历史、活跃态和普通重绘不触发。
         if snapshot.date == self.snapshot.date && snapshot.daily.requests > self.snapshot.daily.requests {
             if let Some(sender) = &self.quota_refresh {
                 let _ = sender.try_send(());
             }
-        }
-        if snapshot.sessions.is_empty() {
-            snapshot.notes[1].text = path.display().to_string();
         }
         self.live.apply(&mut snapshot);
         self.telemetry.apply(&mut snapshot);
@@ -303,6 +296,19 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// 只由日志监视线程调用。先复制配置/独立 reader 句柄，扫描结束后才取得 Runtime 锁。
+fn refresh_log(shared: &Arc<Mutex<Runtime>>) -> Option<RouteSnapshot> {
+    let (reader, path, host, config_error) = {
+        let runtime = shared.lock().expect("状态锁损坏");
+        (Arc::clone(&runtime.reader), usage_path(&runtime.config), runtime.config.magpie_host.clone(), runtime.config_error.clone())
+    };
+    let update = reader.lock().expect("账本锁损坏").update(&path, &host, config_error);
+    let mut runtime = shared.lock().expect("状态锁损坏");
+    runtime.base = update.base;
+    runtime.health.set(health::Source::UsageLog, update.error);
+    runtime.refresh()
+}
+
 fn usage_watcher(
     sender: std::sync::mpsc::Sender<notify::Result<notify::Event>>,
     path: &std::path::Path,
@@ -369,9 +375,8 @@ fn start_watcher(app: AppHandle) {
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            let mut runtime = shared.lock().expect("状态锁损坏");
-            runtime.health.set(health::Source::Watcher, watch_error.clone());
-            if let Some(snapshot) = runtime.refresh() { let _ = app.emit("route-update", snapshot); }
+            shared.lock().expect("状态锁损坏").health.set(health::Source::Watcher, watch_error.clone());
+            if let Some(snapshot) = refresh_log(&shared) { let _ = app.emit("route-update", snapshot); }
         }
     });
 }
@@ -383,9 +388,12 @@ fn start_live(app: AppHandle) {
     let base = match live::gateway_url(&host) {
         Ok(base) => base,
         Err(error) => {
-            let mut runtime = shared.lock().expect("状态锁损坏");
-            runtime.health.set(health::Source::Trace, Some(error));
-            if let Some(snapshot) = runtime.refresh() { let _ = app.emit("route-update", snapshot); }
+            let snapshot = {
+                let mut runtime = shared.lock().expect("状态锁损坏");
+                runtime.health.set(health::Source::Trace, Some(error));
+                runtime.refresh()
+            };
+            if let Some(snapshot) = snapshot { let _ = app.emit("route-update", snapshot); }
             return;
         }
     };
@@ -401,13 +409,12 @@ fn start_live(app: AppHandle) {
             let url = format!("{trace_base}/v1/magpie/trace?after={seq}{}", if seq > 0 { "&wait=1" } else { "" });
             let result = live::read_json::<live::TraceUpdate>(&agent, &url);
             let failed = result.is_err();
-            {
+            let snapshot = {
                 let mut runtime = trace_shared.lock().expect("状态锁损坏");
                 runtime.apply_trace(result);
-                if let Some(snapshot) = runtime.refresh() {
-                    let _ = trace_app.emit("route-update", snapshot);
-                }
-            }
+                runtime.refresh()
+            };
+            if let Some(snapshot) = snapshot { let _ = trace_app.emit("route-update", snapshot); }
             if failed { std::thread::sleep(Duration::from_secs(2)); }
         }
     });
@@ -419,16 +426,15 @@ fn start_live(app: AppHandle) {
         loop {
             let started = Instant::now();
             let quotas = live::read_json::<telemetry::Quotas>(&agent, &format!("{quota_base}/v1/magpie/quotas?kept=1"));
-            {
+            let snapshot = {
                 let mut runtime = quota_shared.lock().expect("状态锁损坏");
                 match quotas {
                     Ok(quotas) => runtime.telemetry.update_quotas(quotas.data),
                     Err(error) => runtime.telemetry.quota_error = Some(error),
                 }
-                if let Some(snapshot) = runtime.refresh() {
-                    let _ = quota_app.emit("route-update", snapshot);
-                }
-            }
+                runtime.refresh()
+            };
+            if let Some(snapshot) = snapshot { let _ = quota_app.emit("route-update", snapshot); }
             // 启动立即读取，之后每分钟刷新；完成事件合并两秒后补读缓存。
             match quota_receiver.recv_timeout(Duration::from_secs(60).saturating_sub(started.elapsed())) {
                 Ok(()) => {
@@ -448,16 +454,15 @@ fn start_live(app: AppHandle) {
         loop {
             let started = Instant::now();
             let usage = live::read_json::<telemetry::Usage>(&agent, &format!("{usage_base}/v1/magpie/usage?period=today"));
-            {
+            let snapshot = {
                 let mut runtime = usage_shared.lock().expect("状态锁损坏");
                 match usage {
                     Ok(usage) => runtime.telemetry.update_usage(usage, &host),
                     Err(error) => runtime.telemetry.cost_error = Some(error),
                 }
-                if let Some(snapshot) = runtime.refresh() {
-                    let _ = usage_app.emit("route-update", snapshot);
-                }
-            }
+                runtime.refresh()
+            };
+            if let Some(snapshot) = snapshot { let _ = usage_app.emit("route-update", snapshot); }
             std::thread::sleep(Duration::from_secs(5).saturating_sub(started.elapsed()));
         }
     });
@@ -487,16 +492,15 @@ fn start_live(app: AppHandle) {
                 last_children = Instant::now();
             }
             let result = live::read_json::<live::Activity>(&agent, &format!("{base}/v1/magpie/concurrency"));
-            {
+            let snapshot = {
                 let mut runtime = shared.lock().expect("状态锁损坏");
                 runtime.live.names = names.clone();
                 runtime.live.aliases = aliases.clone();
                 runtime.live.child_labels = child_labels.clone();
                 runtime.apply_activity(result);
-                if let Some(snapshot) = runtime.refresh() {
-                    let _ = app.emit("route-update", snapshot);
-                }
-            }
+                runtime.refresh()
+            };
+            if let Some(snapshot) = snapshot { let _ = app.emit("route-update", snapshot); }
             std::thread::sleep(Duration::from_millis(500));
         }
     });
@@ -581,19 +585,24 @@ async fn query_usage_details(app: AppHandle, start: String, end: String, filters
         .await.map_err(|e| format!("详情查询任务失败：{e}"))?
 }
 
-/// 模型图费用按需查询：锁内仅复制当前账本的窄字段，网络分页在后台线程执行。
+/// 模型图费用按需查询：Runtime 锁内只复制账本句柄，行提取和网络分页在后台线程执行。
 #[tauri::command]
 async fn query_model_costs(app: AppHandle, session: Option<String>, source_key: Option<String>) -> Result<details::ModelCostData, String> {
-    let (host, date, ledger_revision, rows) = {
+    let (reader, host, aliases) = {
         let state = app.state::<Arc<Mutex<Runtime>>>();
         let runtime = state.lock().map_err(|_| "状态锁损坏")?;
-        let selected = session.as_deref().filter(|s| !s.is_empty());
-        let canonical = selected.map(|s| runtime.live.aliases.get(s).map(String::as_str).unwrap_or(s));
-        (runtime.config.magpie_host.clone(), runtime.snapshot.date.clone(), runtime.ledger.revision,
-         runtime.ledger.model_cost_rows(canonical, source_key.as_deref().filter(|s| !s.is_empty()), &runtime.live.aliases))
+        (Arc::clone(&runtime.reader), runtime.config.magpie_host.clone(), runtime.live.aliases.clone())
     };
-    tauri::async_runtime::spawn_blocking(move || details::model_costs(rows, &host, &date, ledger_revision))
-        .await.map_err(|_| "模型费用查询任务失败".to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected = session.as_deref().filter(|s| !s.is_empty());
+        let source = source_key.as_deref().filter(|s| !s.is_empty());
+        let (date, ledger_revision, rows) = {
+            let reader = reader.lock().map_err(|_| "账本锁损坏".to_string())?;
+            let canonical = selected.map(|s| aliases.get(s).map(String::as_str).unwrap_or(s));
+            (reader.date().to_string(), reader.ledger.revision, reader.ledger.model_cost_rows(canonical, source, &aliases))
+        };
+        Ok::<_, String>(details::model_costs(rows, &host, &date, ledger_revision))
+    }).await.map_err(|_| "模型费用查询任务失败".to_string())?
 }
 
 /// 按需查询一个会话（或其某个子 Agent）的近期请求履历；只接收身份与条数，
@@ -1085,16 +1094,174 @@ mod tests {
         let path = std::env::temp_dir().join(format!("hud-connection-{}-{name}.jsonl", std::process::id()));
         std::fs::write(&path, "").unwrap();
         let config = AppConfig { usage_jsonl_path: path.to_string_lossy().into_owned(), ..AppConfig::default() };
-        let ledger = UsageLedger::new(Local::now().date_naive());
-        let snapshot = ledger.snapshot(&config.magpie_host, "ready", None);
+        let mut reader = reader::LogReader::new(Local::now().date_naive());
+        let update = reader.update(&path, &config.magpie_host, None);
+        let snapshot = (*update.base).clone();
         let runtime = Runtime {
-            config, config_error: None, ledger, cursor: LogCursor::default(), live: live::LiveState::default(),
+            config, config_error: None, reader: Arc::new(Mutex::new(reader)), base: update.base, live: live::LiveState::default(),
             health: health::Health::default(),
             telemetry: telemetry::Telemetry::default(), quota_refresh: None, snapshot,
             history_cache: std::collections::HashMap::new(), window_save: Arc::new(WindowSave::new(None)),
             details_save: Arc::new(WindowSave::new(None)),
         };
         (runtime, path)
+    }
+
+    fn load_log(runtime: &mut Runtime) {
+        let update = runtime.reader.lock().unwrap().update(&usage_path(&runtime.config), &runtime.config.magpie_host, runtime.config_error.clone());
+        runtime.base = update.base;
+        runtime.health.set(health::Source::UsageLog, update.error);
+    }
+
+    fn perf_refresh(shared: &Arc<Mutex<Runtime>>) {
+        refresh_log(shared);
+    }
+
+    /// 固定脱敏数据；手动运行 release 基准，避免 CI 计时断言受机器负载影响。
+    #[test]
+    #[ignore]
+    fn runtime_snapshot_benchmark() {
+        use std::io::Write;
+        let (runtime, path) = connection_runtime("perf");
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let time = format!("{}T12:00:00{}", Local::now().date_naive(), Local::now().format("%:z"));
+        for id in 0..100_000 {
+            writeln!(file, "{}", serde_json::json!({"route_id":id,"t":time,"session":format!("sample-{}", id % 1000),
+                "agent":"sample-cli","provider":"sample","providerAccount":"sample-account","model":"sample-model",
+                "status":if id % 17 == 0 {500} else {200},"in":100,"out":50,"cache_read":200,"ms":2000,"ttft_ms":100})).unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        let shared = Arc::new(Mutex::new(runtime));
+        let start = Instant::now();
+        perf_refresh(&shared);
+        let first = start.elapsed();
+        let expected = shared.lock().unwrap().snapshot.clone();
+        assert_eq!(expected.daily.requests, 100_000);
+        let canonical = serde_json::to_string(&serde_json::to_value(&expected).unwrap()).unwrap();
+        let fingerprint = canonical.bytes().fold(0xcbf29ce484222325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
+        let mut samples = Vec::new();
+        for _ in 0..3 {
+            let start = Instant::now();
+            for _ in 0..5 { perf_refresh(&shared); }
+            samples.push(start.elapsed().as_secs_f64() * 1000.0 / 5.0);
+            assert_eq!(shared.lock().unwrap().snapshot, expected);
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!("PERF rows=100000 sessions=1000 bytes={bytes} first_ms={:.3} idle_ms={samples:?} median_ms={:.3} fingerprint={fingerprint:016x}", first.as_secs_f64()*1000.0, samples[1]);
+        let mut contention = Vec::new();
+        for round in 0..3 {
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, "{}", serde_json::json!({"route_id":100_000 + round,"t":time,"session":"sample-0",
+                "agent":"sample-cli","provider":"sample","providerAccount":"sample-account","model":"sample-model",
+                "status":200,"in":100,"out":50,"cache_read":200,"ms":2000,"ttft_ms":100})).unwrap();
+            drop(file);
+            let writer_shared = Arc::clone(&shared);
+            let (started, starting) = std::sync::mpsc::sync_channel(0);
+            let writer = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                perf_refresh(&writer_shared);
+            });
+            starting.recv().unwrap();
+            let mut max_wait_ms = 0.0f64;
+            let mut probes = 0;
+            while !writer.is_finished() {
+                let start = Instant::now();
+                {
+                    let runtime = shared.lock().unwrap();
+                    runtime.window_save.remember(WindowPlacement { x: 10.0, y: 20.0, width: 1120.0, height: 400.0 });
+                }
+                max_wait_ms = max_wait_ms.max(start.elapsed().as_secs_f64() * 1000.0);
+                probes += 1;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            writer.join().unwrap();
+            assert!(probes > 0);
+            assert_eq!(shared.lock().unwrap().snapshot.daily.requests, 100_001 + round);
+            contention.push(max_wait_ms);
+        }
+        eprintln!("PERF append_while_window_reads max_wait_ms={contention:?}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn log_scan_wait_does_not_block_window_state_or_live_refresh() {
+        let (runtime, path) = connection_runtime("lock-isolation");
+        let reader = Arc::clone(&runtime.reader);
+        let shared = Arc::new(Mutex::new(runtime));
+        // 让日志线程等待账本锁，模拟慢磁盘/大文件读取及费用行提取。
+        let held = reader.lock().unwrap();
+        let (started, starting) = std::sync::mpsc::sync_channel(0);
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            refresh_log(&worker_shared);
+        });
+        starting.recv().unwrap();
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        let probe_shared = Arc::clone(&shared);
+        let probe = std::thread::spawn(move || {
+            for _ in 0..20 {
+                let mut runtime = probe_shared.lock().unwrap();
+                runtime.window_save.remember(WindowPlacement { x: 10.0, y: 20.0, width: 1120.0, height: 400.0 });
+                runtime.apply_activity(Ok(connection_activity()));
+                runtime.refresh();
+            }
+            sent.send(()).unwrap();
+        });
+        let available = received.recv_timeout(Duration::from_millis(100));
+        drop(held); // 无论断言结果如何都先放行，避免测试失败时挂住线程。
+        worker.join().unwrap();
+        probe.join().unwrap();
+        assert!(available.is_ok(), "日志等待不能阻塞窗口状态和实时刷新超过 100ms");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cached_base_keeps_live_health_and_quota_refresh_independent() {
+        let (mut runtime, path) = connection_runtime("base-overlay");
+        let row = serde_json::json!({"route_id":2,"t":Local::now().to_rfc3339(),"session":"sample-completed",
+            "agent":"sample-cli","status":200,"in":10,"out":20});
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        runtime.quota_refresh = Some(sent);
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        load_log(&mut runtime);
+        let base = Arc::clone(&runtime.base);
+        runtime.refresh();
+        assert!(received.try_recv().is_ok(), "新增完成记录补刷一次额度");
+        assert_eq!(runtime.snapshot.daily.requests, 1);
+        let before = runtime.snapshot.clone();
+        assert!(runtime.refresh().is_none());
+        assert_eq!(runtime.snapshot, before);
+        runtime.apply_trace(Ok(connection_trace()));
+        runtime.apply_activity(Ok(connection_activity()));
+        assert!(runtime.refresh().is_some());
+        assert!(Arc::ptr_eq(&base, &runtime.base));
+        assert_eq!(runtime.snapshot.daily.requests, 1);
+        assert_eq!(runtime.snapshot.sessions.len(), 2);
+        runtime.apply_activity(Err("sample-disconnect".into()));
+        runtime.refresh();
+        assert_eq!(runtime.snapshot.state, "warning");
+        runtime.apply_activity(Ok(live::Activity::default()));
+        runtime.refresh();
+        assert!(runtime.snapshot.error.is_none());
+        assert!(received.try_recv().is_err(), "实时活动和故障恢复不补刷额度");
+        assert!(Arc::ptr_eq(&base, &runtime.base));
+        let mut appended = row.clone();
+        appended["route_id"] = serde_json::json!(3);
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(), "{appended}").unwrap();
+        load_log(&mut runtime);
+        assert!(!Arc::ptr_eq(&base, &runtime.base));
+        runtime.refresh();
+        assert_eq!(runtime.snapshot.daily.requests, 2);
+        assert!(received.try_recv().is_ok());
+        // 缓存底稿与同一日志的直接汇总逐字段一致。
+        let mut direct = UsageLedger::new(Local::now().date_naive());
+        LogCursor::default().update(&path, &mut direct).unwrap();
+        assert_eq!(*runtime.base, direct.snapshot(&runtime.config.magpie_host, "ready", None));
+        std::fs::remove_file(path).unwrap();
     }
 
     fn connection_trace() -> live::TraceUpdate {
@@ -1136,6 +1303,7 @@ mod tests {
         let row = serde_json::json!({"route_id":2,"t":Local::now().to_rfc3339(),"session":"completed-session",
             "agent":"test","providerAccount":"example@example.com","model":"example-model","status":200,"in":1,"out":2});
         std::fs::write(&path, format!("{row}\n")).unwrap();
+        load_log(&mut runtime);
         runtime.apply_trace(Ok(connection_trace()));
         runtime.apply_activity(Ok(connection_activity()));
         runtime.refresh();
@@ -1172,9 +1340,11 @@ mod tests {
         let directory = path.with_extension("directory");
         std::fs::create_dir_all(&directory).unwrap();
         runtime.config.usage_jsonl_path = directory.to_string_lossy().into_owned();
+        load_log(&mut runtime);
         runtime.refresh();
         assert!(runtime.snapshot.error.as_deref().unwrap().contains("用量日志异常"));
         runtime.config.usage_jsonl_path = path.to_string_lossy().into_owned();
+        load_log(&mut runtime);
         runtime.refresh();
         assert!(runtime.snapshot.error.is_none(), "日志恢复读取后自动清除读错误");
         std::fs::remove_dir(directory).unwrap();
