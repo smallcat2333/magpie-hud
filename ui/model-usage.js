@@ -18,7 +18,7 @@
   const compact = value => value >= 1e6 ? `${(value / 1e6).toFixed(1)}M` : value >= 1e3 ? `${(value / 1e3).toFixed(1)}k` : format.format(value);
   let rows = [], scope = '', mode = 'tokens', selected = null, hideTimer = 0, layoutFrame = 0, lastRender = '', colorsByModel = new Map();
   let context = { date: '', session: null, sourceKey: null, revision: 0 };
-  let costState = { key: '', status: 'idle', hasData: false, rows: [], warnings: [] }, costRequest = 0;
+  let costState = { key: '', status: 'idle', hasData: false, rows: [], warnings: [] };
   const node = (tag, className, text) => {
     const element = document.createElement(tag);
     if (className) element.className = className;
@@ -333,42 +333,23 @@
       else closeTooltip();
     }
   }
-  let costReadAt = 0;
-  async function loadCosts() {
-    const key = JSON.stringify(context);
+  const costReader = window.hudModelCosts.create({
+    query: scope => window.__TAURI__.core.invoke('query_model_costs', {
+      session: scope.session, sourceKey: scope.sourceKey, date: scope.historical ? scope.date : null,
+    }),
+    changed(state) { costState = state; render(true); },
+  });
+  function loadCosts(force = false) {
     if (section.hidden || !context.date || !window.__TAURI__?.core) { render(); return; }
-    if (costState.status === 'loading') { render(); return; }
-    if (costState.key === key && Date.now() - costReadAt < 15000) { render(); return; }
-    costReadAt = Date.now();
-    const request = ++costRequest;
-    // 后台持续读取；有上次结果时保持当前图表，不切换到读取提示。
-    costState = { ...costState, key, status: 'loading' };
-    if (!costState.hasData) render(true);
-    try {
-      const result = await window.__TAURI__.core.invoke('query_model_costs', { session: context.session, sourceKey: context.sourceKey });
-      if (request !== costRequest || key !== JSON.stringify(context)) return;
-      if (result.date !== context.date || result.ledgerRevision !== context.revision) {
-        throw new Error('账本已更新，请重试');
-      }
-      if (result.fetchFailed) throw new Error('费用读取失败，请重试');
-      // 网关可能尚未收录账本：全部无法匹配时保留此前已定价结果，允许重试。
-      if (costState.hasData && costState.rows.some(row => row.priced > 0)
-          && (!Array.isArray(result.rows) || !result.rows.length
-            || result.rows.every(row => !row.priced && !row.unpriced))) {
-        throw new Error('费用尚未匹配，请重试');
-      }
-      costState = { key, status: 'ready', hasData: true, rows: result.rows || [], warnings: result.warnings || [] };
-    } catch (error) {
-      if (request !== costRequest || key !== JSON.stringify(context)) return;
-      costState = { ...costState, key, status: 'error', warnings: [String(error)] };
-    }
-    render(true);
+    const pending = costReader.load(force);
+    render();
+    return pending;
   }
-  setInterval(loadCosts, 15000);
+  setInterval(loadCosts, 30000);
   section.querySelectorAll('[data-model-mode]').forEach(button => button.addEventListener('click', () => {
     mode = button.dataset.modelMode;
     section.querySelectorAll('[data-model-mode]').forEach(other => other.setAttribute('aria-pressed', String(other === button)));
-    if (mode === 'cost') loadCosts();
+    if (mode === 'cost') loadCosts(costState.status === 'error');
     else render(true);
   }));
   tooltip.addEventListener('pointerenter', () => clearTimeout(hideTimer));
@@ -382,17 +363,8 @@
     update(data, currentScope, nextContext) {
       rows = Array.isArray(data) ? data : [];
       scope = currentScope || '全部会话';
-      const previous = context;
       context = { date: '', session: null, sourceKey: null, revision: 0, ...nextContext };
-      const scopeChanged = previous.date !== context.date || previous.session !== context.session || previous.sourceKey !== context.sourceKey;
-      if (scopeChanged) {
-        costRequest++;
-        costState = { key: '', status: 'idle', hasData: false, rows: [], warnings: [] };
-      } else if (previous.revision !== context.revision) {
-        // 同一范围账本追加时保留旧数据，但丢弃旧请求，后台重新匹配费用。
-        costRequest++;
-        costState = { ...costState, key: '', status: 'idle' };
-      }
+      costReader.update(context);
       scheduleSpace();
       loadCosts();
     },
