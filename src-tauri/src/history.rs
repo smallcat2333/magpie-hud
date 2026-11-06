@@ -7,10 +7,12 @@ use chrono::{Duration, NaiveDate};
 #[cfg(test)]
 use chrono::Local;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 /// 默认返回条数；面板展开时最多 200。
 pub const DEFAULT_LIMIT: usize = 50;
@@ -216,6 +218,98 @@ struct ScanOutcome {
     byte_limited: bool,
     malformed: u64,
     warnings: Vec<String>,
+}
+
+/// 仅缓存已完成日志；实时 trace 和轮次在每次 query 时重新合并。
+#[derive(PartialEq, Eq)]
+struct ScanKey {
+    path: PathBuf,
+    family: Vec<String>,
+    child: Option<String>,
+    start_day: NaiveDate,
+    end_day: NaiveDate,
+    max_bytes: u64,
+}
+
+#[derive(PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: SystemTime,
+    created: Option<SystemTime>,
+}
+
+impl FileStamp {
+    fn read(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.is_file() { return None; }
+        Some(Self { len: meta.len(), modified: meta.modified().ok()?, created: meta.created().ok() })
+    }
+}
+
+struct CachedScan {
+    key: ScanKey,
+    stamp: FileStamp,
+    scan: Arc<ScanOutcome>,
+}
+
+#[derive(Default)]
+struct CompletedCache {
+    entries: VecDeque<CachedScan>,
+}
+
+impl CompletedCache {
+    fn scan(
+        &mut self,
+        path: &Path,
+        family: &HashSet<String>,
+        child: Option<&str>,
+        start_day: NaiveDate,
+        end_day: NaiveDate,
+        max_bytes: u64,
+    ) -> Result<Arc<ScanOutcome>, String> {
+        let mut identities: Vec<_> = family.iter().cloned().collect();
+        identities.sort();
+        let key = ScanKey { path: path.to_owned(), family: identities, child: child.map(str::to_owned), start_day, end_day, max_bytes };
+        let before = FileStamp::read(path);
+        if let Some(stamp) = &before {
+            if let Some(index) = self.entries.iter().position(|entry| entry.key == key && &entry.stamp == stamp) {
+                if let Some(entry) = self.entries.remove(index) {
+                    let result = Arc::clone(&entry.scan);
+                    self.entries.push_back(entry);
+                    return Ok(result);
+                }
+            }
+        }
+        let scan = Arc::new(scan_completed(path, family, child, start_day, end_day, max_bytes)?);
+        self.entries.retain(|entry| entry.key != key);
+        // 读取期间有追加/轮转时不保存该版本，下一次查询重读；缺失或出错也不缓存。
+        if let Some(stamp) = before.filter(|stamp| Some(stamp) == FileStamp::read(path).as_ref()) {
+            // 同时约束范围数和记录总数，避免多个大范围把内存长期占住。
+            const MAX_CACHED_RECORDS: usize = 20_000;
+            if scan.records.len() <= MAX_CACHED_RECORDS {
+                self.entries.push_back(CachedScan { key, stamp, scan: Arc::clone(&scan) });
+                while self.entries.len() > 4
+                    || self.entries.iter().map(|entry| entry.scan.records.len()).sum::<usize>() > MAX_CACHED_RECORDS {
+                    self.entries.pop_front();
+                }
+            }
+        }
+        Ok(scan)
+    }
+}
+
+/// 独立于 Runtime 的锁只串行化履历扫描，防止并发窗口重复读同一份日志。
+fn cached_completed(
+    path: &Path,
+    family: &HashSet<String>,
+    child: Option<&str>,
+    start_day: NaiveDate,
+    end_day: NaiveDate,
+) -> Result<Arc<ScanOutcome>, String> {
+    static CACHE: OnceLock<Mutex<CompletedCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(CompletedCache::default())).lock()
+        .map_err(|_| "履历缓存锁损坏".to_string())?
+        .scan(path, family, child, start_day, end_day, MAX_SCAN_BYTES)
 }
 
 /// 只读日志末尾窗口内的完整行；不修改实时游标，也不构建整日账本。
@@ -651,8 +745,8 @@ pub fn query(
     } else {
         scope.family.clone()
     };
-    let scan = scan_completed(path, &scan_family, subagent, start_day, end_day, MAX_SCAN_BYTES)?;
-    let mut warnings = scan.warnings;
+    let scan = cached_completed(path, &scan_family, subagent, start_day, end_day)?;
+    let mut warnings = scan.warnings.clone();
     if scan.byte_limited {
         warnings.push("更早记录未读取（本次只读日志末尾 4 MiB）".into());
     }
@@ -661,7 +755,7 @@ pub fn query(
     }
     // 先合并实时行再去重复计数与截取：运行请求随最新时间自然置顶，
     // done 但日志未到的 trace 也不会因截取顺序与完成行重复出现。
-    let completed: Vec<RouteHistoryRow> = scan.records.into_iter().map(completed_row).collect();
+    let completed: Vec<RouteHistoryRow> = scan.records.iter().cloned().map(completed_row).collect();
     let mut rows = merge_live(completed, &scope.routes);
     // 轮次索引在截断前补齐：trace 已淘汰的请求仍能并进正确的输入组。
     annotate_turns(&mut rows, &scope.turns);
@@ -692,6 +786,115 @@ pub fn query(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn completed_cache_reuses_scans_and_invalidates_on_changes() {
+        use std::io::Write;
+        let path = temp_log("cache-invalidation");
+        let today = Local::now().date_naive();
+        let start = today - Duration::days(6);
+        let parents = family(&["s1", "alias"]);
+        let one = line(1, &at(0, 10), json!({"status":200,"in":1,"out":2}));
+        std::fs::write(&path, format!("{one}\n")).unwrap();
+        let mut cache = CompletedCache::default();
+        let read = |cache: &mut CompletedCache| cache.scan(&path, &parents, None, start, today, MAX_SCAN_BYTES).unwrap();
+        let first = read(&mut cache);
+        assert!(Arc::ptr_eq(&first, &read(&mut cache)));
+        let reordered = cache.scan(&path, &family(&["alias", "s1"]), None, start, today, MAX_SCAN_BYTES).unwrap();
+        assert!(Arc::ptr_eq(&first, &reordered), "集合顺序不影响缓存身份");
+        let before = FileStamp::read(&path).unwrap();
+        // 等长重写不能只靠文件长度判断。
+        let two = one.replace("\"route_id\":1", "\"route_id\":2");
+        assert_eq!(one.len(), two.len());
+        std::fs::write(&path, format!("{two}\n")).unwrap();
+        File::options().write(true).open(&path).unwrap().set_times(std::fs::FileTimes::new()
+            .set_modified(before.modified + std::time::Duration::from_secs(1))).unwrap();
+        let rewritten = read(&mut cache);
+        assert!(!Arc::ptr_eq(&first, &rewritten));
+        assert_eq!(rewritten.records[0].route_id, Some(2));
+        writeln!(File::options().append(true).open(&path).unwrap(), "{}", line(3, &at(0, 11), json!({"status":200,"in":1,"out":2}))).unwrap();
+        let appended = read(&mut cache);
+        assert_eq!(appended.records.len(), 2);
+        assert!(!Arc::ptr_eq(&rewritten, &appended));
+        for (parents, child, from, to, budget) in [
+            (family(&["other"]), None, start, today, MAX_SCAN_BYTES),
+            (family(&["s1"]), Some("child"), start, today, MAX_SCAN_BYTES),
+            (parents.clone(), None, start + Duration::days(1), today + Duration::days(1), MAX_SCAN_BYTES),
+            (parents.clone(), None, start, today, MAX_SCAN_BYTES / 2),
+        ] {
+            let different = cache.scan(&path, &parents, child, from, to, budget).unwrap();
+            assert!(!Arc::ptr_eq(&appended, &different));
+        }
+        assert!(cache.entries.len() <= 4);
+        std::fs::write(&path, "").unwrap();
+        assert!(read(&mut cache).records.is_empty(), "截断后不能复用旧行");
+        std::fs::remove_file(&path).unwrap();
+        let missing = read(&mut cache);
+        assert!(missing.records.is_empty());
+        assert!(!missing.warnings.is_empty());
+        std::fs::write(&path, format!("{one}\n")).unwrap();
+        assert_eq!(read(&mut cache).records.len(), 1, "重建后应读取新文件");
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, format!("{two}\n")).unwrap();
+        File::options().write(true).open(&replacement).unwrap().set_times(std::fs::FileTimes::new()
+            .set_modified(before.modified + std::time::Duration::from_secs(2))).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(read(&mut cache).records[0].route_id, Some(2), "路径未变的替换文件也应使缓存失效");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn completed_cache_does_not_freeze_live_overlay_or_page_limit() {
+        let path = temp_log("cache-overlay");
+        let today = Local::now().date_naive();
+        std::fs::write(&path, format!("{}\n", line(1, &at(0, 10), json!({"status":200,"in":1,"out":2})))).unwrap();
+        let scope = |routes| HistoryScope { family: family(&["s1"]), routes, turns: HashMap::new() };
+        let first = query(&path, "s1", None, 50, scope(vec![]), today).unwrap();
+        assert_eq!(first.rows.len(), 1);
+        let running = live_row(2, Some(noon_today().timestamp_millis()), "running");
+        let second = query(&path, "s1", None, 1, scope(vec![running]), today).unwrap();
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(second.rows[0].outcome, "running");
+        assert!(second.row_limited);
+        let waiting = live_row(2, Some(noon_today().timestamp_millis()), "waiting");
+        let third = query(&path, "s1", None, 200, scope(vec![waiting]), today).unwrap();
+        assert_eq!(third.rows.len(), 2);
+        assert!(third.rows.iter().any(|row| row.outcome == "waiting"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn completed_cache_handles_twenty_thousand_line_log() {
+        use std::io::Write;
+        use std::time::Instant;
+        let path = temp_log("cache-large");
+        let today = Local::now().date_naive();
+        let time = at(0, 10);
+        let mut file = std::io::BufWriter::new(File::create(&path).unwrap());
+        for id in 1..=20_000 {
+            writeln!(file, "{}", line(id, &time, json!({"status":200,"in":1,"out":2}))).unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+        let mut cache = CompletedCache::default();
+        let parents = family(&["s1"]);
+        let start = Instant::now();
+        let first = cache.scan(&path, &parents, None, today - Duration::days(6), today, MAX_SCAN_BYTES).unwrap();
+        let scan_ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert!(!first.records.is_empty());
+        let start = Instant::now();
+        for _ in 0..60 {
+            let cached = cache.scan(&path, &parents, None, today - Duration::days(6), today, MAX_SCAN_BYTES).unwrap();
+            assert!(Arc::ptr_eq(&first, &cached), "未变日志必须复用同一份扫描结果");
+        }
+        let hits_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let start = Instant::now();
+        let data = query(&path, "s1", None, 50, HistoryScope { family: parents, routes: vec![], turns: HashMap::new() }, today).unwrap();
+        let query_ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(data.rows.len(), 50);
+        println!("history 20k-line sample: first scan {scan_ms:.2} ms; 60 cache hits {hits_ms:.2} ms; first 50-group query {query_ms:.2} ms");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     /// 独立临时目录，不写真实日志。
     fn temp_log(name: &str) -> std::path::PathBuf {
