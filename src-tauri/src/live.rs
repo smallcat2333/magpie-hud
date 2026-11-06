@@ -379,7 +379,7 @@ pub struct DecisionView {
 /// 累积的轮次索引上限；超出后按 route_id 递增顺序淘汰最旧条目。
 const TURN_HISTORY_CAP: usize = 8192;
 
-/// 实时状态与已完成用量独立；失联后清空活跃态并显示提示，避免动画永远运行。
+/// 实时状态与已完成用量独立；短暂失联保留最后状态，由通道健康状态明确标注过期。
 #[derive(Default)]
 pub struct LiveState {
     pub seq: i64,
@@ -396,7 +396,6 @@ pub struct LiveState {
     pub aliases: HashMap<String, String>,
     /// 子 Agent 可读短标签，键是精确的 (父会话, 子 ID)。
     pub child_labels: HashMap<(String, String), String>,
-    pub error: Option<String>,
 }
 
 impl LiveState {
@@ -405,6 +404,8 @@ impl LiveState {
         if self.pid != update.pid || update.seq < self.seq {
             self.routes.clear();
             self.turn_history.clear();
+            // 已确认网关重启时，旧进程的 activity 不能与新 route_id 配对。
+            if self.pid != 0 { self.activity = Activity::default(); }
         }
         self.pid = update.pid;
         self.seq = update.seq;
@@ -667,11 +668,6 @@ impl LiveState {
             view.watch_label = format!("{shown} 个会话请求中");
         } else if aliases_changed && shown == 0 && view.state != "warning" && view.state != "missing" {
             view.watch_label = if view.sessions.is_empty() { "等待今日记录".into() } else { "当日记录 · 只读监视".into() };
-        }
-        if let Some(error) = &self.error {
-            view.state = "warning".into();
-            view.watch_label = "实时连接中断 · 保留完成记录".into();
-            view.error = Some(error.clone());
         }
     }
 
@@ -2600,8 +2596,10 @@ mod tests {
     fn handles_restart_and_exact_title_identity() {
         let mut live = LiveState::default();
         live.update(TraceUpdate { pid: 1, seq: 10, ids: vec![1], routes: vec![LiveRoute { id: 1, ..Default::default() }] });
+        live.activity.active.push(Active { id: 1, route: 1, ..Active::default() });
         live.update(TraceUpdate { pid: 2, seq: 1, ..Default::default() });
         assert!(live.routes.is_empty());
+        assert!(live.activity.active.is_empty(), "旧进程的 activity 不得沿用到新网关");
         let mut names = HashMap::new();
         add_title(&mut names, "id", "old", 1);
         add_title(&mut names, "id", "current", 2);

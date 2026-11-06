@@ -178,6 +178,7 @@
 /* 顶部筛选固定同行；窄窗把品牌单独放在下一行。 */
 .window-bar{gap:8px}.brand-subtitle,.scope-label{display:none}.brand-name{font-size:16px;gap:5px}.app-version{font-size:10px}
 .watch-state{display:none}.hud[data-state="warning"] .watch-state,.hud[data-state="missing"] .watch-state{display:block;position:absolute;top:44px;left:20px;z-index:5;max-width:calc(100vw - 40px);margin:0;background:var(--surface)}
+.hud[data-layout][data-state="warning"] .content,.hud[data-layout][data-state="missing"] .content{padding-top:24px}
 .agent-select{margin-left:auto;flex:0 1 160px;min-width:105px;max-width:160px}#session-select{flex:1 1 170px;min-width:90px;max-width:230px}
 .hud[data-layout="wide"][data-sources] .router-node>small,.hud[data-layout="wide"][data-sources] .router-node>span{max-width:120px;overflow:visible}
 @media(max-width:679px){
@@ -185,6 +186,7 @@
 .hud[data-layout="tall"] .agent-select{grid-column:1;grid-row:1;width:100%;max-width:none;min-width:0;margin:0}.hud[data-layout="tall"] #session-select{grid-column:2;grid-row:1;width:100%;max-width:none;min-width:0}
 .hud[data-layout="tall"] #redact{grid-column:3;grid-row:1}.hud[data-layout="tall"] #pin{grid-column:4;grid-row:1}.hud[data-layout="tall"] #hide-window{grid-column:5;grid-row:1}.hud[data-layout="tall"] #close-window{grid-column:6;grid-row:1}.hud[data-layout="tall"] .window-button{width:26px}
 .hud[data-layout="tall"] .brand-mark{display:none}.hud[data-layout="tall"] .brand-name{grid-column:1/-1;grid-row:2;font-size:14px}.hud[data-layout="tall"] .watch-state{display:none}
+.hud[data-layout="tall"][data-state="warning"] .watch-state,.hud[data-layout="tall"][data-state="missing"] .watch-state{display:block;top:68px;left:12px;max-width:calc(100vw - 24px)}
 .hud[data-layout="tall"]{grid-template-rows:66px minmax(0,1fr)76px}
 }
 @media(max-width:679px) and (max-height:420px){.hud[data-layout="tall"]{grid-template-rows:66px minmax(0,1fr)28px}}

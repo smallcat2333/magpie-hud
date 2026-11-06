@@ -4,6 +4,7 @@ mod backdrop;
 mod config;
 mod details;
 mod history;
+mod health;
 mod hourly;
 mod live;
 mod placement;
@@ -59,6 +60,7 @@ struct Runtime {
     ledger: UsageLedger,
     cursor: LogCursor,
     live: live::LiveState,
+    health: health::Health,
     telemetry: telemetry::Telemetry,
     quota_refresh: Option<std::sync::mpsc::SyncSender<()>>,
     snapshot: RouteSnapshot,
@@ -85,6 +87,7 @@ impl Runtime {
             ledger,
             cursor: LogCursor::default(),
             live: live::LiveState::default(),
+            health: health::Health::with_log(config::config_path().with_file_name("diagnostics.jsonl")),
             telemetry: telemetry::Telemetry::default(),
             quota_refresh: None,
             snapshot,
@@ -92,14 +95,29 @@ impl Runtime {
             window_save: Arc::new(WindowSave::new(saved_window)),
             details_save: Arc::new(WindowSave::new(saved_details)),
         };
-        runtime.refresh(None);
+        runtime.refresh();
         runtime
     }
 
+    fn apply_activity(&mut self, result: Result<live::Activity, String>) {
+        match result {
+            Ok(activity) => { self.live.activity = activity; self.health.set(health::Source::Concurrency, None); }
+            Err(error) => self.health.set(health::Source::Concurrency, Some(error)),
+        }
+    }
+
+    fn apply_trace(&mut self, result: Result<live::TraceUpdate, String>) {
+        match result {
+            Ok(update) => { self.live.update(update); self.health.set(health::Source::Trace, None); }
+            Err(error) => self.health.set(health::Source::Trace, Some(error)),
+        }
+    }
+
     /// 每次只消费新增日志；相同内容不发事件，跨日和文件状态也会产生新快照。
-    fn refresh(&mut self, watcher_error: Option<String>) -> Option<RouteSnapshot> {
+    fn refresh(&mut self) -> Option<RouteSnapshot> {
         let path = usage_path(&self.config);
         let read_error = self.cursor.update(&path, &mut self.ledger).err();
+        self.health.set(health::Source::UsageLog, read_error);
         let mut snapshot = self.ledger.snapshot(
             &self.config.magpie_host,
             if self.cursor.missing {
@@ -107,7 +125,7 @@ impl Runtime {
             } else {
                 "ready"
             },
-            self.config_error.clone().or(read_error).or(watcher_error),
+            self.config_error.clone(),
         );
         // 只有新完成记录才触发额度补刷；启动历史、活跃态和普通重绘不触发。
         if snapshot.date == self.snapshot.date && snapshot.daily.requests > self.snapshot.daily.requests {
@@ -120,6 +138,7 @@ impl Runtime {
         }
         self.live.apply(&mut snapshot);
         self.telemetry.apply(&mut snapshot);
+        self.health.apply(&mut snapshot);
         snapshot.revision = self.snapshot.revision;
         if snapshot == self.snapshot {
             return None;
@@ -284,70 +303,75 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 文件事件在 100ms 内合并，最多等待 150ms；一秒兜底检查负责跨日与缺目录恢复。
+fn usage_watcher(
+    sender: std::sync::mpsc::Sender<notify::Result<notify::Event>>,
+    path: &std::path::Path,
+) -> Result<RecommendedWatcher, String> {
+    let mut watcher = RecommendedWatcher::new(sender, notify::Config::default())
+        .map_err(|error| format!("文件监视不可用：{error}"))?;
+    // 缺目录时监视最近存在的上级，保留一秒轮询兜底，不创建 Magpie 目录。
+    let parent = path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let ancestor = parent.ancestors().find(|candidate| candidate.is_dir()).ok_or("没有可监视的日志目录")?;
+    watcher.watch(ancestor, if ancestor == parent { RecursiveMode::NonRecursive } else { RecursiveMode::Recursive })
+        .map_err(|error| format!("文件监视不可用：{error}"))?;
+    Ok(watcher)
+}
+
+/// 文件事件合并；失败后每五秒重新注册，一秒兜底检查持续工作。
 fn start_watcher(app: AppHandle) {
     let shared = Arc::clone(app.state::<Arc<Mutex<Runtime>>>().inner());
     let path = usage_path(&shared.lock().expect("状态锁损坏").config);
     std::thread::spawn(move || {
         let (sender, receiver) = std::sync::mpsc::channel();
+        let mut watcher = None;
         let mut watch_error = None;
-        let _watcher = match RecommendedWatcher::new(sender, notify::Config::default()) {
-            Ok(mut watcher) => {
-                // 目录尚不存在时监视最近存在的上级；绝不为了监视创建 Magpie 目录。
-                let parent = path.parent().expect("usage 路径缺少目录");
-                let ancestor = parent.ancestors().find(|candidate| candidate.is_dir());
-                if let Some(ancestor) = ancestor {
-                    if let Err(error) = watcher.watch(
-                        ancestor,
-                        if ancestor == parent {
-                            RecursiveMode::NonRecursive
-                        } else {
-                            RecursiveMode::Recursive
-                        },
-                    ) {
-                        watch_error = Some(format!("文件监视不可用：{error}"));
-                    }
-                }
-                Some(watcher)
-            }
-            Err(error) => {
-                watch_error = Some(format!("文件监视不可用：{error}"));
-                None
-            }
-        };
+        let mut retry_at = Instant::now();
         loop {
+            let mut registration_changed = false;
+            if watcher.is_none() && Instant::now() >= retry_at {
+                registration_changed = true;
+                match usage_watcher(sender.clone(), &path) {
+                    Ok(next) => { watcher = Some(next); watch_error = None; }
+                    Err(error) => watch_error = Some(error),
+                }
+                retry_at = Instant::now() + Duration::from_secs(5);
+            }
             match receiver.recv_timeout(Duration::from_secs(1)) {
                 Ok(Ok(event)) => {
-                    if !event
-                        .paths
-                        .iter()
-                        .any(|changed| changed == &path || path.starts_with(changed))
-                    {
-                        continue;
-                    }
-                    let deadline = Instant::now() + Duration::from_millis(150);
-                    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-                        if receiver
-                            .recv_timeout(left.min(Duration::from_millis(100)))
-                            .is_err()
-                        {
-                            break;
+                    let relevant = event.paths.iter().any(|changed| changed == &path || path.starts_with(changed));
+                    if !relevant && !registration_changed { continue; }
+                    if relevant {
+                        if watcher.is_some() { watch_error = None; }
+                        let deadline = Instant::now() + Duration::from_millis(150);
+                        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                            match receiver.recv_timeout(left.min(Duration::from_millis(100))) {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(error)) => {
+                                    watch_error = Some(format!("文件监视异常：{error}"));
+                                    watcher = None;
+                                    retry_at = Instant::now() + Duration::from_secs(5);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
                         }
                     }
                 }
-                Ok(Err(error)) => watch_error = Some(format!("文件监视异常：{error}")),
+                Ok(Err(error)) => {
+                    watch_error = Some(format!("文件监视异常：{error}"));
+                    watcher = None;
+                    retry_at = Instant::now() + Duration::from_secs(5);
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    std::thread::sleep(Duration::from_secs(1))
+                    watch_error = Some("文件监视事件通道已断开".into());
+                    watcher = None;
+                    std::thread::sleep(Duration::from_secs(1));
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            let next = shared
-                .lock()
-                .expect("状态锁损坏")
-                .refresh(watch_error.clone());
-            if let Some(snapshot) = next {
-                let _ = app.emit("route-update", snapshot);
-            }
+            let mut runtime = shared.lock().expect("状态锁损坏");
+            runtime.health.set(health::Source::Watcher, watch_error.clone());
+            if let Some(snapshot) = runtime.refresh() { let _ = app.emit("route-update", snapshot); }
         }
     });
 }
@@ -359,7 +383,9 @@ fn start_live(app: AppHandle) {
     let base = match live::gateway_url(&host) {
         Ok(base) => base,
         Err(error) => {
-            shared.lock().expect("状态锁损坏").live.error = Some(error);
+            let mut runtime = shared.lock().expect("状态锁损坏");
+            runtime.health.set(health::Source::Trace, Some(error));
+            if let Some(snapshot) = runtime.refresh() { let _ = app.emit("route-update", snapshot); }
             return;
         }
     };
@@ -373,16 +399,16 @@ fn start_live(app: AppHandle) {
         loop {
             let seq = trace_shared.lock().expect("状态锁损坏").live.seq;
             let url = format!("{trace_base}/v1/magpie/trace?after={seq}{}", if seq > 0 { "&wait=1" } else { "" });
-            match live::read_json::<live::TraceUpdate>(&agent, &url) {
-                Ok(update) => {
-                    let mut runtime = trace_shared.lock().expect("状态锁损坏");
-                    runtime.live.update(update);
-                    if let Some(snapshot) = runtime.refresh(None) {
-                        let _ = trace_app.emit("route-update", snapshot);
-                    }
+            let result = live::read_json::<live::TraceUpdate>(&agent, &url);
+            let failed = result.is_err();
+            {
+                let mut runtime = trace_shared.lock().expect("状态锁损坏");
+                runtime.apply_trace(result);
+                if let Some(snapshot) = runtime.refresh() {
+                    let _ = trace_app.emit("route-update", snapshot);
                 }
-                Err(_) => std::thread::sleep(Duration::from_secs(2)),
             }
+            if failed { std::thread::sleep(Duration::from_secs(2)); }
         }
     });
     let quota_app = app.clone();
@@ -399,7 +425,7 @@ fn start_live(app: AppHandle) {
                     Ok(quotas) => runtime.telemetry.update_quotas(quotas.data),
                     Err(error) => runtime.telemetry.quota_error = Some(error),
                 }
-                if let Some(snapshot) = runtime.refresh(None) {
+                if let Some(snapshot) = runtime.refresh() {
                     let _ = quota_app.emit("route-update", snapshot);
                 }
             }
@@ -428,7 +454,7 @@ fn start_live(app: AppHandle) {
                     Ok(usage) => runtime.telemetry.update_usage(usage, &host),
                     Err(error) => runtime.telemetry.cost_error = Some(error),
                 }
-                if let Some(snapshot) = runtime.refresh(None) {
+                if let Some(snapshot) = runtime.refresh() {
                     let _ = usage_app.emit("route-update", snapshot);
                 }
             }
@@ -466,11 +492,8 @@ fn start_live(app: AppHandle) {
                 runtime.live.names = names.clone();
                 runtime.live.aliases = aliases.clone();
                 runtime.live.child_labels = child_labels.clone();
-                match result {
-                    Ok(activity) => { runtime.live.activity = activity; runtime.live.error = None; }
-                    Err(error) => { runtime.live.activity = live::Activity::default(); runtime.live.error = Some(error); }
-                }
-                if let Some(snapshot) = runtime.refresh(None) {
+                runtime.apply_activity(result);
+                if let Some(snapshot) = runtime.refresh() {
                     let _ = app.emit("route-update", snapshot);
                 }
             }
@@ -1057,6 +1080,106 @@ fn constrain_current(window: &WebviewWindow) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connection_runtime(name: &str) -> (Runtime, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("hud-connection-{}-{name}.jsonl", std::process::id()));
+        std::fs::write(&path, "").unwrap();
+        let config = AppConfig { usage_jsonl_path: path.to_string_lossy().into_owned(), ..AppConfig::default() };
+        let ledger = UsageLedger::new(Local::now().date_naive());
+        let snapshot = ledger.snapshot(&config.magpie_host, "ready", None);
+        let runtime = Runtime {
+            config, config_error: None, ledger, cursor: LogCursor::default(), live: live::LiveState::default(),
+            health: health::Health::default(),
+            telemetry: telemetry::Telemetry::default(), quota_refresh: None, snapshot,
+            history_cache: std::collections::HashMap::new(), window_save: Arc::new(WindowSave::new(None)),
+            details_save: Arc::new(WindowSave::new(None)),
+        };
+        (runtime, path)
+    }
+
+    fn connection_trace() -> live::TraceUpdate {
+        serde_json::from_value(serde_json::json!({"pid":1,"seq":1,"ids":[10],"routes":[{
+            "id":10,"session":"example-session","agent":"test","time":Local::now().to_rfc3339()
+        }]})).unwrap()
+    }
+
+    fn connection_activity() -> live::Activity {
+        serde_json::from_value(serde_json::json!({"active":[{
+            "id":1,"route":10,"session":"example-session","agent":"test",
+            "started":Local::now().to_rfc3339(),"ms":1000,"phase":"upstream"
+        }]})).unwrap()
+    }
+
+    #[test]
+    fn activity_disconnect_retains_last_cards_until_successful_empty_snapshot() {
+        let (mut runtime, path) = connection_runtime("activity");
+        runtime.live.update(connection_trace());
+        runtime.apply_activity(Ok(connection_activity()));
+        runtime.refresh();
+        assert_eq!(runtime.snapshot.sessions.len(), 1);
+        runtime.apply_activity(Err("simulated disconnect".into()));
+        runtime.refresh();
+        assert_eq!(runtime.snapshot.sessions.len(), 1, "短暂失联不能清空最后有效的活跃卡");
+        assert_eq!(runtime.snapshot.state, "warning");
+        assert!(runtime.snapshot.error.as_deref().unwrap().contains("自 "));
+        assert!(runtime.snapshot.sessions[0].routes[0].detail.contains("过期"));
+        runtime.apply_activity(Ok(live::Activity::default()));
+        runtime.refresh();
+        assert!(runtime.snapshot.sessions.is_empty(), "成功空快照才表示请求确实结束");
+        assert!(runtime.snapshot.error.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn trace_failure_is_visible_until_trace_itself_recovers() {
+        let (mut runtime, path) = connection_runtime("trace");
+        let row = serde_json::json!({"route_id":2,"t":Local::now().to_rfc3339(),"session":"completed-session",
+            "agent":"test","providerAccount":"example@example.com","model":"example-model","status":200,"in":1,"out":2});
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        runtime.apply_trace(Ok(connection_trace()));
+        runtime.apply_activity(Ok(connection_activity()));
+        runtime.refresh();
+        assert_eq!(runtime.snapshot.sessions.len(), 2);
+        runtime.apply_trace(Err("trace offline".into()));
+        runtime.refresh();
+        assert!(runtime.snapshot.error.as_deref().unwrap().contains("路由轨迹异常"));
+        runtime.apply_activity(Ok(connection_activity()));
+        runtime.refresh();
+        assert_eq!(runtime.snapshot.sessions.len(), 2);
+        assert_eq!(runtime.snapshot.daily.requests, 1, "完成记录不受断线影响");
+        assert!(runtime.snapshot.error.as_deref().unwrap().contains("trace offline"), "其他通道成功不能掩盖 trace 故障");
+        runtime.apply_trace(Ok(connection_trace()));
+        runtime.refresh();
+        assert!(runtime.snapshot.error.is_none());
+        assert!(runtime.snapshot.sessions.iter().flat_map(|s| &s.routes).all(|card| !card.detail.contains("过期")));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn watcher_and_log_errors_clear_on_their_own_success() {
+        let (mut runtime, path) = connection_runtime("watcher");
+        runtime.health.set(health::Source::Watcher, Some("watcher offline".into()));
+        runtime.refresh();
+        runtime.apply_activity(Ok(live::Activity::default()));
+        runtime.refresh();
+        assert!(runtime.snapshot.error.as_deref().unwrap().contains("文件监听异常"));
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let watcher = usage_watcher(sender, &path).unwrap();
+        runtime.health.set(health::Source::Watcher, None);
+        runtime.refresh();
+        assert!(runtime.snapshot.error.is_none(), "成功重新注册后不残留 warning");
+        drop(watcher);
+        let directory = path.with_extension("directory");
+        std::fs::create_dir_all(&directory).unwrap();
+        runtime.config.usage_jsonl_path = directory.to_string_lossy().into_owned();
+        runtime.refresh();
+        assert!(runtime.snapshot.error.as_deref().unwrap().contains("用量日志异常"));
+        runtime.config.usage_jsonl_path = path.to_string_lossy().into_owned();
+        runtime.refresh();
+        assert!(runtime.snapshot.error.is_none(), "日志恢复读取后自动清除读错误");
+        std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// 最小化哨兵、零尺寸和非有限值都不能进入持久配置。
     #[test]
