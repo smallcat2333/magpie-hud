@@ -580,7 +580,7 @@ impl LiveState {
                 subagent_id: child.map(str::to_owned),
                 subagent_label: child.map(|id| self.child_label(session_id, id)),
                 route_groups: route.map(|r| route_chain(r, attempt, candidate)).unwrap_or_default(),
-                updated_at: started.map(|start| updated_at(start, active.ms)),
+                updated_at: started.and_then(|start| updated_at(start, active.ms)),
                 note: note.clone(),
             };
             if child.is_some() {
@@ -1314,11 +1314,12 @@ fn trace_chain(route: &LiveRoute) -> Vec<String> {
     route_chain(route, attempt, candidate)
 }
 
-/// 活跃卡的更新时间跟随 Magpie 报告的已用时长；start 不可解析时由调用方留空。
-fn updated_at(start: DateTime<chrono::FixedOffset>, elapsed_ms: u64) -> String {
-    (start + chrono::Duration::milliseconds(elapsed_ms.min(i64::MAX as u64) as i64))
-        .with_timezone(&chrono::Utc)
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+/// 活跃卡的更新时间跟随 Magpie 报告的已用时长；开始时间无效或结果超出日期范围时留空。
+fn updated_at(start: DateTime<chrono::FixedOffset>, elapsed_ms: u64) -> Option<String> {
+    let elapsed = i64::try_from(elapsed_ms).ok()?;
+    let finished = start.timestamp_millis().checked_add(elapsed)?;
+    DateTime::from_timestamp_millis(finished)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
 /// 根卡的请求时序标记：完成卡是真实完成时刻，活跃卡是 start + 已用时长。
@@ -1487,12 +1488,16 @@ pub fn wanted_children(view: &RouteSnapshot) -> HashSet<(String, String)> {
 
 /// 实时接口仅允许回环 HTTP，避免读取配置地址时向远端发出请求。
 pub fn gateway_url(host: &str) -> Result<String, String> {
-    let url = if host.starts_with("http://") { host.trim_end_matches('/').to_string() } else { format!("http://{}", host.trim_end_matches('/')) };
-    let authority = url.strip_prefix("http://").unwrap();
-    let valid = ["127.0.0.1:", "localhost:", "[::1]:"].iter()
-        .any(|prefix| authority.strip_prefix(prefix).is_some_and(|port| port.parse::<u16>().is_ok()));
-    if !valid { return Err("实时路由地址必须是本机回环 HTTP 地址和端口".into()); }
-    Ok(url)
+    let authority = host.strip_prefix("http://").unwrap_or(host).trim_end_matches('/');
+    let address = ["127.0.0.1:", "localhost:", "[::1]:"].iter().find_map(|prefix| {
+        let port = authority.strip_prefix(prefix)?;
+        if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) { return None; }
+        let port = port.parse::<u16>().ok().filter(|port| *port > 0)?;
+        // localhost 固定到 IPv4 回环，不经 hosts/DNS 解析。
+        let ip = if *prefix == "[::1]:" { "[::1]" } else { "127.0.0.1" };
+        Some(format!("http://{ip}:{port}"))
+    });
+    address.ok_or_else(|| "实时路由地址必须是本机回环 HTTP 地址和端口".into())
 }
 
 /// 创建绕过代理的回环客户端；超时覆盖最长 25 秒的路由长轮询。
@@ -1501,10 +1506,17 @@ pub fn client(timeout: Duration) -> ureq::Agent {
         .proxy(None).max_redirects(0).timeout_global(Some(timeout)).build())
 }
 
-/// 读取外部 JSON；网络、状态码及字段错误向界面报告。
+/// JSON 响应最多 8 MiB，避免依赖 HTTP 库的隐式默认值。
+const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 读取外部 JSON；网络、状态码、大小及字段错误向界面报告。
 pub fn read_json<T: serde::de::DeserializeOwned>(agent: &ureq::Agent, url: &str) -> Result<T, String> {
     let mut response = agent.get(url).call().map_err(|e| format!("实时路由读取失败：{e}"))?;
-    let body = response.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("实时路由读取失败：HTTP {}", response.status()));
+    }
+    let body = response.body_mut().with_config().limit(MAX_JSON_BYTES).read_to_string()
+        .map_err(|e| format!("实时路由响应读取失败（上限 8 MiB）：{e}"))?;
     serde_json::from_str(&body).map_err(|e| format!("实时路由字段无效：{e}"))
 }
 
@@ -2525,6 +2537,64 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn gateway_addresses_are_literal_loopback_only() {
+        for (input, expected) in [
+            ("127.0.0.1:3425", "http://127.0.0.1:3425"),
+            ("http://localhost:3425/", "http://127.0.0.1:3425"),
+            ("[::1]:3425", "http://[::1]:3425"),
+        ] {
+            assert_eq!(gateway_url(input).unwrap(), expected);
+        }
+        for input in ["example.com:3425", "localhost.example.com:3425", "https://localhost:3425",
+            "127.0.0.1:3425@remote.example", "localhost:3425/path", "localhost:3425?x=1",
+            "localhost:3425#remote", "localhost:0", "localhost:65536", "localhost:+3425", "localhost:"] {
+            assert!(gateway_url(input).is_err(), "{input}");
+        }
+    }
+
+    /// 只监听临时回环端口；不依赖正在运行的 Magpie。
+    fn json_test_response(headers: &str, body: String) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let response = format!("HTTP/1.1 {headers}\r\nConnection: close\r\n\r\n{body}");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).unwrap();
+            // 客户端超限后主动断开是预期行为。
+            let _ = socket.write_all(response.as_bytes());
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn gateway_json_enforces_size_with_and_without_content_length() {
+        let agent = client(Duration::from_secs(5));
+        let (url, server) = json_test_response("200 OK\r\nContent-Length: 11", "{\"ok\":true}".into());
+        assert_eq!(read_json::<serde_json::Value>(&agent, &url).unwrap()["ok"], true);
+        server.join().unwrap();
+        for length_header in [false, true] {
+            // 没有 Content-Length 时也必须限制流式读取。
+            let body = format!("\"{}\"", "x".repeat(MAX_JSON_BYTES as usize));
+            let headers = if length_header { format!("200 OK\r\nContent-Length: {}", body.len()) }
+                else { "200 OK".into() };
+            let (url, server) = json_test_response(&headers, body);
+            assert!(read_json::<serde_json::Value>(&agent, &url).unwrap_err().contains("上限 8 MiB"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn gateway_client_rejects_redirects() {
+        let (url, server) = json_test_response("302 Found\r\nLocation: http://example.com/\r\nContent-Length: 0", String::new());
+        let error = read_json::<serde_json::Value>(&client(Duration::from_secs(3)), &url).unwrap_err();
+        assert!(error.contains("实时路由读取失败"), "{error}");
+        server.join().unwrap();
+    }
+
     /// 重启替换路由缓存；同级标题争议未知，当前身份优先历史身份。
     #[test]
     fn handles_restart_and_exact_title_identity() {
@@ -2717,11 +2787,40 @@ mod tests {
         let mut view = ledger.snapshot("h", "ready", None);
         live.apply(&mut view);
         let card = &view.sessions[0].routes[0];
-        assert_eq!(card.updated_at.as_deref(), Some(updated_at(now.into(), 3_200).as_str()));
+        assert_eq!(card.updated_at, updated_at(now.into(), 3_200));
         assert!(card.updated_at.as_deref().unwrap().ends_with('Z'));
         assert_eq!(card.time.len(), 8);
         // 无子组信息时组链为空，不用模型名填充。
         assert!(card.route_groups.is_empty());
+    }
+
+    #[test]
+    fn active_card_handles_extreme_elapsed_time_and_recovers() {
+        let now = Local::now();
+        let mut live = LiveState::default();
+        live.activity.active.push(Active { id: 1, session: "alpha".into(), agent: "test".into(),
+            started: now.to_rfc3339(), ms: u64::MAX, phase: "upstream".into(), route: 10, ..Active::default() });
+        live.routes.insert(10, LiveRoute { id: 10, session: "alpha".into(), ..LiveRoute::default() });
+        let ledger = UsageLedger::new(now.date_naive());
+        for elapsed in [u64::MAX, i64::MAX as u64, 0, 3_200] {
+            live.activity.active[0].ms = elapsed;
+            let mut view = ledger.snapshot("h", "ready", None);
+            live.apply(&mut view);
+            let timestamp = &view.sessions[0].routes[0].updated_at;
+            if elapsed > i64::MAX as u64 / 2 {
+                assert!(timestamp.is_none(), "超出日期范围时省略更新时间");
+            } else {
+                assert!(timestamp.as_deref().is_some_and(|value| DateTime::parse_from_rfc3339(value).is_ok()));
+            }
+        }
+    }
+
+    #[test]
+    fn active_elapsed_time_rejects_negative_and_non_numeric_values() {
+        for ms in [serde_json::json!(-1), serde_json::json!(1.5), serde_json::json!("100"), serde_json::Value::Null] {
+            let payload = serde_json::json!({"id":1, "agent":"test", "started":"2026-11-06T00:00:00Z", "ms":ms});
+            assert!(serde_json::from_value::<Active>(payload).is_err());
+        }
     }
 
     /// 规则白名单只取 use/pick；when 表达式与其余字段不进入结构，时间/状态/响应模型可用。
