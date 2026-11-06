@@ -66,7 +66,7 @@ Magpie 路由页底部那种完整中文叙述，jsonl **不一定**原样提供
 MVP 规则：
 
 - **第 1 行（命中）**：根据最新一条成功记录拼人话，例如：  
-  `20:33:19  252964683@qq.com (grok-4.7-build-fast@500k) 以 low 用 3.8s 完成 · 190.0k token · 3.0s 后首响 · 缓存命中率 xx%。req=group/smart-split`
+  `20:33:19  user@example.com (grok-4.7-build-fast@500k) 以 low 用 3.8s 完成 · 190.0k token · 3.0s 后首响 · 缓存命中率 xx%。req=group/smart-split`
 - **第 2 行（对照/说明）**：若同一次路由能推断「Agent 要的强度被改过」则写；否则写上一条不同账号的跳过原因，或写 `—` / 省略。  
   若短期内无法从 jsonl 得到「不参与」原因：**第 2 行允许先显示「候补/其它账号未选中」+ 时间**，并在 README 标明「完整排除原因待二期对接路由 API」。
 
@@ -174,7 +174,7 @@ Token 显示：`(in+out+cache_read)/1000` 显示为 `xxx.xk token`（与 Magpie 
 
 - 默认用中文 UI 文案
 - 密钥/账号仅显示界面已有信息，**不要**把 `logins.json` 或 API key 读进本程序
-- 所有路径用用户主目录，不要写死 `C:\Users\kaizhong_liu\...`
+- 所有路径用用户主目录，不要写死 `C:\Users\<用户名>\...`
 - 提交信息清晰；附一张运行截图到 README
 
 ---
