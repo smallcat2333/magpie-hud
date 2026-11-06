@@ -1597,6 +1597,7 @@ impl CustomTitles {
 #[derive(Default)]
 pub struct Titles {
     files: HashMap<PathBuf, (std::time::SystemTime, u64, DesktopTitle)>,
+    codex: crate::title_index::CodexTitles,
     /// 显式 CLI ID 关联；与显示名无关，只描述同一个 Desktop 会话的身份轮换。
     aliases: HashMap<String, String>,
 }
@@ -1604,6 +1605,13 @@ pub struct Titles {
 impl Titles {
     /// 与 Magpie 相同：当前 ID 优先历史 ID；同优先级冲突不随意认领名称。
     pub fn scan(&mut self, roots: &[PathBuf]) -> HashMap<String, String> {
+        let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| {
+            crate::config::directories_base().join(".codex")
+        }).join("session_index.jsonl");
+        self.scan_paths(roots, &codex)
+    }
+
+    fn scan_paths(&mut self, roots: &[PathBuf], codex: &Path) -> HashMap<String, String> {
         let mut found = HashSet::new();
         let mut result = HashMap::<String, (u8, String)>::new();
         for root in roots {
@@ -1642,27 +1650,13 @@ impl Titles {
         }
         self.files.retain(|path, _| found.contains(path));
         self.aliases = alias_links(self.files.values().map(|(_, _, title)| title));
-        let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| {
-            crate::config::directories_base().join(".codex")
-        }).join("session_index.jsonl");
-        // Magpie 也从此只追加索引读取名称，未换行记录留到下次扫描。
-        if let Ok(file) = fs::File::open(codex) {
-            use std::io::BufRead;
-            let mut reader = std::io::BufReader::new(file);
-            let mut row = String::new();
-            while reader.read_line(&mut row).is_ok_and(|n| n > 0) {
-                if row.ends_with('\n') {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&row) {
-                        if let (Some(id), Some(name)) = (value["id"].as_str(), value["thread_name"].as_str()) {
-                            result.insert(id.into(), (2, name.into()));
-                        }
-                    }
-                }
-                row.clear();
-            }
-        }
+        // Codex 同一 ID 的最新完整索引行覆盖此前名称，保留既有跨来源优先级。
+        result.extend(self.codex.scan(codex).into_iter().map(|(id, name)| (id, (2, name))));
         result.into_iter().filter(|(_, (_, name))| !name.is_empty()).map(|(id, (_, name))| (id, name)).collect()
     }
+
+    /// 大索引尚未追平时，后台线程缩短补扫间隔；不改变并发请求轮询节拍。
+    pub fn catching_up(&self) -> bool { self.codex.catching_up() }
 
     /// 最近一次扫描得到的显式 CLI 身份关联；只做展示归一，不改变账本或统计。
     pub fn aliases(&self) -> HashMap<String, String> {
@@ -2531,6 +2525,35 @@ mod tests {
         assert_eq!(names.get(prior).map(String::as_str), Some("VACS / ID 提取"));
         assert_eq!(titles.aliases().get(prior).map(String::as_str), Some(current));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_incremental_titles_keep_source_precedence_and_exact_ids() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("hud-title-merge-{}", std::process::id()));
+        let org = root.join("claude-code-sessions/profile/org");
+        fs::create_dir_all(&org).unwrap();
+        let current = "11111111-1111-4111-8111-111111111111";
+        let prior = "22222222-2222-4222-8222-222222222222";
+        fs::write(org.join("local_sample.json"), serde_json::json!({"sessionId":"local_sample",
+            "cliSessionId":current,"priorCliSessionIds":[prior],"title":"Desktop title"}).to_string()).unwrap();
+        let codex = root.join("session_index.jsonl");
+        fs::write(&codex, format!("{}\n", serde_json::json!({"id":current,"thread_name":"Codex title"}))).unwrap();
+        let mut titles = Titles::default();
+        let names = titles.scan_paths(std::slice::from_ref(&root), &codex);
+        assert_eq!(names[current], "Codex title");
+        assert_eq!(names[prior], "Desktop title");
+        assert_eq!(titles.aliases()[prior], current);
+        assert!(!names.contains_key("11111111"));
+        let mut file = fs::OpenOptions::new().append(true).open(&codex).unwrap();
+        writeln!(file, "{}", serde_json::json!({"id":current,"thread_name":"Renamed"})).unwrap();
+        assert_eq!(titles.scan_paths(std::slice::from_ref(&root), &codex)[current], "Renamed");
+        writeln!(file, "{}", serde_json::json!({"id":current,"thread_name":""})).unwrap();
+        assert!(!titles.scan_paths(std::slice::from_ref(&root), &codex).contains_key(current));
+        drop(file);
+        fs::remove_file(&codex).unwrap();
+        assert_eq!(titles.scan_paths(std::slice::from_ref(&root), &codex)[current], "Desktop title");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

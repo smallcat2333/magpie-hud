@@ -12,6 +12,7 @@ mod reader;
 mod single;
 mod tail;
 mod telemetry;
+mod title_index;
 mod usage;
 mod winmon;
 
@@ -381,7 +382,31 @@ fn start_watcher(app: AppHandle) {
     });
 }
 
-/// 路由长轮询与活跃请求分开读取，等待路由变化不阻塞活跃结束检测。
+#[derive(Clone, Default)]
+struct TitleSnapshot {
+    names: std::collections::HashMap<String, String>,
+    aliases: std::collections::HashMap<String, String>,
+    child_labels: std::collections::HashMap<(String, String), String>,
+}
+
+/// 文件扫描只获得窄身份集合；完成后在锁内更新标题，再叠加最新活动，不能发布扫描前的活动。
+fn refresh_titles(
+    shared: &Arc<Mutex<Runtime>>,
+    scan: impl FnOnce(std::collections::HashSet<String>, std::collections::HashSet<(String, String)>) -> TitleSnapshot,
+) -> Option<RouteSnapshot> {
+    let (wanted, children) = {
+        let runtime = shared.lock().expect("状态锁损坏");
+        (runtime.snapshot.sessions.iter().map(|session| session.id.clone()).collect(), live::wanted_children(&runtime.snapshot))
+    };
+    let titles = scan(wanted, children);
+    let mut runtime = shared.lock().expect("状态锁损坏");
+    runtime.live.names = titles.names;
+    runtime.live.aliases = titles.aliases;
+    runtime.live.child_labels = titles.child_labels;
+    runtime.refresh()
+}
+
+/// 路由长轮询、标题文件扫描与活跃请求各自使用线程，磁盘读取不阻塞并发状态刷新。
 fn start_live(app: AppHandle) {
     let shared = Arc::clone(app.state::<Arc<Mutex<Runtime>>>().inner());
     let host = shared.lock().expect("状态锁损坏").config.magpie_host.clone();
@@ -466,37 +491,43 @@ fn start_live(app: AppHandle) {
             std::thread::sleep(Duration::from_secs(5).saturating_sub(started.elapsed()));
         }
     });
+    let title_shared = Arc::clone(&shared);
+    let title_app = app.clone();
     std::thread::spawn(move || {
-        let agent = live::client(Duration::from_secs(2));
         let mut titles = live::Titles::default();
         let mut custom_titles = live::CustomTitles::default();
         let mut child_titles = live::ChildTitles::default();
-        let mut names = std::collections::HashMap::new();
-        let mut aliases = std::collections::HashMap::new();
-        let mut child_labels = std::collections::HashMap::new();
+        let mut cached = TitleSnapshot::default();
         let mut last_titles = Instant::now() - Duration::from_secs(3);
         let mut last_children = Instant::now() - Duration::from_secs(8);
         loop {
-            if last_titles.elapsed() >= Duration::from_secs(2) {
-                names = custom_titles.scan();
-                names.extend(titles.scan(&live::desktop_roots()));
-                aliases = titles.aliases();
-                last_titles = Instant::now();
+            let title_due = last_titles.elapsed() >= Duration::from_secs(2) || titles.catching_up();
+            let child_due = last_children.elapsed() >= Duration::from_secs(8);
+            if title_due || child_due {
+                let snapshot = refresh_titles(&title_shared, |_wanted, children| {
+                    if title_due {
+                        cached.names = custom_titles.scan();
+                        cached.names.extend(titles.scan(&live::desktop_roots()));
+                        cached.aliases = titles.aliases();
+                        last_titles = Instant::now();
+                    }
+                    if child_due {
+                        cached.child_labels = child_titles.scan(&children);
+                        last_children = Instant::now();
+                    }
+                    cached.clone()
+                });
+                if let Some(snapshot) = snapshot { let _ = title_app.emit("route-update", snapshot); }
             }
-            if last_children.elapsed() >= Duration::from_secs(8) {
-                let wanted = {
-                    let runtime = shared.lock().expect("状态锁损坏");
-                    live::wanted_children(&runtime.snapshot)
-                };
-                child_labels = child_titles.scan(&wanted);
-                last_children = Instant::now();
-            }
+            std::thread::sleep(Duration::from_millis(if titles.catching_up() { 100 } else { 500 }));
+        }
+    });
+    std::thread::spawn(move || {
+        let agent = live::client(Duration::from_secs(2));
+        loop {
             let result = live::read_json::<live::Activity>(&agent, &format!("{base}/v1/magpie/concurrency"));
             let snapshot = {
                 let mut runtime = shared.lock().expect("状态锁损坏");
-                runtime.live.names = names.clone();
-                runtime.live.aliases = aliases.clone();
-                runtime.live.child_labels = child_labels.clone();
                 runtime.apply_activity(result);
                 runtime.refresh()
             };
@@ -1261,6 +1292,54 @@ mod tests {
         let mut direct = UsageLedger::new(Local::now().date_naive());
         LogCursor::default().update(&path, &mut direct).unwrap();
         assert_eq!(*runtime.base, direct.snapshot(&runtime.config.magpie_host, "ready", None));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn blocked_title_scan_keeps_activity_updates_independent() {
+        let (runtime, path) = connection_runtime("title-isolation");
+        let shared = Arc::new(Mutex::new(runtime));
+        let scanning = Arc::clone(&shared);
+        let (started, starting) = std::sync::mpsc::sync_channel(0);
+        let (release, released) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            refresh_titles(&scanning, |_, _| {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                TitleSnapshot {
+                    names: std::collections::HashMap::from([("example-session".into(), "Updated title".into())]),
+                    ..TitleSnapshot::default()
+                }
+            });
+        });
+        starting.recv().unwrap();
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        let polling = Arc::clone(&shared);
+        let probe = std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut runtime = polling.lock().unwrap();
+            runtime.apply_trace(Ok(connection_trace()));
+            runtime.apply_activity(Ok(connection_activity()));
+            runtime.refresh();
+            assert_eq!(runtime.snapshot.sessions.len(), 1);
+            sent.send(start.elapsed()).unwrap();
+        });
+        let latency = received.recv_timeout(Duration::from_millis(100));
+        // 超过原来的 500ms 并发轮询间隔，模拟慢磁盘；标题仍阻塞时活动能够结束。
+        std::thread::sleep(Duration::from_millis(600));
+        if latency.is_ok() {
+            let mut runtime = shared.lock().unwrap();
+            runtime.apply_activity(Ok(live::Activity::default()));
+            runtime.refresh();
+        }
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        probe.join().unwrap();
+        assert!(latency.is_ok(), "标题文件被阻塞时，concurrency 的状态更新必须能在 100ms 内完成");
+        let runtime = shared.lock().unwrap();
+        assert!(runtime.snapshot.sessions.is_empty(), "迟到的标题发布不能恢复旧活动");
+        assert_eq!(runtime.live.names["example-session"], "Updated title");
+        eprintln!("TITLE_POLL blocked_scan_ms=600 activity_update_ms={:.3}", latency.unwrap().as_secs_f64() * 1000.0);
         std::fs::remove_file(path).unwrap();
     }
 
