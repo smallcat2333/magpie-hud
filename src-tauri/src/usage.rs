@@ -1073,22 +1073,48 @@ fn finite_number(value: &Value, key: &str) -> Option<f64> {
         .filter(|n| n.is_finite() && *n >= 0.0)
 }
 
-/// 精确请求身份：route_id | 时间戳毫秒 | 原始账号 | 状态 | rid。
-/// 当日账本与按需履历查询共用同一口径去重，避免两处判定不一致。
+/// 日志和定价接口共用的请求范围；原始会话/子身份不合并为展示别名。
+pub(crate) struct RequestScope<'a> {
+    pub session: &'a str,
+    pub subagent: &'a str,
+    pub provider: &'a str,
+}
+
+/// 带版本的 JSON 元组自动转义字段，账号或 rid 中的分隔符不会造成碰撞。
+pub(crate) fn request_identity(
+    route_id: &str,
+    timestamp_ms: i64,
+    account: &str,
+    status: &str,
+    rid: &str,
+    scope: RequestScope<'_>,
+) -> String {
+    serde_json::to_string(&("request-v2", route_id, timestamp_ms, account, status, rid,
+        scope.session, scope.subagent, scope.provider)).expect("请求身份仅含可序列化的字符串和整数")
+}
+
+/// 定价接口可能不回报子身份；仅在去掉子身份后仍唯一时允许配对。
+pub(crate) fn identity_without_subagent(identity: &str) -> Option<String> {
+    type Fields = (String, String, i64, String, String, String, String, String, String);
+    let (version, route, time, account, status, rid, session, _, provider): Fields = serde_json::from_str(identity).ok()?;
+    if version != "request-v2" { return None; }
+    Some(request_identity(&route, time, &account, &status, &rid,
+        RequestScope { session: &session, subagent: "", provider: &provider }))
+}
+
+/// 当日账本、详情与履历共用同一去重口径；账号为空时与展示口径一致回退 host。
 fn record_identity(value: &Value, timestamp_ms: i64) -> String {
-    format!(
-        "{}|{}|{}|{}|{}",
-        value
-            .get("route_id")
-            .map(Value::to_string)
-            .unwrap_or_default(),
+    request_identity(
+        &value.get("route_id").map(Value::to_string).unwrap_or_default(),
         timestamp_ms,
-        string(value, "providerAccount").unwrap_or(""),
-        value
-            .get("status")
-            .map(Value::to_string)
-            .unwrap_or_default(),
-        string(value, "rid").unwrap_or("")
+        string(value, "providerAccount").or_else(|| string(value, "host")).unwrap_or(""),
+        &value.get("status").map(Value::to_string).unwrap_or_default(),
+        string(value, "rid").unwrap_or(""),
+        RequestScope {
+            session: string(value, "session").unwrap_or(""),
+            subagent: string(value, "subagent").unwrap_or(""),
+            provider: string(value, "provider").unwrap_or(""),
+        },
     )
 }
 
@@ -1987,6 +2013,59 @@ mod tests {
         let end = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
         let error = scan_month_usage(&missing, start, end).unwrap_err();
         assert!(error.contains("未找到"));
+    }
+
+    #[test]
+    fn concurrent_records_keep_session_child_provider_and_host_identity() {
+        let base = fixture(1, "parent-a", 200);
+        let mut cases = vec![base.clone()];
+        let mut session = base.clone(); session["session"] = json!("parent-b"); cases.push(session);
+        for child in ["child-a", "child-b"] {
+            let mut row = base.clone(); row["subagent"] = json!(child); cases.push(row);
+        }
+        for host in ["host-a.example.com", "host-b.example.com"] {
+            let mut row = base.clone(); row["providerAccount"] = json!(""); row["host"] = json!(host); cases.push(row);
+        }
+        let mut provider = base.clone(); provider["provider"] = json!("other-vendor"); cases.push(provider);
+        let mut ledger = ledger();
+        let mut history_ids = HashSet::new();
+        for row in &cases {
+            let bytes = row.to_string();
+            ledger.ingest(bytes.as_bytes());
+            ledger.ingest(bytes.as_bytes());
+            match parse_history_line(bytes.as_bytes()) {
+                ParsedHistoryLine::Record(record) => { history_ids.insert(record.identity); }
+                other => panic!("有效记录未解析：{other:?}"),
+            }
+        }
+        let view = ledger.snapshot("h", "ready", None);
+        assert_eq!(view.daily.requests, 7, "同毫秒的不同会话、子请求和账号不能被吞掉");
+        assert_eq!(view.daily.tokens, 7_000);
+        assert_eq!(view.model_usage.iter().map(|row| row.requests).sum::<u64>(), 7);
+        assert_eq!(history_ids, ledger.records.iter().map(|record| record.identity.clone()).collect());
+        assert_eq!(history_ids.len(), 7);
+    }
+
+    #[test]
+    fn request_identity_escapes_fields_and_normalizes_account_fallback() {
+        let mut first = fixture(1, "s", 200);
+        first["providerAccount"] = json!("account|200"); first["rid"] = json!("rid");
+        let mut second = first.clone();
+        second["providerAccount"] = json!("account"); second["rid"] = json!("200|rid");
+        let mut ledger = ledger();
+        ledger.ingest(first.to_string().as_bytes());
+        ledger.ingest(second.to_string().as_bytes());
+        assert_eq!(ledger.records.len(), 2, "字段内分隔符不能拼出相同身份");
+        let mut host = fixture(2, "s", 200);
+        host.as_object_mut().unwrap().remove("providerAccount");
+        host["host"] = json!("fallback.example.com");
+        ledger.ingest(host.to_string().as_bytes());
+        host["providerAccount"] = json!("");
+        ledger.ingest(host.to_string().as_bytes());
+        host["providerAccount"] = json!("fallback.example.com");
+        host["host"] = json!("ignored.example.com");
+        ledger.ingest(host.to_string().as_bytes());
+        assert_eq!(ledger.records.len(), 3, "缺省/空账号回退 host，显式账号优先，不重复计数");
     }
 
     /// 履历窄解析与账本使用同一精确身份去重，并保留 served 与 handed_on 语义。

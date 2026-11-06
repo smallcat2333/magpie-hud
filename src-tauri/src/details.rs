@@ -160,6 +160,8 @@ struct PricedRequest {
     status: Option<u16>,
     #[serde(default)] rid: String,
     #[serde(default)] session: String,
+    #[serde(default)] subagent: Option<String>,
+    #[serde(default)] host: String,
     #[serde(default)] provider: String,
     #[serde(default, rename="providerAccount")] account: String,
     #[serde(default)] kind: String,
@@ -174,8 +176,12 @@ struct PricedRequest {
 impl PricedRequest {
     fn identity(&self) -> Option<String> {
         let time = stamp(&self.t)?;
-        Some(format!("{}|{time}|{}|{}|{}", self.route_id.map(|id|id.to_string()).unwrap_or_default(),
-            self.account, self.status.map(|s|s.to_string()).unwrap_or_default(), self.rid))
+        Some(usage::request_identity(
+            &self.route_id.map(|id| id.to_string()).unwrap_or_default(), time,
+            if self.account.is_empty() { &self.host } else { &self.account },
+            &self.status.map(|status| status.to_string()).unwrap_or_default(), &self.rid,
+            usage::RequestScope { session: &self.session, subagent: self.subagent.as_deref().unwrap_or(""), provider: &self.provider },
+        ))
     }
     fn matches(&self, row: &usage::UsageDetailRow) -> bool {
         self.kind != "routing" && self.source.is_empty() && self.session == row.session
@@ -190,6 +196,13 @@ where F: FnMut(usize) -> Result<PricePage, String> {
     let wanted: HashMap<_,_> = rows.iter().filter(|r| r.cost_matchable).map(|r|(r.id.as_str(),r)).collect();
     if wanted.is_empty() {
         return (HashMap::new(), if rows.is_empty() { Vec::new() } else { vec![format!("逐请求费用匹配 0/{} 次；用量不完整，费用未知", rows.len())] }, false);
+    }
+    // 缺少子身份的网关行只能匹配唯一候选，不能把某个子请求的费用猜给根请求。
+    let mut without_child: HashMap<String, Option<&usage::UsageDetailRow>> = HashMap::new();
+    for row in rows {
+        if let Some(key) = usage::identity_without_subagent(&row.id) {
+            without_child.entry(key).and_modify(|candidate| *candidate = None).or_insert(Some(row));
+        }
     }
     let mut found: HashMap<String, Option<PricedRequest>> = HashMap::new();
     let mut warnings = Vec::new();
@@ -214,13 +227,18 @@ where F: FnMut(usize) -> Result<PricePage, String> {
         let limit = *scan_limit.get_or_insert(page.total.saturating_add(500).min(250_000));
         let count = page.rows.len();
         for priced in page.rows {
-            let Some(id) = priced.identity() else { continue; };
+            let Some(mut id) = priced.identity() else { continue; };
+            if priced.subagent.is_none() {
+                let Some(Some(row)) = without_child.get(&id) else { continue; };
+                id = row.id.clone();
+            }
             let Some(row) = wanted.get(id.as_str()) else { continue; };
             if !priced.matches(row) { found.insert(id, None); continue; }
             match found.entry(id) {
                 std::collections::hash_map::Entry::Vacant(e) => { e.insert(Some(priced)); }
                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if e.get().as_ref() != Some(&priced) { e.insert(None); }
+                    // 身份与用量已核对；接口补齐子身份不算价格冲突。
+                    if !e.get().as_ref().is_some_and(|old| old.priced == priced.priced && old.cost == priced.cost) { e.insert(None); }
                 }
             }
         }
@@ -464,6 +482,93 @@ mod tests {
             Ok(PricePage{period:period.into(),offset,total:2,rows:vec![priced.clone()]})
         });
         assert_eq!(costs.len(),1);assert!(!warnings.is_empty());
+    }
+
+    fn concurrent_pricing_fixture() -> (Vec<serde_json::Value>, Vec<usage::UsageDetailRow>, NaiveDate) {
+        let base = serde_json::json!({"route_id":1,"t":"2026-10-20T00:00:01Z","session":"parent-a",
+            "subagent":"","provider":"vendor","providerAccount":"account@example.com","model":"example-model",
+            "agent":"example-agent","status":200,"in":1,"out":2,"cache_read":3});
+        let day = DateTime::parse_from_rfc3339(base["t"].as_str().unwrap()).unwrap().with_timezone(&Local).date_naive();
+        let mut cases = vec![base.clone()];
+        let mut other = base.clone(); other["session"] = "parent-b".into(); cases.push(other);
+        for child in ["child-a", "child-b"] {
+            let mut row = base.clone(); row["subagent"] = child.into(); cases.push(row);
+        }
+        for host in ["host-a.example.com", "host-b.example.com"] {
+            let mut row = base.clone(); row["providerAccount"] = "".into(); row["host"] = host.into(); cases.push(row);
+        }
+        let mut other = base; other["provider"] = "other-vendor".into(); cases.push(other);
+        let mut ledger = usage::UsageLedger::new(day);
+        for (index, row) in cases.iter_mut().enumerate() {
+            row["priced"] = true.into(); row["cost"] = ((index + 1) as u64).into();
+            ledger.ingest(row.to_string().as_bytes()); ledger.ingest(row.to_string().as_bytes());
+        }
+        (cases, ledger.model_cost_rows(None, None, &HashMap::new()), day)
+    }
+
+    #[test]
+    fn concurrent_identities_preserve_history_details_and_exact_prices() {
+        let (cases, rows, day) = concurrent_pricing_fixture();
+        assert_eq!(rows.len(), 7);
+        let prices: Vec<PricedRequest> = cases.iter().cloned().map(|row| serde_json::from_value(row).unwrap()).collect();
+        let period = format!("{day}..{day}");
+        let (costs, warnings) = request_costs(&rows, &period, |offset| Ok(PricePage {
+            period: period.clone(), offset, total: prices.len(), rows: prices.clone(),
+        }));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(costs.len(), 7);
+        assert_eq!(costs.iter().map(|cost| cost.cost).sum::<f64>(), 28.0);
+        for (index, row) in rows.iter().enumerate() {
+            let cost = costs.iter().find(|cost| cost.row_ids == vec![row.id.clone()]).unwrap();
+            assert_eq!(cost.cost, (index + 1) as f64, "不能把同毫秒的另一条请求价格配过来");
+        }
+        let path = std::env::temp_dir().join(format!("hud-concurrent-identity-{}.jsonl", std::process::id()));
+        let log: String = cases.iter().map(|row| format!("{row}\n{row}\n")).collect();
+        std::fs::write(&path, log).unwrap();
+        let scanned = usage::scan_detail_rows(&path, day, day).unwrap();
+        assert_eq!(scanned.len(), 7);
+        assert_eq!(scanned.iter().map(|row| &row.id).collect::<std::collections::HashSet<_>>(),
+            rows.iter().map(|row| &row.id).collect());
+        let scope = || crate::live::HistoryScope {
+            family: ["parent-a".to_string(), "parent-b".to_string()].into_iter().collect(), routes: vec![], turns: HashMap::new(),
+        };
+        let roots = crate::history::query(&path, "parent-a", None, 50, scope(), day).unwrap();
+        assert_eq!(roots.rows.len(), 5, "别名家族中的同毫秒根请求分别保留");
+        for child in ["child-a", "child-b"] {
+            let history = crate::history::query(&path, "parent-a", Some(child), 50, scope(), day).unwrap();
+            assert_eq!(history.rows.len(), 1);
+            assert_eq!(history.rows[0].subagent.as_deref(), Some(child));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_pricing_subagent_requires_an_unambiguous_candidate() {
+        let (cases, rows, day) = concurrent_pricing_fixture();
+        let period = format!("{day}..{day}");
+        let mut child: PricedRequest = serde_json::from_value(cases[2].clone()).unwrap();
+        child.subagent = None;
+        let fetch = |offset| Ok(PricePage { period: period.clone(), offset, total: 1, rows: vec![child.clone()] });
+        let (unique, warnings) = request_costs(&[rows[2].clone()], &period, fetch);
+        assert_eq!(unique.len(), 1, "接口缺省子身份时仍可匹配唯一的旧记录");
+        assert!(warnings.is_empty());
+        let ambiguous = vec![rows[0].clone(), rows[2].clone()];
+        let (costs, warnings) = request_costs(&ambiguous, &period, fetch);
+        assert!(costs.is_empty(), "根请求和子请求同身份时不能猜测费用归属");
+        assert!(!warnings.is_empty());
+        let mut incomplete = rows[2].clone(); incomplete.cost_matchable = false;
+        let (costs, _) = request_costs(&[rows[0].clone(), incomplete], &period, fetch);
+        assert!(costs.is_empty(), "不完整用量的子请求仍参与歧义检查，不能把其费用算给根请求");
+        let explicit: PricedRequest = serde_json::from_value(cases[2].clone()).unwrap();
+        let (costs, _) = request_costs(&ambiguous, &period, |offset| Ok(PricePage {
+            period: period.clone(), offset, total: 1, rows: vec![explicit.clone()],
+        }));
+        assert_eq!(costs[0].row_ids, vec![rows[2].id.clone()]);
+        let (repeated, warnings) = request_costs(&[rows[2].clone()], &period, |offset| Ok(PricePage {
+            period: period.clone(), offset, total: 2, rows: vec![child.clone(), explicit.clone()],
+        }));
+        assert_eq!(repeated.len(), 1, "分页补齐子身份不应被视为价格冲突");
+        assert!(warnings.is_empty());
     }
 
     #[test]
