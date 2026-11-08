@@ -27,7 +27,10 @@ jobs:
           rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
           rustup default stable
 
-      - name: Test
+      - name: Test shared core
+        run: cargo test -p magpie-hud-core --locked --target x86_64-pc-windows-msvc
+
+      - name: Test desktop
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked --target x86_64-pc-windows-msvc
 
       - name: Build executable

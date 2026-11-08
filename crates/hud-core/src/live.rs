@@ -265,15 +265,15 @@ pub struct TurnRecord {
 }
 
 /// 判定区只发送路由白名单；不包含请求正文、规则表达式、候选账号或原始错误。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct DecisionRuleView {
     pub group: String,
     pub classifier: Option<String>,
     pub duration_ms: Option<i64>,
     pub cached: bool,
     pub intent: Option<String>,
-    pub intent_source: &'static str,
+    pub intent_source: String,
     pub confidence: Option<f64>,
     pub target: Option<String>,
     pub effort: Option<String>,
@@ -285,12 +285,12 @@ pub struct DecisionRuleView {
     pub unready: bool,
     /// 优先目标无人可接时记录的替代目标。
     pub instead: Option<String>,
-    pub state: &'static str,
+    pub state: String,
 }
 
 /// 已确认的组身份；routing 只保留已知策略结构字符串，不读取配置。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct DecisionGroupView {
     pub id: Option<String>,
     #[serde(rename = "ref")]
@@ -300,27 +300,27 @@ pub struct DecisionGroupView {
 }
 
 /// 判定上下文的一个阶段：按上游记录顺序排列，不是该请求的实际执行路径。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct DecisionStageView {
     /// 稳定阶段键：根组为 root，嵌套组带序号与精确身份。
     pub key: String,
     pub group: DecisionGroupView,
     pub rule: Option<DecisionRuleView>,
     /// 该阶段只是入口顺序上的判定上下文，不表示请求按此顺序经过这些组。
-    pub context: &'static str,
+    pub context: String,
     /// 组身份已用 id/ref 精确关联，且父子关系有证据；否则为假，不能当成路径的一环。
     pub confirmed: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct DecisionAttemptView {
     /// 该请求内的尝试序号，从 1 起，包含模型未记录的尝试。
     pub ordinal: i64,
     pub model: String,
     pub effort: Option<String>,
-    pub state: &'static str,
+    pub state: String,
     /// 该次尝试自己确认的组链，不借用其它尝试的路径。
     pub group_chain: Vec<DecisionGroupView>,
     /// 公共前缀在未知层级截断，后续路径不能唯一确认。
@@ -328,8 +328,8 @@ pub struct DecisionAttemptView {
 }
 
 /// 计划尝试顺序的一项；只保留序号、模型与固定强度，不发送账号或供应商。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct DecisionCandidateItem {
     pub ordinal: i64,
     pub model: String,
@@ -337,16 +337,16 @@ pub struct DecisionCandidateItem {
 }
 
 /// 计划尝试顺序，不是已经发生的尝试；超出上限的项只计数量。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct DecisionCandidatePlan {
     pub items: Vec<DecisionCandidateItem>,
     pub total: i64,
     pub omitted: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct DecisionView {
     /// 网关进程与路由组成的稳定身份；不使用用户输入内容作为标识。
     pub id: String,
@@ -360,12 +360,12 @@ pub struct DecisionView {
     pub user_turn: Option<i64>,
     pub continuation: bool,
     pub active: bool,
-    pub state: &'static str,
+    pub state: String,
     /// 活跃请求的等待原因；非等待或已结束时为 null。
-    pub wait_reason: Option<&'static str>,
+    pub wait_reason: Option<String>,
     /// 活跃请求的网关阶段白名单；已结束时不发送。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub phase: Option<&'static str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     pub rules: Vec<DecisionRuleView>,
     pub route_groups: Vec<String>,
     /// 根组与嵌套组的有序阶段，按上游原序。
@@ -461,11 +461,20 @@ impl LiveState {
         // 账本卡没有完整链，按日志 route_id 复用同一条已结束 trace；只补空链，
         // 不改日志算出的 time/updatedAt。活跃卡稍后由自身选中尝试单独计算。
         for session in &mut view.sessions {
-            for card in session.routes.iter_mut().chain(session.completed_subagents.iter_mut())
-                .filter(|card| card.route_groups.is_empty()) {
-                if let Some(chain) = card.route_id.and_then(|id| self.routes.get(&id))
-                    .map(trace_chain).filter(|chain| !chain.is_empty()) {
-                    card.route_groups = chain;
+            for card in session.routes.iter_mut().chain(session.completed_subagents.iter_mut()) {
+                let Some(route) = card.route_id.and_then(|id| self.routes.get(&id)) else { continue };
+                if card.route_groups.is_empty() {
+                    let chain = trace_chain(route);
+                    if !chain.is_empty() { card.route_groups = chain; }
+                }
+                if card.served.as_ref().map(|served| served.is_empty()).unwrap_or(true)
+                    && !matches!(card.state.as_str(), "running" | "waiting")
+                {
+                    let served = trace_served(route);
+                    if !served.is_empty() {
+                        card.model = served.clone();
+                        card.served = Some(served);
+                    }
                 }
             }
         }
@@ -580,6 +589,7 @@ impl LiveState {
                 subagent_id: child.map(str::to_owned),
                 subagent_label: child.map(|id| self.child_label(session_id, id)),
                 route_groups: route.map(|r| route_chain(r, attempt, candidate)).unwrap_or_default(),
+                served: attempt.and_then(|item| nonempty(&item.served)).or_else(|| route.and_then(|item| nonempty(&item.served))),
                 updated_at: started.map(|start| updated_at(start, active.ms)),
                 note: note.clone(),
             };
@@ -596,7 +606,7 @@ impl LiveState {
                     view.sessions.push(SessionView { id: session_id.into(), label, timestamp_ms: started.map(|t| t.timestamp_millis()).unwrap_or(0),
                         latest_sequence: 0, agent: display_agent(&active.agent), request: String::new(),
                         routes: Vec::new(), subagents: vec![card], completed_subagents: Vec::new(), subagent_history: HashMap::new(), quota_routes: Vec::new(),
-                        notes: [note, second], daily: DailyStats::default(), caller_key_id: String::new(), caller_key_name: String::new() });
+                        notes: [note, second], daily: DailyStats::default(), caller_key_id: String::new(), caller_key_name: String::new(), via: String::new() });
                 }
                 continue;
             }
@@ -617,7 +627,7 @@ impl LiveState {
                 view.sessions.push(SessionView { id: session_id.into(), label, timestamp_ms: started.map(|t| t.timestamp_millis()).unwrap_or(0),
                     latest_sequence: 0, agent: display_agent(&active.agent), request: active.model.clone(),
                     routes: vec![card], subagents: Vec::new(), completed_subagents: Vec::new(), subagent_history: HashMap::new(), quota_routes: Vec::new(),
-                    notes: [note, second], daily: DailyStats::default(), caller_key_id, caller_key_name });
+                    notes: [note, second], daily: DailyStats::default(), caller_key_id, caller_key_name, via: String::new() });
             }
         }
         for route in self.routes.values().filter(|route| route.done && route.kind.is_empty()
@@ -688,7 +698,7 @@ impl LiveState {
                 ordinal: index as i64 + 1,
                 model: attempt.model.trim().to_owned(),
                 effort: nonempty(&attempt.effort),
-                state: if !attempt.done { "running" } else { decision_status(attempt.status) },
+                state: (if !attempt.done { "running" } else { decision_status(attempt.status) }).to_owned(),
                 group_chain: chain,
                 path_incomplete: incomplete,
             }
@@ -715,9 +725,9 @@ impl LiveState {
             user_turn: route.rule.as_ref().and_then(|rule| rule.turn.filter(|turn| *turn > 0)),
             continuation: route.rule.as_ref().is_some_and(|rule| rule.held || rule.waits || rule.grown),
             active: true,
-            state,
-            wait_reason,
-            phase,
+            state: state.to_owned(),
+            wait_reason: wait_reason.map(str::to_owned),
+            phase: phase.map(str::to_owned),
             rules,
             route_groups: route_chain(route, terminal, candidate),
             stages,
@@ -1048,7 +1058,7 @@ fn decision_rule(group: &str, rule: &TraceRule) -> DecisionRuleView {
         duration_ms: classified.ms.filter(|ms| *ms >= 0 && !rule.held && !rule.waits),
         cached: classified.cached && !rule.held && !rule.waits,
         intent,
-        intent_source,
+        intent_source: intent_source.to_owned(),
         confidence: classified.sure.filter(|value| value.is_finite() && (0.0..=1.0).contains(value)),
         target: nonempty(&rule.use_target),
         effort: nonempty(&rule.pick),
@@ -1056,7 +1066,7 @@ fn decision_rule(group: &str, rule: &TraceRule) -> DecisionRuleView {
         turn: rule.turn,
         unready: rule.unready,
         instead: nonempty(&rule.instead),
-        state,
+        state: state.to_owned(),
     }
 }
 
@@ -1109,7 +1119,7 @@ fn decision_stages(route: &LiveRoute) -> Vec<DecisionStageView> {
             name: group.name.clone(), routing: known_routing(&group.routing),
         },
         rule: route.rule.as_ref().map(|rule| decision_rule(&group.name, rule)),
-        context: "recorded",
+        context: "recorded".to_owned(),
         confirmed: true,
     }];
     // 只跟踪从根组开始、父子关系连续有证据的那一条；断掉之后不再确认。
@@ -1130,7 +1140,7 @@ fn decision_stages(route: &LiveRoute) -> Vec<DecisionStageView> {
                 name: subgroup.name.clone(), routing: known_routing(&subgroup.routing),
             },
             rule: nested.rule.as_ref().map(|rule| decision_rule(&subgroup.name, rule)),
-            context: "recorded",
+            context: "recorded".to_owned(),
             confirmed: linked,
         });
         if linked {
@@ -1305,6 +1315,16 @@ fn route_chain(route: &LiveRoute, attempt: Option<&Attempt>, candidate: Option<&
 }
 
 /// 已结束的 trace 优先用被选中尝试；多次尝试无法确认时只展示入口组。
+fn trace_served(route: &LiveRoute) -> String {
+    let tries = route.tries.as_deref().unwrap_or_default();
+    tries.iter().rev().find(|attempt| attempt.done && !attempt.served.trim().is_empty())
+        .or_else(|| tries.last())
+        .map(|attempt| attempt.served.trim())
+        .filter(|served| !served.is_empty())
+        .unwrap_or(route.served.trim())
+        .to_owned()
+}
+
 fn trace_chain(route: &LiveRoute) -> Vec<String> {
     let tries = route.tries.as_deref().unwrap_or_default();
     let attempt = tries.iter().rev().find(|attempt| attempt.picked && attempt.done)
@@ -1369,7 +1389,7 @@ pub struct ChildTitles {
 impl ChildTitles {
     /// 只查当天快照里出现的父会话和子 ID。
     pub fn scan(&mut self, wanted: &HashSet<(String, String)>) -> HashMap<(String, String), String> {
-        let root = crate::config::directories_base().join(".claude").join("projects");
+        let root = crate::paths::directories_base().join(".claude").join("projects");
         self.scan_root(Some(&root), wanted)
     }
 
@@ -1541,7 +1561,7 @@ pub struct CustomTitles {
 
 impl CustomTitles {
     pub fn scan(&mut self) -> HashMap<String, String> {
-        let directory = crate::config::config_path().with_file_name("session-titles");
+        let directory = crate::paths::config_path().with_file_name("session-titles");
         self.scan_directory(&directory)
     }
 
@@ -1635,7 +1655,7 @@ impl Titles {
         self.files.retain(|path, _| found.contains(path));
         self.aliases = alias_links(self.files.values().map(|(_, _, title)| title));
         let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| {
-            crate::config::directories_base().join(".codex")
+            crate::paths::directories_base().join(".codex")
         }).join("session_index.jsonl");
         // Magpie 也从此只追加索引读取名称，未换行记录留到下次扫描。
         if let Ok(file) = fs::File::open(codex) {
@@ -1727,7 +1747,7 @@ pub fn desktop_roots() -> Vec<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        let base = crate::config::directories_base().join("Library").join("Application Support");
+        let base = crate::paths::directories_base().join("Library").join("Application Support");
         for name in ["Claude", "Claude-3p"] { roots.push(base.join(name)); }
     }
     roots
@@ -2700,7 +2720,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_desktop_roots_include_application_support() {
-        let base = crate::config::directories_base().join("Library/Application Support");
+        let base = crate::paths::directories_base().join("Library/Application Support");
         let roots = desktop_roots();
         assert!(roots.contains(&base.join("Claude")));
         assert!(roots.contains(&base.join("Claude-3p")));
@@ -3166,7 +3186,7 @@ mod tests {
         assert_eq!((plan.items.len(), plan.total, plan.omitted), (12, 15, 3));
         assert_eq!(plan.items[0].model, "model-0");
         assert_eq!(plan.items[11].ordinal, 12);
-        assert_eq!(decision.phase, Some("unknown"));
+        assert_eq!(decision.phase.as_deref(), Some("unknown"));
         assert_eq!(decision.stages[0].group.routing, None, "未知策略字符串不外发");
         let json = serde_json::to_string(decision).unwrap();
         for secret in ["account-0", "provider-0", "user-0@example.com", "PRIVATE", "custom-secret"] {

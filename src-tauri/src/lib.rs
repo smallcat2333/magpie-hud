@@ -2,133 +2,28 @@
 
 mod backdrop;
 mod config;
-mod details;
-mod history;
-mod hourly;
-mod live;
+mod connection;
+mod desktop_data;
+mod remote;
 mod placement;
 mod single;
-mod tail;
-mod telemetry;
-mod usage;
 mod winmon;
 
-use chrono::{Datelike, Local};
-use config::{load_config, save_config, usage_path, AppConfig, WindowPlacement};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use config::{save_config, WindowPlacement};
+use desktop_data::Runtime;
+use hud_core::{details, usage::RouteSnapshot};
+#[cfg(test)]
+use hud_core::query::parse_month;
+use serde_json::{json, Value};
 use placement::{constrain, monitor_for_window, PhysicalRect};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tail::LogCursor;
+use std::time::Duration;
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
     WebviewWindow,
 };
-use usage::{RouteSnapshot, UsageLedger};
-
-/// 历史日期统计缓存项，与主账本和实时游标完全隔离。
-#[derive(Clone)]
-struct CachedDayStats {
-    host: String,
-    file_created: Option<std::time::SystemTime>,
-    file_modified: Option<std::time::SystemTime>,
-    file_len: u64,
-    read_at: Instant,
-    view: DateStatsView,
-}
-
-/// 按日统计查询结果；历史日期与实时主账本分离，不覆盖当日会话或实时游标。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DateStatsView {
-    date: String,
-    earliest_date: String,
-    latest_date: String,
-    daily: usage::DailyStats,
-    /// 该日全部完成记录的来源分组，字段与实时快照 agentStats 相同。
-    agent_stats: Vec<usage::AgentStats>,
-    cost_error: Option<String>,
-}
-
-/// 后台增量游标和已发布快照只在这个状态内持有，避免启动与更新分叉。
-struct Runtime {
-    config: AppConfig,
-    config_error: Option<String>,
-    ledger: UsageLedger,
-    cursor: LogCursor,
-    live: live::LiveState,
-    telemetry: telemetry::Telemetry,
-    quota_refresh: Option<std::sync::mpsc::SyncSender<()>>,
-    snapshot: RouteSnapshot,
-    history_cache: std::collections::HashMap<chrono::NaiveDate, CachedDayStats>,
-    /// 合并窗口保存请求。事件回调不在持锁时等待写盘线程。
-    window_save: Arc<WindowSave>,
-    details_save: Arc<WindowSave>,
-}
-
-impl Runtime {
-    /// 初次流式汇总只读日志；无效配置保留可见错误，不在启动时覆盖文件。
-    fn new() -> Self {
-        let (config, config_error) = match load_config(&config::config_path()) {
-            Ok(config) => (config, None),
-            Err(error) => (AppConfig::default(), Some(error)),
-        };
-        let ledger = UsageLedger::new(Local::now().date_naive());
-        let snapshot = ledger.snapshot(&config.magpie_host, "waiting", config_error.clone());
-        let saved_window = config.window.filter(|placement| stable_window(placement));
-        let saved_details = config.details_window.filter(|placement| stable_window(placement));
-        let mut runtime = Self {
-            config,
-            config_error,
-            ledger,
-            cursor: LogCursor::default(),
-            live: live::LiveState::default(),
-            telemetry: telemetry::Telemetry::default(),
-            quota_refresh: None,
-            snapshot,
-            history_cache: std::collections::HashMap::new(),
-            window_save: Arc::new(WindowSave::new(saved_window)),
-            details_save: Arc::new(WindowSave::new(saved_details)),
-        };
-        runtime.refresh(None);
-        runtime
-    }
-
-    /// 每次只消费新增日志；相同内容不发事件，跨日和文件状态也会产生新快照。
-    fn refresh(&mut self, watcher_error: Option<String>) -> Option<RouteSnapshot> {
-        let path = usage_path(&self.config);
-        let read_error = self.cursor.update(&path, &mut self.ledger).err();
-        let mut snapshot = self.ledger.snapshot(
-            &self.config.magpie_host,
-            if self.cursor.missing {
-                "missing"
-            } else {
-                "ready"
-            },
-            self.config_error.clone().or(read_error).or(watcher_error),
-        );
-        // 只有新完成记录才触发额度补刷；启动历史、活跃态和普通重绘不触发。
-        if snapshot.date == self.snapshot.date && snapshot.daily.requests > self.snapshot.daily.requests {
-            if let Some(sender) = &self.quota_refresh {
-                let _ = sender.try_send(());
-            }
-        }
-        if snapshot.sessions.is_empty() {
-            snapshot.notes[1].text = path.display().to_string();
-        }
-        self.live.apply(&mut snapshot);
-        self.telemetry.apply(&mut snapshot);
-        snapshot.revision = self.snapshot.revision;
-        if snapshot == self.snapshot {
-            return None;
-        }
-        snapshot.revision = self.snapshot.revision + 1;
-        self.snapshot = snapshot.clone();
-        Some(snapshot)
-    }
-}
 
 /// 拖动期间只保留一个写盘线程，安静 250ms 后保存最后的正常矩形。
 struct WindowSave {
@@ -180,12 +75,15 @@ pub fn run() {
         .setup(|app| {
             setup_window(app.handle())?;
             setup_tray(app.handle())?;
-            start_watcher(app.handle().clone());
-            start_live(app.handle().clone());
+            desktop_data::start_source(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             startup_state,
+            desktop_data::connection_settings,
+            desktop_data::test_connection,
+            desktop_data::save_connection,
+            desktop_data::forget_connection,
             query_date_stats,
             query_month_usage,
             open_usage_details,
@@ -270,7 +168,8 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             "exit" => {
                 let _ = remember_details(&app);
                 let _ = remember_window(app);
-                app.exit(0);
+                desktop_data::stop_source(&app);
+    app.exit(0);
             }
             _ => {}
         })
@@ -282,201 +181,6 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         }
     });
     Ok(())
-}
-
-/// 文件事件在 100ms 内合并，最多等待 150ms；一秒兜底检查负责跨日与缺目录恢复。
-fn start_watcher(app: AppHandle) {
-    let shared = Arc::clone(app.state::<Arc<Mutex<Runtime>>>().inner());
-    let path = usage_path(&shared.lock().expect("状态锁损坏").config);
-    std::thread::spawn(move || {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let mut watch_error = None;
-        let _watcher = match RecommendedWatcher::new(sender, notify::Config::default()) {
-            Ok(mut watcher) => {
-                // 目录尚不存在时监视最近存在的上级；绝不为了监视创建 Magpie 目录。
-                let parent = path.parent().expect("usage 路径缺少目录");
-                let ancestor = parent.ancestors().find(|candidate| candidate.is_dir());
-                if let Some(ancestor) = ancestor {
-                    if let Err(error) = watcher.watch(
-                        ancestor,
-                        if ancestor == parent {
-                            RecursiveMode::NonRecursive
-                        } else {
-                            RecursiveMode::Recursive
-                        },
-                    ) {
-                        watch_error = Some(format!("文件监视不可用：{error}"));
-                    }
-                }
-                Some(watcher)
-            }
-            Err(error) => {
-                watch_error = Some(format!("文件监视不可用：{error}"));
-                None
-            }
-        };
-        loop {
-            match receiver.recv_timeout(Duration::from_secs(1)) {
-                Ok(Ok(event)) => {
-                    if !event
-                        .paths
-                        .iter()
-                        .any(|changed| changed == &path || path.starts_with(changed))
-                    {
-                        continue;
-                    }
-                    let deadline = Instant::now() + Duration::from_millis(150);
-                    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-                        if receiver
-                            .recv_timeout(left.min(Duration::from_millis(100)))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-                Ok(Err(error)) => watch_error = Some(format!("文件监视异常：{error}")),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    std::thread::sleep(Duration::from_secs(1))
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            let next = shared
-                .lock()
-                .expect("状态锁损坏")
-                .refresh(watch_error.clone());
-            if let Some(snapshot) = next {
-                let _ = app.emit("route-update", snapshot);
-            }
-        }
-    });
-}
-
-/// 路由长轮询与活跃请求分开读取，等待路由变化不阻塞活跃结束检测。
-fn start_live(app: AppHandle) {
-    let shared = Arc::clone(app.state::<Arc<Mutex<Runtime>>>().inner());
-    let host = shared.lock().expect("状态锁损坏").config.magpie_host.clone();
-    let base = match live::gateway_url(&host) {
-        Ok(base) => base,
-        Err(error) => {
-            shared.lock().expect("状态锁损坏").live.error = Some(error);
-            return;
-        }
-    };
-    let (quota_sender, quota_receiver) = std::sync::mpsc::sync_channel(1);
-    shared.lock().expect("状态锁损坏").quota_refresh = Some(quota_sender);
-    let trace_app = app.clone();
-    let trace_shared = Arc::clone(&shared);
-    let trace_base = base.clone();
-    std::thread::spawn(move || {
-        let agent = live::client(Duration::from_secs(30));
-        loop {
-            let seq = trace_shared.lock().expect("状态锁损坏").live.seq;
-            let url = format!("{trace_base}/v1/magpie/trace?after={seq}{}", if seq > 0 { "&wait=1" } else { "" });
-            match live::read_json::<live::TraceUpdate>(&agent, &url) {
-                Ok(update) => {
-                    let mut runtime = trace_shared.lock().expect("状态锁损坏");
-                    runtime.live.update(update);
-                    if let Some(snapshot) = runtime.refresh(None) {
-                        let _ = trace_app.emit("route-update", snapshot);
-                    }
-                }
-                Err(_) => std::thread::sleep(Duration::from_secs(2)),
-            }
-        }
-    });
-    let quota_app = app.clone();
-    let quota_shared = Arc::clone(&shared);
-    let quota_base = base.clone();
-    std::thread::spawn(move || {
-        let agent = live::client(Duration::from_secs(5));
-        loop {
-            let started = Instant::now();
-            let quotas = live::read_json::<telemetry::Quotas>(&agent, &format!("{quota_base}/v1/magpie/quotas?kept=1"));
-            {
-                let mut runtime = quota_shared.lock().expect("状态锁损坏");
-                match quotas {
-                    Ok(quotas) => runtime.telemetry.update_quotas(quotas.data),
-                    Err(error) => runtime.telemetry.quota_error = Some(error),
-                }
-                if let Some(snapshot) = runtime.refresh(None) {
-                    let _ = quota_app.emit("route-update", snapshot);
-                }
-            }
-            // 启动立即读取，之后每分钟刷新；完成事件合并两秒后补读缓存。
-            match quota_receiver.recv_timeout(Duration::from_secs(60).saturating_sub(started.elapsed())) {
-                Ok(()) => {
-                    std::thread::sleep(Duration::from_secs(2));
-                    while quota_receiver.try_recv().is_ok() {}
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-        }
-    });
-    let usage_app = app.clone();
-    let usage_shared = Arc::clone(&shared);
-    let usage_base = base.clone();
-    std::thread::spawn(move || {
-        let agent = live::client(Duration::from_secs(5));
-        loop {
-            let started = Instant::now();
-            let usage = live::read_json::<telemetry::Usage>(&agent, &format!("{usage_base}/v1/magpie/usage?period=today"));
-            {
-                let mut runtime = usage_shared.lock().expect("状态锁损坏");
-                match usage {
-                    Ok(usage) => runtime.telemetry.update_usage(usage, &host),
-                    Err(error) => runtime.telemetry.cost_error = Some(error),
-                }
-                if let Some(snapshot) = runtime.refresh(None) {
-                    let _ = usage_app.emit("route-update", snapshot);
-                }
-            }
-            std::thread::sleep(Duration::from_secs(5).saturating_sub(started.elapsed()));
-        }
-    });
-    std::thread::spawn(move || {
-        let agent = live::client(Duration::from_secs(2));
-        let mut titles = live::Titles::default();
-        let mut custom_titles = live::CustomTitles::default();
-        let mut child_titles = live::ChildTitles::default();
-        let mut names = std::collections::HashMap::new();
-        let mut aliases = std::collections::HashMap::new();
-        let mut child_labels = std::collections::HashMap::new();
-        let mut last_titles = Instant::now() - Duration::from_secs(3);
-        let mut last_children = Instant::now() - Duration::from_secs(8);
-        loop {
-            if last_titles.elapsed() >= Duration::from_secs(2) {
-                names = custom_titles.scan();
-                names.extend(titles.scan(&live::desktop_roots()));
-                aliases = titles.aliases();
-                last_titles = Instant::now();
-            }
-            if last_children.elapsed() >= Duration::from_secs(8) {
-                let wanted = {
-                    let runtime = shared.lock().expect("状态锁损坏");
-                    live::wanted_children(&runtime.snapshot)
-                };
-                child_labels = child_titles.scan(&wanted);
-                last_children = Instant::now();
-            }
-            let result = live::read_json::<live::Activity>(&agent, &format!("{base}/v1/magpie/concurrency"));
-            {
-                let mut runtime = shared.lock().expect("状态锁损坏");
-                runtime.live.names = names.clone();
-                runtime.live.aliases = aliases.clone();
-                runtime.live.child_labels = child_labels.clone();
-                match result {
-                    Ok(activity) => { runtime.live.activity = activity; runtime.live.error = None; }
-                    Err(error) => { runtime.live.activity = live::Activity::default(); runtime.live.error = Some(error); }
-                }
-                if let Some(snapshot) = runtime.refresh(None) {
-                    let _ = app.emit("route-update", snapshot);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    });
 }
 
 /// 提供已缓存的快照，避免页面每次切会话都重读日志。
@@ -548,255 +252,28 @@ fn usage_details_context(app: AppHandle) -> details::DetailContext {
 }
 
 #[tauri::command]
-async fn query_usage_details(app: AppHandle, start: String, end: String, filters: Option<details::DetailFilters>) -> Result<details::DetailData, String> {
-    let (path, host) = {
-        let state = app.state::<Arc<Mutex<Runtime>>>();
-        let runtime = state.lock().map_err(|_| "状态锁损坏")?;
-        (usage_path(&runtime.config), runtime.config.magpie_host.clone())
-    };
-    tauri::async_runtime::spawn_blocking(move || details::query(&path, &host, &start, &end, &filters.unwrap_or_default()))
-        .await.map_err(|e| format!("详情查询任务失败：{e}"))?
+async fn query_usage_details(app: AppHandle, start: String, end: String, filters: Option<details::DetailFilters>) -> Result<Value, String> {
+    desktop_data::query(app, "query_usage_details", json!({"start":start,"end":end,"filters":filters})).await
 }
 
-/// 模型图费用按需查询：锁内仅复制当前账本的窄字段，网络分页在后台线程执行。
 #[tauri::command]
-async fn query_model_costs(app: AppHandle, session: Option<String>, source_key: Option<String>) -> Result<details::ModelCostData, String> {
-    let (host, date, ledger_revision, rows) = {
-        let state = app.state::<Arc<Mutex<Runtime>>>();
-        let runtime = state.lock().map_err(|_| "状态锁损坏")?;
-        let selected = session.as_deref().filter(|s| !s.is_empty());
-        let canonical = selected.map(|s| runtime.live.aliases.get(s).map(String::as_str).unwrap_or(s));
-        (runtime.config.magpie_host.clone(), runtime.snapshot.date.clone(), runtime.ledger.revision,
-         runtime.ledger.model_cost_rows(canonical, source_key.as_deref().filter(|s| !s.is_empty()), &runtime.live.aliases))
-    };
-    tauri::async_runtime::spawn_blocking(move || details::model_costs(rows, &host, &date, ledger_revision))
-        .await.map_err(|_| "模型费用查询任务失败".to_string())
+async fn query_model_costs(app: AppHandle, session: Option<String>, source_key: Option<String>) -> Result<Value, String> {
+    desktop_data::query(app, "query_model_costs", json!({"session":session,"sourceKey":source_key})).await
 }
 
-/// 按需查询一个会话（或其某个子 Agent）的近期请求履历；只接收身份与条数，
-/// 路径由配置解析，不触发费用、额度或快照克隆。
 #[tauri::command]
-async fn query_route_history(
-    app: AppHandle,
-    session: String,
-    subagent: Option<String>,
-    limit: Option<usize>,
-) -> Result<history::RouteHistoryData, String> {
-    let subagent = subagent.filter(|id| !id.trim().is_empty());
-    if session.trim().is_empty() {
-        return Err("缺少会话身份".into());
-    }
-    let limit = limit.unwrap_or(history::DEFAULT_LIMIT).clamp(1, history::MAX_LIMIT);
-    let (path, scope, today) = {
-        let state = app.state::<Arc<Mutex<Runtime>>>();
-        let runtime = state.lock().map_err(|_| "状态锁损坏")?;
-        (
-            usage_path(&runtime.config),
-            runtime.live.history_scope(&session, subagent.as_deref()),
-            Local::now().date_naive(),
-        )
-    };
-    tauri::async_runtime::spawn_blocking(move || history::query(&path, &session, subagent.as_deref(), limit, scope, today))
-        .await
-        .map_err(|e| format!("履历查询任务失败：{e}"))?
+async fn query_route_history(app: AppHandle, session: String, subagent: Option<String>, limit: Option<usize>) -> Result<Value, String> {
+    desktop_data::query(app, "query_route_history", json!({"session":session,"subagent":subagent,"limit":limit})).await
 }
 
-/// 查询指定本地日期的六项统计与 24 小时趋势；历史日期走只读缓存轨，不干扰当日实时账本。
 #[tauri::command]
-async fn query_date_stats(app: AppHandle, date: String) -> Result<DateStatsView, String> {
-    tauri::async_runtime::spawn_blocking(move || read_date_stats(&app, &date))
-        .await
-        .map_err(|error| format!("历史查询任务失败：{error}"))?
+async fn query_date_stats(app: AppHandle, date: String) -> Result<Value, String> {
+    desktop_data::query(app, "query_date_stats", json!({"date":date})).await
 }
 
-fn read_date_stats(app: &AppHandle, date: &str) -> Result<DateStatsView, String> {
-    let day = chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d")
-        .map_err(|_| "日期格式无效，应为 YYYY-MM-DD".to_string())?;
-    // `%Y-%m-%d` 也接受非零填充，这里要求与接口完全一致才放行。
-    if day.format("%Y-%m-%d").to_string() != date.trim() {
-        return Err("日期格式无效，应为 YYYY-MM-DD".into());
-    }
-    let today = Local::now().date_naive();
-    if day > today {
-        return Err("不能查看未来日期的统计".into());
-    }
-    let state = app.state::<Arc<Mutex<Runtime>>>();
-    let (path, host) = {
-        let runtime = state.lock().expect("状态锁损坏");
-        if day == today && runtime.snapshot.date == today.to_string() {
-            return Ok(DateStatsView {
-                date: runtime.snapshot.date.clone(),
-                earliest_date: runtime.snapshot.earliest_date.clone(),
-                latest_date: today.to_string(),
-                daily: runtime.snapshot.daily.clone(),
-                agent_stats: runtime.snapshot.agent_stats.clone(),
-                cost_error: runtime.snapshot.cost_error.clone(),
-            });
-        }
-        (
-            usage_path(&runtime.config),
-            runtime.config.magpie_host.clone(),
-        )
-    };
-    let metadata = std::fs::metadata(&path).ok();
-    let file_created = metadata.as_ref().and_then(|meta| meta.created().ok());
-    let file_modified = metadata.as_ref().and_then(|meta| meta.modified().ok());
-    let file_len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
-    if day < today {
-        let runtime = state.lock().expect("状态锁损坏");
-        if let Some(cached) = runtime.history_cache.get(&day) {
-            if cached.host == host
-                && cached.file_created == file_created
-                && cached.file_modified == file_modified
-                && cached.file_len == file_len
-                && cached.read_at.elapsed() < Duration::from_secs(60)
-                && cached.view.cost_error.is_none()
-            {
-                let mut view = cached.view.clone();
-                view.latest_date = today.to_string();
-                return Ok(view);
-            }
-        }
-    }
-    let (mut daily, mut agent_stats, scanned_earliest) = usage::scan_day_stats(&path, day)?;
-    let period = format!("{day}..{day}");
-    let cost_error = match live::gateway_url(&host) {
-        Ok(base) => {
-            let agent = live::client(Duration::from_secs(5));
-            let url = format!("{base}/v1/magpie/usage?period={period}");
-            match live::read_json::<telemetry::Usage>(&agent, &url) {
-                Ok(usage) => telemetry::apply_history_usage(&mut daily, &mut agent_stats, day, &period, &usage).err(),
-                Err(error) => Some(error),
-            }
-        }
-        Err(error) => Some(error),
-    };
-    let mut runtime = state.lock().expect("状态锁损坏");
-    let mut current_earliest = chrono::NaiveDate::parse_from_str(&runtime.snapshot.earliest_date, "%Y-%m-%d")
-        .unwrap_or(today);
-    if let Some(earliest) = scanned_earliest {
-        current_earliest = current_earliest.min(earliest);
-    }
-    let view = DateStatsView {
-        date: day.to_string(),
-        earliest_date: current_earliest.to_string(),
-        latest_date: today.to_string(),
-        daily,
-        agent_stats,
-        cost_error,
-    };
-    if day < today && view.cost_error.is_none() {
-        if runtime.history_cache.len() >= 32 {
-            runtime.history_cache.clear();
-        }
-        runtime.history_cache.insert(
-            day,
-            CachedDayStats {
-                host,
-                file_created,
-                file_modified,
-                file_len,
-                read_at: Instant::now(),
-                view: view.clone(),
-            },
-        );
-    }
-    Ok(view)
-}
-
-/// 热力日历的一次单月结果；未来日期以 0 返回，由前端禁用。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MonthUsageView {
-    month: String,
-    earliest_date: String,
-    latest_date: String,
-    days: Vec<MonthDayUsage>,
-    agent_days: Vec<MonthAgentUsage>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MonthAgentUsage {
-    agent: String,
-    caller_key_id: String,
-    caller_key_name: String,
-    days: Vec<MonthDayUsage>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MonthDayUsage {
-    date: String,
-    tokens: u64,
-    requests: u64,
-}
-
-/// 查询所选本地月每天的热力数据；历史缓存轨独立扫描，不占用实时账本或主游标。
 #[tauri::command]
-async fn query_month_usage(app: AppHandle, month: String) -> Result<MonthUsageView, String> {
-    tauri::async_runtime::spawn_blocking(move || read_month_usage(&app, &month))
-        .await
-        .map_err(|error| format!("月份查询任务失败：{error}"))?
-}
-
-fn read_month_usage(app: &AppHandle, month: &str) -> Result<MonthUsageView, String> {
-    let (month, start, end) = parse_month(month.trim(), Local::now().date_naive())?;
-    let state = app.state::<Arc<Mutex<Runtime>>>();
-    let path = {
-        let runtime = state.lock().expect("状态锁损坏");
-        usage_path(&runtime.config)
-    };
-    let (days, agent_days, scanned_earliest) = usage::scan_month_scoped_usage(&path, start, end)?;
-    let today = Local::now().date_naive();
-    let earliest = scanned_earliest
-        .map(|date| date.min(today))
-        .unwrap_or(today);
-    Ok(MonthUsageView {
-        month,
-        earliest_date: earliest.to_string(),
-        latest_date: today.to_string(),
-        agent_days: agent_days.into_iter().map(|(agent, caller_key_id, caller_key_name, days)| MonthAgentUsage {
-            agent, caller_key_id, caller_key_name,
-            days: days.into_iter().map(|day| MonthDayUsage { date: day.date.to_string(), tokens: day.tokens, requests: day.requests }).collect(),
-        }).collect(),
-        days: days
-            .into_iter()
-            .map(|day| MonthDayUsage {
-                date: day.date.to_string(),
-                tokens: day.tokens,
-                requests: day.requests,
-            })
-            .collect(),
-    })
-}
-
-/// 严格校验 `YYYY-MM` 并给出当月闭区间；格式多余零填充和未来月份都在扫描前拒绝。
-fn parse_month(
-    input: &str,
-    today: chrono::NaiveDate,
-) -> Result<(String, chrono::NaiveDate, chrono::NaiveDate), String> {
-    if input.len() != 7 || input.as_bytes().get(4) != Some(&b'-') {
-        return Err("月份格式无效，应为 YYYY-MM".into());
-    }
-    let start = chrono::NaiveDate::parse_from_str(&format!("{input}-01"), "%Y-%m-%d")
-        .map_err(|_| "月份格式无效，应为 YYYY-MM".to_string())?;
-    if start.format("%Y-%m").to_string() != input {
-        return Err("月份格式无效，应为 YYYY-MM".into());
-    }
-    let next = if start.month() == 12 {
-        chrono::NaiveDate::from_ymd_opt(start.year() + 1, 1, 1)
-    } else {
-        chrono::NaiveDate::from_ymd_opt(start.year(), start.month() + 1, 1)
-    }
-    .ok_or("月份超出支持范围")?;
-    let end = next.pred_opt().ok_or("月份超出支持范围")?;
-    let this_month = chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-        .ok_or("无法确定当前月份")?;
-    if start > this_month {
-        return Err("不能查看未来月份的热力日历".into());
-    }
-    Ok((input.to_string(), start, end))
+async fn query_month_usage(app: AppHandle, month: String) -> Result<Value, String> {
+    desktop_data::query(app, "query_month_usage", json!({"month":month})).await
 }
 
 /// 切换真实置顶并保存，失败返回错误，不让图标假装成功。
@@ -912,6 +389,7 @@ fn hide_window(app: AppHandle) -> Result<(), String> {
 fn close_window(app: AppHandle) {
     let _ = remember_details(&app);
     let _ = remember_window(&app);
+    desktop_data::stop_source(&app);
     app.exit(0);
 }
 

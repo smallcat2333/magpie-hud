@@ -336,7 +336,7 @@
   let costReadAt = 0;
   async function loadCosts() {
     const key = JSON.stringify(context);
-    if (section.hidden || !context.date || !window.__TAURI__?.core) { render(); return; }
+    if (section.hidden || !context.date || window.HudData.preview) { render(); return; }
     if (costState.status === 'loading') { render(); return; }
     if (costState.key === key && Date.now() - costReadAt < 15000) { render(); return; }
     costReadAt = Date.now();
@@ -345,7 +345,7 @@
     costState = { ...costState, key, status: 'loading' };
     if (!costState.hasData) render(true);
     try {
-      const result = await window.__TAURI__.core.invoke('query_model_costs', { session: context.session, sourceKey: context.sourceKey });
+      const result = await window.HudData.invoke('query_model_costs', { session: context.session, sourceKey: context.sourceKey });
       if (request !== costRequest || key !== JSON.stringify(context)) return;
       if (result.date !== context.date || result.ledgerRevision !== context.revision) {
         throw new Error('账本已更新，请重试');
@@ -360,6 +360,7 @@
       costState = { key, status: 'ready', hasData: true, rows: result.rows || [], warnings: result.warnings || [] };
     } catch (error) {
       if (request !== costRequest || key !== JSON.stringify(context)) return;
+      if (error?.hudStale) return;
       costState = { ...costState, key, status: 'error', warnings: [String(error)] };
     }
     render(true);
@@ -397,4 +398,9 @@
       loadCosts();
     },
   };
+  window.HudData.listen('source-change', () => {
+    costRequest += 1;
+    costState = { key: '', status: 'idle', hasData: false, rows: [], warnings: [] };
+    render(true);
+  });
 })();

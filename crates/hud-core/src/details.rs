@@ -15,8 +15,8 @@ pub struct DetailContext {
     #[serde(default)] pub session: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct DetailData {
     pub start: String,
     pub end: String,
@@ -26,8 +26,8 @@ pub struct DetailData {
     pub warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct CostGroup {
     pub session: String,
     pub row_ids: Vec<String>,
@@ -36,8 +36,8 @@ pub struct CostGroup {
     pub unpriced: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Cycle {
     pub provider: String,
     pub account: String,
@@ -69,7 +69,7 @@ pub fn parse_range(start: &str, end: &str) -> Result<(NaiveDate, NaiveDate), Str
 }
 
 /// 与前端一致的筛选条件；空集合表示不限制。按筛选缩小逐请求费用的匹配范围。
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetailFilters {
     #[serde(default)] pub source_keys: Vec<String>,
@@ -91,9 +91,20 @@ impl DetailFilters {
     }
 }
 
+fn read_price_page(client: &ureq::Agent, url: &str, classify_http: bool) -> Result<PricePage, String> {
+    crate::http::read_json(client, url, classify_http)
+}
+
 pub fn query(path: &Path, host: &str, start: &str, end: &str, filters: &DetailFilters) -> Result<DetailData, String> {
+    query_mode(path, host, start, end, filters, false, false)
+}
+
+pub fn query_mode(
+    path: &Path, host: &str, start: &str, end: &str, filters: &DetailFilters,
+    include_unassociated: bool, classify_http: bool,
+) -> Result<DetailData, String> {
     let (a,b) = parse_range(start,end)?;
-    let mut rows = usage::scan_detail_rows(path,a,b)?;
+    let mut rows = usage::scan_detail_rows_with(path, a, b, include_unassociated)?;
     if rows.len() > 200_000 { return Err("所选范围超过 20 万条请求，请缩小日期范围".into()); }
     // 先按筛选缩小行集，费用匹配随之收窄；网关分页从最新往前，已筛选的近期请求可以提前结束扫描。
     rows.retain(|row| {
@@ -108,7 +119,7 @@ pub fn query(path: &Path, host: &str, start: &str, end: &str, filters: &DetailFi
                 let scope = pricing_scope(&data.rows);
                 let client = live::client(Duration::from_secs(5));
                 let (costs, warnings) = request_costs(&data.rows, &period, |offset| {
-                    live::read_json::<PricePage>(&client, &format!("{base}/v1/magpie/usage/requests?period={period}&via=through&limit=500&offset={offset}{scope}"))
+                    read_price_page(&client, &format!("{base}/v1/magpie/usage/requests?period={period}&via=through&limit=500&offset={offset}{scope}"), classify_http)
                 });
                 data.costs = costs;
                 data.warnings.extend(warnings);
@@ -247,8 +258,8 @@ where F: FnMut(usize) -> Result<PricePage, String> {
     (costs, warnings)
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ModelCostData {
     pub date: String,
     pub ledger_revision: u64,
@@ -258,8 +269,8 @@ pub struct ModelCostData {
     pub warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ModelCostRow {
     pub model: String,
     pub effort: String,
@@ -271,6 +282,10 @@ pub struct ModelCostRow {
 
 /// 费用只在前端请求时查询回环网关，按原始日志行精确匹配并只返回模型/强度合计。
 pub fn model_costs(rows: Vec<usage::UsageDetailRow>, host: &str, date: &str, ledger_revision: u64) -> ModelCostData {
+    model_costs_mode(rows, host, date, ledger_revision, false)
+}
+
+pub fn model_costs_mode(rows: Vec<usage::UsageDetailRow>, host: &str, date: &str, ledger_revision: u64, classify_http: bool) -> ModelCostData {
     let mut warnings = Vec::new();
     let period = format!("{date}..{date}");
     let mut fetch_failed = false;
@@ -280,7 +295,7 @@ pub fn model_costs(rows: Vec<usage::UsageDetailRow>, host: &str, date: &str, led
         let scope = pricing_scope(&rows);
         let client = live::client(Duration::from_secs(5));
         let (matched, messages, failed) = match_request_costs(&rows, &period, |offset| {
-            live::read_json::<PricePage>(&client, &format!("{base}/v1/magpie/usage/requests?period={period}&via=through&limit=500&offset={offset}{scope}"))
+            read_price_page(&client, &format!("{base}/v1/magpie/usage/requests?period={period}&via=through&limit=500&offset={offset}{scope}"), classify_http)
         });
         warnings.extend(messages);
         fetch_failed = failed;
@@ -382,7 +397,7 @@ mod tests {
     fn detail_filters_narrow_rows_before_cost_matching() {
         let row=|model:&str,provider:&str,account:&str,effort:&str| usage::UsageDetailRow{
             id:String::new(),timestamp:0,date:String::new(),hour:0,session:"s".into(),agent:String::new(),
-            caller_key_id:String::new(),caller_key_name:String::new(),source_key:r#"["Claude Code","key-a"]"#.into(),
+            caller_key_id:String::new(),caller_key_name:String::new(),via:String::new(),source_key:r#"["Claude Code","key-a"]"#.into(),
             provider:provider.into(),account:account.into(),model:model.into(),effort:effort.into(),
             outcome:"success".into(),input:0,output:0,cache_read:0,tokens:0,generation_ms:None,cost_matchable:true};
         let account_key=serde_json::to_string(&["vendor","account"]).unwrap();
@@ -470,7 +485,7 @@ mod tests {
     fn model_cost_summary_distinguishes_zero_unpriced_and_unmatched() {
         let row = |id: &str, effort: &str| usage::UsageDetailRow {
             id:id.into(),timestamp:0,date:String::new(),hour:0,session:"s".into(),agent:String::new(),
-            caller_key_id:String::new(),caller_key_name:String::new(),source_key:String::new(),
+            caller_key_id:String::new(),caller_key_name:String::new(),via:String::new(),source_key:String::new(),
             provider:String::new(),account:String::new(),model:"m".into(),effort:effort.into(),
             outcome:"success".into(),input:0,output:0,cache_read:0,tokens:0,generation_ms:None,cost_matchable:true,
         };
@@ -500,7 +515,7 @@ mod tests {
         let row = |price: &PricedRequest, matchable| usage::UsageDetailRow {
             id: price.identity().unwrap(), timestamp: stamp(&price.t).unwrap(), date: "2026-10-27".into(),
             hour: 0, session: "session-a".into(), agent: "Claude Desktop".into(),
-            caller_key_id: "key".into(), caller_key_name: String::new(), source_key: String::new(),
+            caller_key_id: "key".into(), caller_key_name: String::new(), via: String::new(), source_key: String::new(),
             provider: "vendor".into(), account: "account".into(), model: "model-a".into(), effort: "high".into(),
             outcome: "success".into(), input: 10, output: 20, cache_read: 5, tokens: 35,
             generation_ms: None, cost_matchable: matchable,

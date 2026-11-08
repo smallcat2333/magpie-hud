@@ -36,12 +36,15 @@ pub struct AppConfig {
     pub details_window: Option<WindowPlacement>,
     /// 是否置顶，默认 true。
     pub always_on_top: bool,
+    /// 数据源选择与系统凭据引用；兼容旧版配置，绝不保存查看密钥。
+    #[serde(default)]
+    pub connection: crate::remote::ConnectionConfig,
 }
 
 impl Default for AppConfig {
     /// 返回首次运行配置：默认路径、本机显示地址、无保存位置、置顶。
     fn default() -> Self {
-        Self { usage_jsonl_path: String::new(), magpie_host: "127.0.0.1:3425".to_string(), window: None, details_window: None, always_on_top: true }
+        Self { usage_jsonl_path: String::new(), magpie_host: "127.0.0.1:3425".to_string(), window: None, details_window: None, always_on_top: true, connection: crate::remote::ConnectionConfig::default() }
     }
 }
 
@@ -112,10 +115,15 @@ mod tests {
         let old=r#"{"usageJsonlPath":"","magpieHost":"127.0.0.1:3425","window":null,"alwaysOnTop":true}"#;
         let mut config:AppConfig=serde_json::from_str(old).unwrap();
         assert_eq!(config.details_window,None);
+        assert_eq!(config.connection.mode, "local");
+        assert!(config.connection.credential_ref.is_none());
+        config.connection.remote_url = "https://hud.example.com".into();
+        config.connection.credential_ref = Some("remote-hud".into());
         config.details_window=Some(WindowPlacement{x:-120.0,y:80.0,width:960.0,height:720.0});
         let restored:AppConfig=serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
         assert_eq!(restored.details_window,config.details_window);
         assert_eq!(restored.window,None);
+        assert_eq!(restored.connection, config.connection);
     }
 
     /// 空路径回到默认日志，空白地址与关闭置顶必须原样保存。

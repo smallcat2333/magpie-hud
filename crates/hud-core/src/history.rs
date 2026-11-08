@@ -6,7 +6,7 @@ use crate::usage::{parse_history_line, ParsedHistoryLine, RawHistoryRecord};
 use chrono::{Duration, NaiveDate};
 #[cfg(test)]
 use chrono::Local;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -29,7 +29,8 @@ const MAX_DISCARD_BYTES: u64 = 1024 * 1024;
 const MATCH_TOLERANCE_MS: i64 = 1_000;
 
 /// 一次真实请求的履历行；完成行来自日志，运行行来自 trace，均不含正文。
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteHistoryRow {
     pub id: String,
@@ -81,7 +82,8 @@ pub struct RouteHistoryRow {
 
 /// 一次用户输入（轮）的履历组：连续且轮次序号相同的请求合并为一行。
 /// 无轮次记录的请求各自单独成组（requests 只有一行）。
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteHistoryGroup {
     /// 组内首个请求的 id，展开状态按它记忆。
@@ -115,7 +117,8 @@ pub struct RouteHistoryGroup {
 
 /// 履历查询结果；覆盖范围显式说明，不把“窗口内无记录”说成“没有历史”。
 /// 条数限制按组计：rows 是已选组内请求的扁平视图，兼容按请求读取的调用方。
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteHistoryData {
     pub session: String,

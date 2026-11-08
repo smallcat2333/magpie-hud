@@ -1,0 +1,32 @@
+[Unit]
+Description=Magpie HUD server (read-only collector and web dashboard)
+After=network-online.target magpie.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=magpie-hud
+Group=magpie-hud
+# Replace MAGPIE_USER with the account running Magpie, and keep the absolute
+# paths identical to /etc/magpie-hud-server/config.json.
+Environment=TZ=Asia/Shanghai
+Environment=RUST_LOG=info
+ExecStart=/opt/magpie-hud-server/magpie-hud-server --config /etc/magpie-hud-server/config.json serve
+Restart=on-failure
+RestartSec=3
+# Read-only access to the Magpie log directory, plus the HUD's own state.
+ReadWritePaths=/var/lib/magpie-hud-server
+ProtectSystem=strict
+ProtectHome=read-only
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

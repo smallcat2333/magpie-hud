@@ -79,6 +79,14 @@ pub struct Telemetry {
 
 impl Telemetry {
     /// 全局小时费用直接取网关序列；会话序列不存在，只记录之后的真实累计增量。
+    pub fn bind_cache(&mut self, path: std::path::PathBuf) {
+        self.hourly.bind_cache(path);
+    }
+
+    pub fn disable_persistence(&mut self) {
+        self.hourly.disable_persistence();
+    }
+
     pub fn update_usage(&mut self, usage: Usage, host: &str) {
         self.hourly.observe(&usage, chrono::Local::now(), host);
         self.cost_error = self.hourly.error.clone();

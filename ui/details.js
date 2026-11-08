@@ -24,8 +24,20 @@
     return scale ? `${sign}${(absolute / scale[0]).toFixed(1)}${scale[1]}` : number.format(value);
   }
   const node = (tag, text, className) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; if (className) el.className = className; return el; };
-  function localDate(date = new Date()) { return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`; }
-  function offset(date, days) { const d = new Date(`${date}T12:00:00`); d.setDate(d.getDate()+days); return localDate(d); }
+  function ymd(date) { return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`; }
+  function formatInstant(date) {
+    const zone = window.HudData.timeZone();
+    if (zone) {
+      try { return new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date); }
+      catch { /* 未知时区时再退回日历分量 */ }
+    }
+    return ymd(date);
+  }
+  function localDate(date) {
+    if (date instanceof Date) return formatInstant(date);
+    return window.HudData.today() || (window.HudData.preview ? ymd(new Date()) : '');
+  }
+  function offset(date, days) { const [year, month, day] = date.split('-').map(Number); const value = new Date(year, month - 1, day + days, 12); return ymd(value); }
   function dayStart(date) { return new Date(`${date}T00:00:00`).getTime(); }
   function stamp(value) { return new Date(value).toLocaleString('zh-CN', { hour12:false }); }
   function sourceLabel(r) { return `${r.agent} · ${r.callerKeyName && r.callerKeyName !== '本机' ? window.hudRedact.text(r.callerKeyName) : (r.callerKeyName || '本机')}`; }
@@ -114,15 +126,15 @@
   $('detail-close').addEventListener('click',()=>windowAction('close'));
   $('detail-minimize').addEventListener('click',()=>windowAction('minimize'));
   $('detail-maximize').addEventListener('click',()=>windowAction('toggleMaximize'));
-  document.querySelector('.page-head').addEventListener('dblclick',e=>{if(!e.target.closest('button'))windowAction('toggleMaximize');});
-  for (const direction of ['North','South','East','West','NorthEast','NorthWest','SouthEast','SouthWest']) {
+  document.querySelector('.page-head').addEventListener('dblclick', e => { if (window.HudData.shell && !e.target.closest('button')) windowAction('toggleMaximize'); });
+  if (window.HudData.shell) for (const direction of ['North','South','East','West','NorthEast','NorthWest','SouthEast','SouthWest']) {
     const edge=node('div',undefined,`window-resize ${direction}`);edge.setAttribute('aria-hidden','true');
     edge.addEventListener('pointerdown',e=>{if(e.button===0&&window.__TAURI__){e.preventDefault();window.__TAURI__.window.getCurrentWindow().startResizeDragging(direction).catch(()=>{});}});
     document.body.append(edge);
   }
   document.addEventListener('pointerdown', e => { document.querySelectorAll('.filter[open]').forEach(d => { if (!d.contains(e.target)) d.open = false; }); });
   document.addEventListener('keydown', e => {
-    if(e.key === 'Escape' && !e.isComposing) { e.preventDefault(); windowAction('close'); }
+    if(e.key === 'Escape' && window.HudData.shell && !e.isComposing) { e.preventDefault(); windowAction('close'); }
   });
 
   function renderChips() {
@@ -195,11 +207,11 @@
     while (cycleActive < 2 && cycleQueue.length) {
       const job = cycleQueue.shift();
       cycleActive++;
-      const query = window.__TAURI__
-        ? window.__TAURI__.core.invoke('query_usage_details',{start:job.start,end:job.end,filters:job.filters})
-        : (window.hudDetailsPreviewQuery?window.hudDetailsPreviewQuery(job.start,job.end):Promise.reject(new Error('无数据源')));
+      const query = window.HudData.preview
+        ? (window.hudDetailsPreviewQuery?window.hudDetailsPreviewQuery(job.start,job.end):Promise.reject(new Error('预览尚未注入数据')))
+        : window.HudData.invoke('query_usage_details',{start:job.start,end:job.end,filters:job.filters});
       query.then(result=>{ if(data===job.sourceData){result.rows.forEach(r=>{r.accountKey=JSON.stringify([r.provider,r.account]);});job.entry.status='ready';job.entry.data=result;} })
-        .catch(error=>{ if(data===job.sourceData){job.entry.status='error';job.entry.error=String(error);} })
+        .catch(error=>{ if(data===job.sourceData && !error?.hudStale){job.entry.status='error';job.entry.error=String(error);} })
         .finally(()=>{ cycleActive--; if(data===job.sourceData)render(); pumpCycleUsage(); });
     }
   }
@@ -376,7 +388,9 @@
 
   async function load(fullCycle = null) {
     const start=$('start').value,end=$('end').value;
-    if(!start||!end||start>end||end>localDate()||(dayStart(end)-dayStart(start))/86400000>365){$('load-status').hidden=false;$('load-status').dataset.error='true';$('load-status').textContent='请选择有效日期范围，结束日期不晚于今天，一次最多 366 天';return;}
+    const today=localDate();
+    if(!today&&!window.HudData.preview){$('load-status').hidden=false;$('load-status').dataset.error='true';$('load-status').textContent='尚未取得服务器日期';return;}
+    if(!start||!end||start>end||(today&&end>today)||(dayStart(end)-dayStart(start))/86400000>365){$('load-status').hidden=false;$('load-status').dataset.error='true';$('load-status').textContent='请选择有效日期范围，结束日期不晚于今天，一次最多 366 天';return;}
     const keepView=data?.start===start && data?.end===end;
     const id=++request;loading=true;if(!keepView){data=null;clearDrill();}$('load-status').hidden=false;$('load-status').dataset.error='false';$('load-status').textContent='正在读取用量…';
     document.querySelector('main').setAttribute('aria-busy','true');$('refresh').disabled=true;
@@ -385,8 +399,9 @@
       document.querySelectorAll('.metric-value').forEach(v=>v.textContent='—');
     }
     try {
-      const result=window.__TAURI__?await window.__TAURI__.core.invoke('query_usage_details',{start,end,filters:filterPayload()})
-        :await (window.hudDetailsPreviewQuery?window.hudDetailsPreviewQuery(start,end):Promise.reject(new Error('独立预览未注入数据，请从 HUD 打开详情')));
+      const result=window.HudData.preview
+        ?await (window.hudDetailsPreviewQuery?window.hudDetailsPreviewQuery(start,end):Promise.reject(new Error('预览尚未注入数据，请从 HUD 打开详情')))
+        :await window.HudData.invoke('query_usage_details',{start,end,filters:filterPayload()});
       if(id!==request)return;
       if(result.start!==start||result.end!==end)throw new Error('返回的统计日期与所选范围不一致');
       data=result;labels=new Map();data.rows.forEach(r=>{r.accountKey=JSON.stringify([r.provider,r.account]);labels.set(r.sourceKey,sourceLabel(r));});cycleUsageMap.clear();
@@ -394,10 +409,13 @@
       $('load-status').hidden=true;$('warnings').textContent=data.warnings.join('；');
       $('updated').textContent=`更新于 ${new Date().toLocaleTimeString('zh-CN',{hour12:false})} · ${data.start} — ${data.end}`;
       buildFilters();render();
-    } catch(error){if(id!==request)return;$('load-status').dataset.error='true';$('load-status').textContent=`读取失败：${String(error)}。可点击刷新重试。`;}
+    } catch(error){if(id!==request)return;if(error?.hudStale)return;$('load-status').dataset.error='true';$('load-status').textContent=`读取失败：${String(error)}。可点击刷新重试。`;}
     finally{if(id===request){loading=false;$('refresh').disabled=false;document.querySelector('main').setAttribute('aria-busy','false');}}
   }
   function applyContext(context) {
+    if(context.today) window.HudData.noteToday(context.today);
+    const today=localDate();
+    if(today) $('start').max=$('end').max=today;
     metric=metricNames[context.metric]?context.metric:'tokens';
     resetFilters();if(context.source&&context.source!=='*')filters.sourceKey.add(context.source);session=context.session||'';
     $('start').value=context.date||localDate();$('end').value=context.date||localDate();$('grain').value='hour';view='trend';mode='groups';render();load();
@@ -424,11 +442,23 @@
       control.value=value;control.dispatchEvent(new Event('change',{bubbles:true}));
     },()=>!control.disabled);
   });
-  $('start').max=$('end').max=localDate();
   if(innerWidth<640)document.querySelector('.filter-disclosure').open=false;
   async function start() {
-    if(window.__TAURI__){await window.__TAURI__.event.listen('usage-details-context',e=>applyContext(e.payload));applyContext(await window.__TAURI__.core.invoke('usage_details_context'));}
-    else {window.addEventListener('hud-details-preview-context',e=>applyContext(e.detail));const ctx=new URLSearchParams(location.search);applyContext({metric:ctx.get('metric'),date:ctx.get('date'),source:ctx.get('source'),session:ctx.get('session')});}
+    // 详情只带自己的筛选上下文，不订阅主快照，避免实时路由覆盖日期和来源。
+    if(!window.HudData.preview){
+      try { await window.HudData.serverToday(); } catch(error) { $('load-status').hidden=false; $('load-status').textContent=String(error?.message||error); }
+    }
+    const today=localDate();
+    if(today) $('start').max=$('end').max=today;
+    if(window.HudData.shell){
+      await window.HudData.listen('usage-details-context',payload=>applyContext(payload));
+      await window.HudData.listen('source-change',()=>{cycleUsageMap.clear();cycleQueue.length=0;if($('start').value&&$('end').value)load();});
+      applyContext(await window.HudData.invoke('usage_details_context'));
+      return;
+    }
+    if(window.HudData.preview) window.addEventListener('hud-details-preview-context',e=>applyContext(e.detail));
+    const ctx=new URLSearchParams(location.search);
+    applyContext({metric:ctx.get('metric'),date:ctx.get('date'),source:ctx.get('source'),session:ctx.get('session'),today:ctx.get('today')});
   }
   start().catch(error=>{$('load-status').hidden=false;$('load-status').textContent=String(error);});
 })();

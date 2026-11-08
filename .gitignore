@@ -1,5 +1,6 @@
 /out/
 /dist/
+/target/
 /rust/target/
 /src-tauri/target/
 /src-tauri/target-v008/

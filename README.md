@@ -7,7 +7,7 @@ cargo install tauri-cli --version "^2.0.0" --locked
 cargo tauri dev
 ```
 
-使用 **Tauri 2 + 系统 WebView** 构建桌面悬浮窗，支持 Windows，并提供 macOS Apple Silicon 构建配置。完成用量只读 Magpie 的 `usage.jsonl`，进行中状态只读本机网关 `/v1/magpie/trace` 与 `/v1/magpie/concurrency`；显示会话名称、流动路由及本次 Token/TPS，底部默认显示两行带本地时间的说明，高度不超过 420px 时收为 28px 单行。不修改 Magpie、不读取密钥、不集成进 rs_agent_router。
+使用 **Tauri 2 + 系统 WebView** 构建桌面悬浮窗，支持 Windows，并提供 macOS Apple Silicon 构建配置。完成用量只读 Magpie 的 `usage.jsonl`，进行中状态只读本机网关 `/v1/magpie/trace` 与 `/v1/magpie/concurrency`；显示会话名称、流动路由及本次 Token/TPS，底部默认显示两行带本地时间的说明，高度不超过 420px 时收为 28px 单行。不修改 Magpie、不读取 Magpie 模型调用密钥、不集成进 rs_agent_router。远端模式使用独立的 HUD 查看密钥。
 
 **当前状态：支持自由缩放、横竖布局、实时路由、账号额度和费用估值。** 标题为 Magpie HUD，主背景 50% 不透明度配合 Windows 桌面合成 Acrylic 磨砂，聚焦和失焦保持相同底色，文字保持清晰。横窗来源不超过两个时与 Magpie 纵向排列；竖窗并排，保留来源图标并放大 Magpie。默认窗口 1120×400；拖动边缘/角落调整宽高，长宽比小于 1.25 或宽度小于 680px 时自动使用纵向布局；来源超过两个且宽度小于 980px 时也使用纵向布局。统计、来源与会话块随尺寸重排；高度不超过 420px 时，统计精简为 `Token | TPS | 费用`，日志收为 28px 单行，拉高后自动恢复。完整需求见 [SPEC](docs/spec/magpie-route-float-SPEC.md)，2026-10-20 的会话/统计增量见 [M2 档案](docs/feat/Feat_261019_2_分流图与托盘.md)。原始 [HTML 原型](docs/ui/magpie-hud.html) 保留为早期设计参考，实际程序使用 `ui/index.html`、`ui/hud.css` 和 `ui/hud.js`。
 
@@ -19,17 +19,21 @@ V.0.0.32 当前运行窗口（2026-10-28，真实数据，账号信息已脱敏�
 
 路由决策按已确认的组路径和实际模型尝试展示，支持 Jev 等判定模型图标、轮初沿用、规则与轮次、判定耗时及会话悬停联动。耗时位于连线上方，低于 1 秒为绿、1 至不足 2 秒为黄、达到 2 秒为红；已确认经过的连线先展示至少 1 秒光点，再转为绿色实线，尚未确认部分保持浅灰。详见 [路由决策说明](docs/ui/decision-route.md)。
 
+## 远端 Magpie 查看
+
+把 Magpie 部署在 Linux 服务器后，可在同机运行无界面的 **magpie-hud-server**，由它读取完整路由、日志、额度和费用，再通过 HTTPS 提供给本地桌面 HUD 和网页。桌面设置中填写主 HUD 地址和 HUD 查看密钥即可，远端模式不要求本机安装 Magpie；普通本地模式保持原行为。安装、密钥、systemd 与 HTTPS/SSE 配置见 [远端查看说明](docs/remote-hud.md)。
+
 ## Windows x64 下载
 
 [GitHub Actions · Build Windows x64](https://github.com/smallcat2333/magpie-hud/actions/workflows/windows-x64.yml) 在推送到 `main`、推送 `v*` 标签或手动运行时执行 Rust 测试并构建 Windows x64 独立程序。
 
-打开成功的运行记录，在 **Artifacts** 中下载 `magpie-hud-版本号-windows-x64`，解压后包含 exe 和 `SHA256SUMS.txt`。构建产物保留 30 天，下载通常需要登录 GitHub。这是独立 exe，运行环境仍需 Windows 10/11 WebView2 Runtime 和本机 Magpie。
+打开成功的运行记录，在 **Artifacts** 中下载 `magpie-hud-版本号-windows-x64`，解压后包含 exe 和 `SHA256SUMS.txt`。构建产物保留 30 天，下载通常需要登录 GitHub。这是独立 exe，运行环境需 Windows 10/11 WebView2 Runtime；本地模式需要本机 Magpie，远端模式连接 HUD Server。
 
 ## macOS Apple Silicon 下载
 
 [GitHub Actions · Build macOS Apple Silicon](https://github.com/smallcat2333/magpie-hud/actions/workflows/macos-aarch64.yml) 在推送到 `main`、`v*` 标签或手动运行时，在 ARM64 Mac 上执行 Rust 测试并构建原生 `aarch64-apple-darwin` 应用，适用于 M 系列芯片，最低 macOS 11。
 
-成功运行的 **Artifacts** 中提供 `magpie-hud-版本号-macos-arm64`：包含 `.dmg`、保留应用结构的 `.app.zip` 和 `SHA256SUMS.txt`，保留 30 天。打开 DMG 后将应用拖入 Applications。当前构建没有 Developer ID 签名和 Apple 公证，macOS 可能阻止首次打开；确认来源后可在“系统设置 → 隐私与安全性”中允许打开。需要本机运行 Magpie；不读取另一台电脑的数据。
+成功运行的 **Artifacts** 中提供 `magpie-hud-版本号-macos-arm64`：包含 `.dmg`、保留应用结构的 `.app.zip` 和 `SHA256SUMS.txt`，保留 30 天。打开 DMG 后将应用拖入 Applications。当前构建没有 Developer ID 签名和 Apple 公证，macOS 可能阻止首次打开；确认来源后可在“系统设置 → 隐私与安全性”中允许打开。本地模式需要本机运行 Magpie；远端模式在设置中填写主 HUD 地址和查看密钥。
 
 macOS 配置位于 `~/Library/Application Support/magpie-hud/config.json`，自定义标题位于同目录的 `session-titles/`；默认用量日志为 `~/.config/magpie/usage.jsonl`。Desktop 标题从 `~/Library/Application Support/Claude`、`Claude-3p` 读取；Codex 使用 `CODEX_HOME` 或 `~/.codex`；子 Agent 元数据使用 `~/.claude/projects`。缺少数据目录时保留未知状态。
 
@@ -133,7 +137,9 @@ python scripts/verify_routing_window.py
 
 ## 变更记录
 
-当前程序版本是 `1.0.19`，标题显示为 `Magpie HUD V.1.0.19`。上方截图来自 v0.0.32，保留为实际运行示例。
+当前程序版本是 `1.0.20`，标题显示为 `Magpie HUD V.1.0.20`。上方截图来自 v0.0.32，保留为实际运行示例。
+
+2026-11-08 | 1.0.20 | 新增共享 Rust 采集核心、Linux HUD Server、独立查看密钥与网页登录、桌面远端连接设置；本地与远端共用统计和历史查询，已完成请求优先显示响应模型。远端一次查看一个实例，不叠加转发链两端总量。部署见远端查看说明。
 
 2026-11-05 | 1.0.19 | 启动单实例检查：Windows 下用命名互斥锁检测同一路径已运行实例，第二个进程向主窗口发置顶消息（恢复最小化）后退出；macOS/Linux 仍允许多实例。
 

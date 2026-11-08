@@ -1,0 +1,55 @@
+name: Build Linux HUD server
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Linux x86_64 HUD server
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-ci
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Test shared core and server
+        run: |
+          cargo test -p magpie-hud-core --locked
+          cargo test -p magpie-hud-server --locked
+
+      - name: Build server
+        run: cargo build -p magpie-hud-server --release --locked
+
+      - name: Prepare download
+        run: |
+          version=$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' src-tauri/tauri.conf.json | head -n1)
+          name="magpie-hud-server-$version-linux-x86_64"
+          mkdir -p "dist/$name"
+          cp "$CARGO_TARGET_DIR/release/magpie-hud-server" "dist/$name/"
+          cp deploy/config.example.json deploy/magpie-hud-server.service deploy/nginx.conf.example "dist/$name/"
+          cp docs/remote-hud.md "dist/$name/README.zh-CN.md"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > SHA256SUMS.txt)
+          echo "ARTIFACT_NAME=$name" >> "$GITHUB_ENV"
+
+      - name: Upload server and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30

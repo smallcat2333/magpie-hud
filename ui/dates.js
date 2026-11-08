@@ -29,7 +29,7 @@
   const pending = new Map();
   const cacheMs = 60_000;
 
-  function localDate() {
+  function browserToday() {
     const now = new Date();
     return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
   }
@@ -41,7 +41,7 @@
   }
 
   function latestDate() {
-    return live?.date || localDate();
+    return live?.latestDate || live?.date || window.HudData.today() || (window.HudData.preview ? browserToday() : '');
   }
 
   function dateLabel(date) {
@@ -102,13 +102,13 @@
     const cached = cache.get(date);
     if (cached && Date.now() - cached.at < cacheMs) return cached.view;
     if (!pending.has(date)) {
-      const task = window.__TAURI__
-        ? window.__TAURI__.core.invoke('query_date_stats', { date })
-        : Promise.resolve().then(() => {
-          // 仅独立预览接受外部 fixture，产品不生成任何演示统计。
+      const task = window.HudData.preview
+        ? Promise.resolve().then(() => {
+          // 仅显式预览接受外部 fixture，产品不生成任何演示统计。
           if (!window.hudDatePreviewQuery) throw new Error('预览尚未注入历史数据');
           return window.hudDatePreviewQuery(date);
-        });
+        })
+        : window.HudData.invoke('query_date_stats', { date });
       pending.set(date, task.then(view => {
         if (view.date !== date) throw new Error('返回日期与所选日期不一致');
         if (!view.costError) {
@@ -143,8 +143,10 @@
       if (id !== requestId) return;
       shown = view;
       earliest = view.earliestDate || earliest;
+      if (view.latestDate) window.HudData.noteToday(view.latestDate);
     } catch (error) {
       if (id !== requestId) return;
+      if (error?.hudStale) return;
       failure = String(error);
     } finally {
       if (id === requestId) { loading = false; render(); }
@@ -282,11 +284,12 @@
     renderCalendar();
     try {
       if (!monthPending.has(month)) {
-        const task = window.__TAURI__ ? window.__TAURI__.core.invoke('query_month_usage', { month })
-          : Promise.resolve().then(() => {
+        const task = window.HudData.preview
+          ? Promise.resolve().then(() => {
             if (!window.hudMonthPreviewQuery) throw new Error('预览尚未注入月份数据');
             return window.hudMonthPreviewQuery(month);
-          });
+          })
+          : window.HudData.invoke('query_month_usage', { month });
         monthPending.set(month, task.then(view => {
           if (view.month !== month || !Array.isArray(view.days)) throw new Error('返回月份与所选月份不一致');
           monthCache.set(month, { at: Date.now(), view });
@@ -298,8 +301,10 @@
       if (id !== calendarRequest || calendar.hidden) return;
       calendarView = view;
       earliest = view.earliestDate || earliest;
+      if (view.latestDate) window.HudData.noteToday(view.latestDate);
     } catch (error) {
       if (id !== calendarRequest) return;
+      if (error?.hudStale) return;
       calendarError = String(error);
     } finally {
       if (id === calendarRequest && !calendar.hidden) {
@@ -364,7 +369,16 @@
   window.addEventListener('hud-live-stats', event => {
     const old = live;
     live = event.detail;
+    if (live.latestDate || live.date) window.HudData.noteToday(live.latestDate || live.date);
     earliest = live.earliestDate || earliest || live.date;
+    if (reopenHistory) {
+      reopenHistory = false;
+      shown = null;
+      if (selectedDate) select(selectedDate, true);
+      else render();
+      if (!calendar.hidden && latestDate()) loadCalendar((selectedDate || latestDate()).slice(0, 7), true);
+      return;
+    }
     if (old && (old.host !== live.host || old.date !== live.date)) {
       cache.clear();
       monthCache.clear();
@@ -384,5 +398,18 @@
     }
     render();
     if (!calendar.hidden) renderCalendar();
+  });
+  let reopenHistory = false;
+  window.HudData.listen('source-change', () => {
+    cache.clear();
+    monthCache.clear();
+    pending.clear();
+    monthPending.clear();
+    ++requestId;
+    ++calendarRequest;
+    live = null;
+    shown = null;
+    failure = '';
+    reopenHistory = Boolean(selectedDate);
   });
 })();

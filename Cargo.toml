@@ -1,0 +1,4 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/hud-core", "crates/hud-server"]
+default-members = ["src-tauri"]

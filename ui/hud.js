@@ -150,13 +150,18 @@
   }
   window.hudModelIcon = modelIcon;
 
-  /** 展示统一为完成、运行、异常三类；异常类别按取消、失败、未知区分。 */
+  function linkStale() { return window.HudData.stale; }
+  function confirmedState(state) { return linkStale() && (state === 'running' || state === 'waiting') ? 'unknown' : state; }
+  function isLiveState(state) { return !linkStale() && (state === 'running' || state === 'waiting'); }
+
+  /** 展示统一为完成、运行、异常三类；断线时旧的运行不再算作当前活动。 */
   function statusInfo(card) {
-    switch (card.state) {
+    switch (confirmedState(card.state)) {
       case 'intermission': return ['', '间歇', 'intermission'];
       case 'delegating': return ['', '子任务', 'delegating'];
       case 'running': return ['', '运行', 'running'];
       case 'waiting': return ['', '运行', 'waiting'];
+      case 'unknown': return ['', '未知', 'unknown'];
       case 'success':
       case 'recovered': return ['√', '完成', 'success'];
       case 'cancelled': return ['x', '取消', 'error'];
@@ -185,9 +190,9 @@
   function createCard(card, session) {
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = `route-card ${card.state}${selectedCard === card.id ? ' selected' : ''}`;
+    button.className = `route-card ${confirmedState(card.state)}${selectedCard === card.id ? ' selected' : ''}`;
     button.dataset.cardId = card.id;
-    button.dataset.current = String(card.current);
+    button.dataset.current = String(Boolean(card.current) && !linkStale());
     button.setAttribute('role', 'listitem');
     const [symbol, state, status] = statusInfo(card);
     button.dataset.status = status;
@@ -196,14 +201,14 @@
     button.setAttribute('aria-label', tooltip.replaceAll('\n', '，'));
     const icon = document.createElement('span');
     icon.className = 'model-icon';
-    const selecting = ['running', 'waiting'].includes(card.state) && card.account === '正在选择账号';
+    const selecting = isLiveState(card.state) && card.account === '正在选择账号';
     const family = modelIcon(card.model) || (/feishu|lark|飞书/i.test(card.provider || '') ? 'feishu' : null);
     if (family) {
       const image = document.createElement('img');
       image.src = `icons/${family}.svg`;
       image.alt = family.replace('-color', '');
       icon.append(image);
-    } else if (selecting || ['running', 'waiting'].includes(card.state) && (!card.model || /^(正在选择账号|正在选择模型|正在选路|模型待定)$/.test(card.model))) {
+    } else if (selecting || isLiveState(card.state) && (!card.model || /^(正在选择账号|正在选择模型|正在选路|模型待定)$/.test(card.model))) {
       icon.title = '正在选路';
       const routing = document.createElementNS(namespace, 'svg');
       routing.setAttribute('class', 'routing-icon');
@@ -381,11 +386,11 @@
 
   /** 只挂载有活跃模型请求的子 Agent，编号在所属会话内保持稳定。 */
   function activeSubagents(session) {
-    return (session.subagents || []).filter(card => ['running', 'waiting'].includes(card.state));
+    return (session.subagents || []).filter(card => isLiveState(card.state));
   }
 
   function sessionIsActive(session) {
-    return session.routes.some(card => ['running', 'waiting'].includes(card.state)) || activeSubagents(session).length > 0;
+    return session.routes.some(card => isLiveState(card.state)) || activeSubagents(session).length > 0;
   }
 
   /** 父会话独立保序十分钟；只有真实请求活动才重置，子项的一分钟保留不续期。 */
@@ -517,7 +522,7 @@
 
   /** 每个会话只展示一张主卡；活跃时选最新路由，结束后沿用后端标记的当前记录。 */
   function primaryCard(session) {
-    const active = session.routes.filter(card => ['running', 'waiting'].includes(card.state));
+    const active = session.routes.filter(card => isLiveState(card.state));
     if (active.length) return active.reduce((latest, card) =>
       (card.routeId || 0) > (latest.routeId || 0) ? card : latest);
     return session.routes.find(card => card.current) || session.routes[0] || parentAnchor(session);
@@ -892,6 +897,18 @@
       const windows = quota.windows.length ? [...quota.windows].sort((a, b) => windowRank(a) - windowRank(b)) : [null];
       entries.push({ key, card, models, quota, windows });
     }
+    if (byId('quota-scope').value === 'all') {
+      const shown = new Set(entries.map(entry => entry.quota));
+      for (const quota of snapshot.quotas || []) {
+        if (shown.has(quota)) continue;
+        const account = quota.user || quota.name || quota.provider;
+        const key = JSON.stringify([quota.provider.toLowerCase(), account, quota.name]);
+        const read = quota.readAt || quota.asOf;
+        if (read && !Number.isNaN(Date.parse(read))) readings.push(new Date(read));
+        entries.push({ key, card: { provider: quota.provider, account }, models: new Set(), quota,
+          windows: quota.windows.length ? [...quota.windows].sort((a, b) => windowRank(a) - windowRank(b)) : [null] });
+      }
+    }
     const orderKey = entries.map(entry => entry.key).join('\n');
     if (!forceOrder && quotaRenderKey && orderKey !== quotaRenderKey) {
       const ranks = new Map(quotaRenderKey.split('\n').map((key, index) => [key, index]));
@@ -938,6 +955,8 @@
     updateQuotaClocks();
     window.hudMotion.layout(before, [...quotaViews.values()].map(view => view.item), node => node.dataset.quotaKey);
   }
+
+  byId('quota-scope').addEventListener('change', () => { quotaRenderKey = ''; render(false); });
 
   /** 同一账号只展示最短窗口；无法识别时排在已知窗口之后。 */
   function windowRank(span) {
@@ -1356,14 +1375,14 @@
     let sessions = chooseSessions();
     const before = window.hudMotion.capture(routeList.querySelectorAll('.route-card'), node => node.dataset.motionKey);
     const oldScroll = routeList.scrollTop;
-    hud.dataset.state = snapshot.state;
-    text('watch-label', snapshot.watchLabel);
-    byId('watch-label').title = snapshot.error || snapshot.watchLabel;
+    hud.dataset.state = linkStale() ? 'disconnected' : snapshot.state;
+    text('watch-label', watchText(snapshot));
+    byId('watch-label').title = snapshot.error || window.HudData.connectionError() || watchText(snapshot);
     text('router-host', snapshot.magpieHost);
     renderSources(sessions);
     window.dispatchEvent(new CustomEvent('hud-live-stats', { detail: {
       daily: session ? session.daily : statsForSource(snapshot),
-      date: snapshot.date, earliestDate: snapshot.earliestDate, host: snapshot.magpieHost,
+      date: snapshot.date, latestDate: snapshot.latestDate || snapshot.date, earliestDate: snapshot.earliestDate, host: snapshot.magpieHost,
       scope: session ? session.label : statsScope(), costError: snapshot.costError,
       agentScope: selectedAgent, agentScopeLabel: statsScope(),
       projectMonth: view => {
@@ -1448,7 +1467,7 @@
     routeList.scrollTop = oldScroll;
     byId('empty-route').hidden = sessions.length > 0;
     const inbound = byId('inbound-active');
-    const hasRequests = sessions.some(item => item.routes.some(card => ['running', 'waiting'].includes(card.state)) || activeSubagents(item).length);
+    const hasRequests = sessions.some(item => item.routes.some(card => isLiveState(card.state)) || activeSubagents(item).length);
     inbound.classList.toggle('flowing', hasRequests);
     inbound.style.opacity = sessions.length ? '1' : '0';
     const picked = sessions.flatMap(item => [primaryCard(item), ...subagentsForView(item, Boolean(session))]).find(card => card.id === selectedCard);
@@ -1646,12 +1665,14 @@
   /** 忽略比已渲染快照更旧的启动结果，避免订阅与首次拉取竞态。 */
   function acceptSnapshot(next, animate) {
     if (snapshot && next.revision < snapshot.revision) return;
-    if (snapshot && next.revision === snapshot.revision) return;
+    if (snapshot && next.revision === snapshot.revision && snapshot.state === next.state) return;
     snapshot = next;
+    window.HudData.noteToday(next.latestDate || next.date);
     for (const session of next.sessions || []) {
       window.hudRedact.remember(session.callerKeyName);
       for (const card of [...(session.routes || []), ...(session.subagents || []), ...(session.completedSubagents || []), ...(session.quotaRoutes || [])]) window.hudRedact.remember(card.account);
     }
+    for (const quota of next.quotas || []) window.hudRedact.remember(quota.user || quota.name);
     Object.values(next.callerKeyNames || {}).forEach(window.hudRedact.remember);
     updateChildPresence(next);
     updateSessionOrder(next);
@@ -1659,10 +1680,244 @@
     render(animate);
   }
 
-  /** IPC 错误必须可见，置顶失败不静默更换图标。 */
+  /** IPC 或网页传输错误必须可见，置顶失败不静默更换图标。 */
   function reportError(error) {
     hud.dataset.state = 'warning';
-    text('watch-label', String(error));
+    text('watch-label', String(error?.message || error));
+  }
+
+  function watchText(next) {
+    if (!next) return '';
+    if (linkStale() && next.state !== 'disconnected') return `${next.watchLabel} · 连接中断，显示最近数据`;
+    return next.watchLabel;
+  }
+
+  /** 断线先留下最后的路由，但去掉仍在流动的运行态。 */
+  function softenLiveRoutes() {
+    if (linkStale()) hud.dataset.state = 'disconnected';
+    routeList.querySelectorAll('.route-card.running, .route-card.waiting').forEach(card => {
+      card.classList.remove('running', 'waiting');
+      card.classList.add('unknown');
+      card.dataset.current = 'false';
+      card.querySelector('.request-spinner')?.remove();
+      const tag = card.querySelector('.state-tag');
+      if (tag) { tag.dataset.status = 'unknown'; const label = tag.querySelector('.state-text'); if (label) label.textContent = '未知'; }
+    });
+    byId('inbound-active')?.classList.remove('flowing');
+    requestDraw();
+  }
+
+  /** 换源后丢掉快照代际，查询缓存由各页自己清；路由先降为未知，等新快照替换。 */
+  function resetForSourceChange() {
+    snapshot = null;
+    softenLiveRoutes();
+  }
+
+  function applyStreamState() {
+    hud.dataset.stream = window.HudData.stale ? 'stale' : 'live';
+    if (window.HudData.stale) softenLiveRoutes();
+    if (!snapshot) {
+      if (window.HudData.stale) text('watch-label', window.HudData.connectionError() || '远端已断开 · 最后数据');
+      return;
+    }
+    const label = watchText(snapshot);
+    text('watch-label', label);
+    byId('watch-label').title = snapshot.error || window.HudData.connectionError() || label;
+    // Reconnect may resend the same revision. Restore the visual running state
+    // even when the complete snapshot is deduplicated by the transport.
+    render(false);
+  }
+
+  function bindShellChrome() {
+    document.addEventListener('contextmenu', event => {
+      if (!event.target.closest('input,textarea,select')) event.preventDefault();
+    });
+    if (!window.HudData.shell) return;
+    const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
+    document.querySelectorAll('[data-resize]').forEach(handle => {
+      handle.addEventListener('pointerdown', event => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        window.__TAURI__.webviewWindow.getCurrentWebviewWindow()
+          .startResizeDragging(handle.dataset.resize).catch(reportError);
+      });
+    });
+    byId('hide-window').addEventListener('click', () => invoke('hide_window').catch(reportError));
+    byId('close-window').addEventListener('click', () => invoke('close_window').catch(reportError));
+    byId('drag-region').addEventListener('pointerdown', event => {
+      if (event.button === 0 && !event.target.closest('button,select,label,input,textarea')) {
+        window.__TAURI__.webviewWindow.getCurrentWebviewWindow().startDragging().catch(reportError);
+      }
+    });
+  }
+
+  function bindConnectionSettings() {
+    const dialog = byId('connection-dialog');
+    const opener = byId('settings');
+    const form = byId('connection-form');
+    const url = byId('connection-url');
+    const key = byId('connection-key');
+    const hint = byId('connection-key-hint');
+    const status = byId('connection-status');
+    const test = byId('connection-test');
+    const forget = byId('connection-forget');
+    const logout = byId('connection-logout');
+    const instance = byId('connection-instance');
+    let hasCredential = false;
+    let busy = false;
+    const capsText = caps => {
+      if (!caps || typeof caps !== 'object') return '可以连接';
+      const lines = [];
+      if (caps.instanceId) lines.push(`实例 ${caps.instanceId}`);
+      if (caps.timezone) lines.push(`时区 ${caps.timezone}`);
+      if (Array.isArray(caps.checks)) {
+        for (const check of caps.checks) {
+          const name = check?.label || check?.name || '检查';
+          const detail = check?.detail ? `：${check.detail}` : '';
+          lines.push(`${check?.ok ? '通过' : '失败'} ${name}${detail}`);
+        }
+      }
+      return lines.length ? lines.join('\n') : '可以连接';
+    };
+    const setBusy = value => {
+      busy = value;
+      for (const control of [test, byId('connection-save'), forget, logout, ...form.elements]) control.disabled = value;
+    };
+    const syncMode = () => {
+      const remote = form.elements.mode.value === 'remote';
+      url.disabled = !remote || busy;
+      key.disabled = !remote || busy;
+      test.disabled = !remote || busy;
+      hint.hidden = !remote;
+      hint.textContent = hasCredential ? '已保存密钥。留空则保留，填写则替换。' : '远端需要访问密钥。';
+    };
+    const applySettings = settings => {
+      form.elements.mode.value = settings?.mode === 'remote' ? 'remote' : 'local';
+      url.value = settings?.remoteUrl || '';
+      key.value = '';
+      hasCredential = Boolean(settings?.hasCredential);
+      syncMode();
+    };
+    const renderInstance = () => {
+      if (window.HudData.preview) {
+        instance.textContent = '预览模式只接收演示数据，不会登录或保存密钥。';
+        logout.hidden = true;
+        return;
+      }
+      logout.hidden = false;
+      const env = window.HudData.envelope;
+      const caps = window.HudData.capabilities;
+      const lines = [
+        `实例 ${env?.instanceId || caps?.instanceId || '—'}`,
+        `启动 ${env?.bootId || caps?.bootId || '—'}`,
+        `序号 ${env?.revision ?? '—'}`,
+      ];
+      if (caps?.timezone) lines.push(`时区 ${caps.timezone}`);
+      if (caps?.protocolVersion != null) lines.push(`协议 ${caps.protocolVersion}`);
+      if (env?.collectedAt) lines.push(`采集 ${env.collectedAt}`);
+      const collectors = caps?.collectors;
+      if (collectors && typeof collectors === 'object') {
+        const names = ['logs', 'trace', 'quotas', 'usage'].filter(name => collectors[name]);
+        if (names.length) lines.push(`采集 ${names.join('、')}`);
+        if (collectors.concurrency && collectors.concurrency.available === false) {
+          lines.push(`并发不可用${collectors.concurrency.error ? `：${collectors.concurrency.error}` : ''}`);
+        }
+      }
+      if (window.HudData.stale) lines.push('实时连接中断，画面仍是最近数据');
+      instance.textContent = lines.join('\n');
+    };
+    const closeDialog = () => {
+      dialog.hidden = true;
+      opener.setAttribute('aria-expanded', 'false');
+      key.value = '';
+      opener.focus();
+    };
+    const openDialog = async () => {
+      dialog.hidden = false;
+      opener.setAttribute('aria-expanded', 'true');
+      status.textContent = '';
+      if (!window.HudData.shell) {
+        byId('connection-desktop').hidden = true;
+        byId('connection-browser').hidden = false;
+        renderInstance();
+        byId('connection-close').focus();
+        return;
+      }
+      byId('connection-desktop').hidden = false;
+      byId('connection-browser').hidden = true;
+      status.textContent = '正在读取连接…';
+      try {
+        const current = await window.HudData.connectionSettings();
+        applySettings(current);
+        status.textContent = current?.credentialError || '';
+      } catch (error) {
+        status.textContent = error?.message || String(error);
+      }
+      byId('connection-close').focus();
+    };
+    opener.addEventListener('click', () => dialog.hidden ? openDialog() : closeDialog());
+    byId('connection-close').addEventListener('click', closeDialog);
+    dialog.addEventListener('pointerdown', event => { if (event.target === dialog) closeDialog(); });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !dialog.hidden) { event.preventDefault(); closeDialog(); }
+    });
+    form.elements.mode.forEach(input => input.addEventListener('change', syncMode));
+    test.addEventListener('click', async () => {
+      if (busy) return;
+      setBusy(true);
+      status.textContent = '正在测试…';
+      try { status.textContent = capsText(await window.HudData.testConnection({ remoteUrl: url.value.trim(), key: key.value })); }
+      catch (error) { status.textContent = error?.message || String(error); }
+      finally { setBusy(false); syncMode(); }
+    });
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      if (busy) return;
+      const mode = form.elements.mode.value === 'remote' ? 'remote' : 'local';
+      const remoteUrl = url.value.trim();
+      if (mode === 'remote' && !/^https?:\/\//i.test(remoteUrl)) {
+        status.textContent = '远端地址需要以 http:// 或 https:// 开头';
+        return;
+      }
+      const typed = key.value;
+      setBusy(true);
+      status.textContent = '正在保存…';
+      try {
+        const saved = await window.HudData.saveConnection({ mode, remoteUrl, key: mode === 'remote' ? typed : '' });
+        applySettings(saved && saved.mode ? saved : await window.HudData.connectionSettings());
+        status.textContent = saved?.credentialError || (mode === 'remote' ? '已改为远端连接' : '已改为本地连接');
+      } catch (error) {
+        status.textContent = error?.message || String(error);
+      } finally { setBusy(false); syncMode(); }
+    });
+    forget.addEventListener('click', async () => {
+      if (busy) return;
+      setBusy(true);
+      status.textContent = '正在清除…';
+      try {
+        const saved = await window.HudData.forgetConnection();
+        applySettings(saved && typeof saved === 'object' ? saved : { mode: 'local', remoteUrl: '' });
+        status.textContent = saved?.credentialError || '已清除保存的远端连接';
+      } catch (error) {
+        status.textContent = error?.message || String(error);
+      } finally { setBusy(false); syncMode(); }
+    });
+    logout.addEventListener('click', async () => {
+      if (busy) return;
+      setBusy(true);
+      status.textContent = '正在退出…';
+      try {
+        closeDialog();
+        await window.HudData.logout();
+      } catch (error) {
+        dialog.hidden = false;
+        status.textContent = error?.message || String(error);
+      } finally { setBusy(false); }
+    });
+    if (!window.HudData.shell) {
+      window.HudData.listen('route-update', () => { if (!dialog.hidden) renderInstance(); });
+      window.HudData.listen('stale', () => { if (!dialog.hidden) renderInstance(); });
+    }
   }
 
   /** 先完成事件订阅，再拉取后端已缓存快照；只在 Tauri 环境访问原生 API。 */
@@ -1765,15 +2020,19 @@
       render(false);
       window.hudHistory?.redraw();
     });
-    if (!window.__TAURI__) {
+    if (window.HudData.preview) {
       text('watch-label', '界面预览 · 等待演示数据');
+      window.addEventListener('hud-preview-snapshot', event => acceptSnapshot(event.detail, true));
       return;
     }
-    const { invoke } = window.__TAURI__.core;
-    await window.__TAURI__.event.listen('route-update', event => acceptSnapshot(event.payload, true));
-    await window.__TAURI__.event.listen('config-error', event => reportError(event.payload));
-    const initial = await invoke('startup_state');
-    acceptSnapshot(initial.snapshot, false);
+    await window.HudData.listen('source-change', resetForSourceChange);
+    await window.HudData.listen('route-update', payload => acceptSnapshot(payload, true));
+    await window.HudData.listen('config-error', payload => reportError(payload));
+    await window.HudData.listen('stale', applyStreamState);
+    const initial = await window.HudData.startup();
+    if (initial?.snapshot) acceptSnapshot(initial.snapshot, false);
+    if (!window.HudData.shell) return;
+    const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
     const pin = byId('pin');
     pin.setAttribute('aria-pressed', String(initial.pinned));
     pin.title = initial.pinned ? '置顶已开启' : '置顶已关闭';
@@ -1786,21 +2045,6 @@
       } catch (error) { reportError(error); }
       finally { pin.disabled = false; }
     });
-    document.querySelectorAll('[data-resize]').forEach(handle => {
-      handle.addEventListener('pointerdown', event => {
-        if (event.button !== 0) return;
-        event.preventDefault();
-        window.__TAURI__.webviewWindow.getCurrentWebviewWindow()
-          .startResizeDragging(handle.dataset.resize).catch(reportError);
-      });
-    });
-    byId('hide-window').addEventListener('click', () => invoke('hide_window').catch(reportError));
-    byId('close-window').addEventListener('click', () => invoke('close_window').catch(reportError));
-    // 右键不触发任何菜单；输入控件保留系统编辑菜单。
-    document.addEventListener('contextmenu', event => { if (!event.target.closest('input,textarea,select')) event.preventDefault(); });
-    byId('drag-region').addEventListener('pointerdown', event => {
-      if (event.button === 0 && !event.target.closest('button,select,label')) window.__TAURI__.webviewWindow.getCurrentWebviewWindow().startDragging().catch(reportError);
-    });
   }
 
   // 六项指标共用一个详情窗口，显式携带当前范围；详情筛选不反向修改 HUD。
@@ -1808,18 +2052,22 @@
   async function openDetails(metric) {
     const historical = hud.dataset.statsHistory === 'true';
     const context = {
-      metric, date: byId('stats-date').dateTime || snapshot?.date,
+      metric, date: byId('stats-date').dateTime || snapshot?.date || '',
       source: selectedAgent,
       session: historical || selector.value === '*' ? '' : selector.value,
+      today: snapshot?.latestDate || snapshot?.date || window.HudData.today() || '',
     };
     try {
-      if (window.__TAURI__) await window.__TAURI__.core.invoke('open_usage_details', { context });
+      if (window.HudData.shell) await window.__TAURI__.core.invoke('open_usage_details', { context });
       else {
-        const url = `details.html?${new URLSearchParams(context)}`;
-        if (detailsPreview && !detailsPreview.closed) {
+        const params = new URLSearchParams();
+        for (const [key, value] of Object.entries(context)) if (value) params.set(key, value);
+        if (window.HudData.preview) params.set('preview', '1');
+        const url = `details.html?${params}`;
+        if (window.HudData.preview && detailsPreview && !detailsPreview.closed) {
           detailsPreview.dispatchEvent(new CustomEvent('hud-details-preview-context', { detail: context }));
           detailsPreview.focus();
-        } else detailsPreview = window.open(url, 'hud-usage-details', 'width=960,height=720');
+        } else detailsPreview = window.open(url, 'hud-usage-details');
       }
     } catch (error) { reportError(error); }
   }
@@ -1840,7 +2088,7 @@
     } }));
   });
 
-  // 独立浏览器验证可通过已声明事件注入脱敏 fixture；产品从不自行生成演示数据。
-  window.addEventListener('hud-preview-snapshot', event => { if (!window.__TAURI__) acceptSnapshot(event.detail, true); });
+  bindShellChrome();
+  bindConnectionSettings();
   start().catch(reportError);
 })();

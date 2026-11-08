@@ -1,0 +1,8 @@
+{
+  "listen": "127.0.0.1:3435",
+  "usageJsonlPath": "/home/MAGPIE_USER/.config/magpie/usage.jsonl",
+  "magpieHost": "127.0.0.1:3425",
+  "dataDir": "/var/lib/magpie-hud-server",
+  "publicUrl": "https://hud.example.com",
+  "timezone": "Asia/Shanghai"
+}

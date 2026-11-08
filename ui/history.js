@@ -220,9 +220,9 @@
     if (previous?.pending) return previous.pending;
     if (!force && previous?.data && performance.now() - previous.at < 1000) return Promise.resolve(previous.data);
     const entry = previous || {};
-    const query = window.__TAURI__
-      ? window.__TAURI__.core.invoke('query_route_history', { session: scope.session, subagent: scope.subagent || null, limit })
-      : fixtures.has(keyOf(scope)) ? Promise.resolve(fixtures.get(keyOf(scope))) : Promise.reject(new Error('预览尚未提供履历数据'));
+    const query = window.HudData.preview
+      ? fixtures.has(keyOf(scope)) ? Promise.resolve(fixtures.get(keyOf(scope))) : Promise.reject(new Error('预览尚未提供履历数据'))
+      : window.HudData.invoke('query_route_history', { session: scope.session, subagent: scope.subagent || null, limit });
     entry.pending = Promise.resolve(query).then(data => {
       entry.data = data;
       entry.at = performance.now();
@@ -259,6 +259,7 @@
       render(data);
     } catch (error) {
       if (view !== current || token !== generation || request !== requestSequence) return;
+      if (error?.hudStale) return;
       status.hidden = false;
       status.textContent = `履历读取失败：${String(error?.message || error)}`;
       status.dataset.error = 'true';
@@ -447,10 +448,13 @@
   document.addEventListener('scroll', event => { if (view && !panel.contains(event.target)) position(); }, true);
   window.addEventListener('blur', () => { if (!view?.pinned) close(false); });
   document.addEventListener('visibilitychange', () => { if (!document.hidden && view) load(false); });
-  window.addEventListener('hud-preview-history', event => {
-    if (window.__TAURI__) return;
+  if (window.HudData.preview) window.addEventListener('hud-preview-history', event => {
     const { session, subagent = '', data } = event.detail;
     fixtures.set(keyOf({ session, subagent }), data);
+    cache.clear();
+    if (view) load(true);
+  });
+  window.HudData.listen('source-change', () => {
     cache.clear();
     if (view) load(true);
   });

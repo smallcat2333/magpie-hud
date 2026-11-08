@@ -4,33 +4,35 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Magpie HUD V.1.0.19</title>
+  <title>Magpie HUD V.1.0.20</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="hud.css?v=1.0.19-restore-quota">
+  <link rel="stylesheet" href="hud.css?v=1.0.20-restore-quota">
+  <script src="data-client.js?v=1.0.20" defer></script>
   <script src="motion.js?v=1.0.6-20261025-continuous-motion" defer></script>
   <script src="hourly.js?v=0.0.28-20261022-endpoint-motion" defer></script>
   <link rel="stylesheet" href="dates.css?v=20261023-deeper-heat">
-  <script src="dates.js?v=20261023-caller-stats" defer></script>
+  <script src="dates.js?v=1.0.20" defer></script>
   <link rel="stylesheet" href="history.css?v=20261029-route-prefix">
-  <script src="history.js?v=20261029-route-prefix" defer></script>
+  <script src="history.js?v=1.0.20" defer></script>
   <link rel="stylesheet" href="model-usage.css?v=20261027-model-usage-v31">
-  <script src="model-usage.js?v=20261028-model-colors-v32" defer></script>
+  <script src="model-usage.js?v=1.0.20" defer></script>
   <link rel="stylesheet" href="decision-route.css?v=1.0.6-20261030-decision-sticky">
   <script src="decision-route.js?v=20261029-user-turn" defer></script>
   <script src="redact.js?v=20261028-redact" defer></script>
   <script src="source-icons.js?v=1.0.8-20261030-agent-icons" defer></script>
-  <script src="hud.js?v=1.0.19-restore-quota" defer></script>
+  <script src="hud.js?v=1.0.20-restore-quota" defer></script>
 </head>
 <body>
 <main class="hud" id="hud" data-state="waiting" data-sources="compact" data-focus="true">
   <header class="window-bar" id="drag-region" data-tauri-drag-region>
     <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg>
-    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.1.0.19</span></h1><span class="brand-subtitle">路由监视</span>
+    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.1.0.20</span></h1><span class="brand-subtitle">路由监视</span>
     <span class="watch-state" id="watch-label" role="status">等待今日记录</span>
     <button id="agent-select" class="agent-select" type="button" role="combobox" aria-label="按 Agent 筛选路由" aria-haspopup="listbox" aria-expanded="false" aria-controls="agent-options"><span class="agent-caption">Agent</span><span class="agent-icon" aria-hidden="true">∗</span><span class="agent-value">全部</span><span class="agent-arrow" aria-hidden="true">⌄</span></button>
     <label class="scope-label" for="session-select">查看</label>
     <select id="session-select" aria-label="按会话查看路由"><option value="*">最近会话</option></select>
     <button id="redact" class="window-button" type="button" data-redact aria-label="账号打码" aria-pressed="false" title=""><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10s3-5 7-5 7 5 7 5-3 5-7 5-7-5-7-5Z"/><circle cx="10" cy="10" r="2.2"/></svg></button>
+    <button id="settings" class="window-button" type="button" aria-label="连接设置" aria-haspopup="dialog" aria-expanded="false" aria-controls="connection-dialog" title="连接设置"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="2.2"/><path d="M10 3.5v2M10 14.5v2M3.5 10h2M14.5 10h2M5.4 5.4l1.4 1.4M13.2 13.2l1.4 1.4M14.6 5.4l-1.4 1.4M6.8 13.2l-1.4 1.4"/></svg></button>
     <button id="pin" class="window-button" type="button" aria-label="置顶窗口" aria-pressed="true" title="置顶窗口"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3h6m-5 0v5l-3 3v1h10v-1l-3-3V3M10 12v5"/></svg></button>
     <button id="hide-window" class="window-button" type="button" aria-label="最小化到托盘" title="最小化到托盘"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10h10"/></svg></button>
     <button id="close-window" class="window-button" type="button" aria-label="关闭程序" title="关闭程序"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8"/></svg></button>
@@ -66,7 +68,7 @@
       <table id="hourly-table" class="hourly-table"><caption>每小时明细</caption><thead><tr><th>时段</th><th>Token</th><th>USD</th></tr></thead><tbody></tbody></table>
     </section>
     <section class="quota" aria-label="账号用量">
-      <div class="quota-heading"><h2 id="quota-title">用量</h2><span id="quota-freshness" hidden>旧数据</span></div>
+      <div class="quota-heading"><h2 id="quota-title">用量</h2><select id="quota-scope" aria-label="账号额度范围"><option value="current">当前范围</option><option value="all">全部账号</option></select><span id="quota-freshness" hidden>旧数据</span></div>
       <div id="quota-list" class="quota-list"><p class="quota-empty">等待当前会话的额度</p></div>
     </section>
     <section id="model-usage" class="model-usage" aria-labelledby="model-usage-heading" hidden>
@@ -85,7 +87,7 @@
         <div id="source-list" class="source-list"><div class="source-entry"><div class="source-heading"><span class="source-icon"><img src="icons/claude-color.svg" alt=""></span><strong>等待请求</strong></div></div></div>
       </div>
       <svg class="inbound" viewBox="0 0 48 100" preserveAspectRatio="none" aria-hidden="true"><path class="route-track" d="M2 60C22 60 26 42 46 42"/><path class="route-active" id="inbound-active" d="M2 60C22 60 26 42 46 42"/></svg>
-      <div class="router-node" tabindex="0" aria-label="本机 Magpie 路由器">
+      <div class="router-node" tabindex="0" aria-label="Magpie 路由器">
         <div class="router-emblem"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg></div>
         <strong>magpie</strong><span class="stats-live-label">实时路由</span><small id="session-count">0会话</small><span id="router-host">127.0.0.1:3425</span>
       </div>
@@ -124,6 +126,28 @@
   <div class="calendar-legend" aria-label="色块由浅至深表示 Token 用量从少到多，无调用日期无底色"><span>Token 少</span><i data-heat="0"></i><i data-heat="1"></i><i data-heat="2"></i><i data-heat="3"></i><i data-heat="4"></i><span>多</span></div>
   <div class="calendar-footer"><span id="calendar-summary"></span><button id="calendar-retry" type="button" hidden>重试</button><button id="calendar-today" type="button">回今天</button></div>
   <table id="calendar-table" class="calendar-table"><caption>每日 Token 与调用明细</caption><thead><tr><th>日期</th><th>Token</th><th>调用</th></tr></thead><tbody></tbody></table>
+</div>
+<div id="connection-dialog" class="connection-dialog" role="dialog" aria-modal="true" aria-labelledby="connection-title" hidden>
+  <div class="connection-panel">
+    <div class="connection-heading"><strong id="connection-title">连接</strong><button id="connection-close" type="button" aria-label="关闭连接设置">×</button></div>
+    <form id="connection-form" novalidate>
+      <div id="connection-desktop">
+        <div class="connection-modes" role="radiogroup" aria-label="数据来源">
+          <label><input type="radio" name="mode" value="local" checked>本地</label>
+          <label><input type="radio" name="mode" value="remote">远端</label>
+        </div>
+        <label class="connection-field">服务地址<input id="connection-url" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://hud.example"></label>
+        <label class="connection-field">访问密钥<input id="connection-key" type="password" autocomplete="off" spellcheck="false"></label>
+        <p id="connection-key-hint" class="connection-hint" hidden>已保存密钥。留空则保留，填写则替换。</p>
+        <div class="connection-actions"><button id="connection-test" type="button">测试</button><button id="connection-save" type="submit">保存</button><button id="connection-forget" type="button">忘记</button></div>
+      </div>
+    </form>
+    <div id="connection-browser" hidden>
+      <p id="connection-instance" class="connection-instance"></p>
+      <div class="connection-actions"><button id="connection-logout" type="button">退出登录</button></div>
+    </div>
+    <p id="connection-status" class="connection-status" role="status"></p>
+  </div>
 </div>
 <div class="resize-edge north" data-resize="North" aria-hidden="true"></div>
 <div class="resize-edge south" data-resize="South" aria-hidden="true"></div>

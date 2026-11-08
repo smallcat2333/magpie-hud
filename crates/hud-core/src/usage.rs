@@ -6,8 +6,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// 固定日志槽；没有真实时间时显示明确占位。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Note {
     pub time: String,
     pub kind: String,
@@ -26,8 +26,8 @@ pub struct HourlyStats {
 }
 
 /// 当日统计。费用来自 Magpie 按模型价格算出的美元金额，不是日志里的 Credits；速度按有效生成时间加权。
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct DailyStats {
     pub requests: u64,
     pub tokens: u64,
@@ -101,7 +101,11 @@ struct Record {
     caller_key_name: String,
     request: String,
     account: String,
+    /// 日志 model（发送模型）。响应报告模型见 served，不在这里互相覆盖。
     model: String,
+    served: Option<String>,
+    /// 管理员或设备来源标签。有 callerKeyId 时不替代密钥分组。
+    via: String,
     provider: String,
     handed_on: bool,
     effort: String,
@@ -133,6 +137,11 @@ impl Record {
     }
 
     /// 区分调用方取消和服务失败，防止把 499 变成账号冷却。
+    /// 已完成卡片优先显示响应报告模型；没有 served 时仍显示发送模型。
+    fn shown_model(&self) -> &str {
+        self.served.as_deref().filter(|served| !served.is_empty()).unwrap_or(self.model.as_str())
+    }
+
     fn outcome(&self) -> &'static str {
         if self.success() {
             "success"
@@ -186,7 +195,7 @@ impl Record {
         let mut text = format!(
             "{} ({}) · {} · {}",
             self.account,
-            self.model,
+            self.shown_model(),
             self.effort,
             self.detail(recovered)
         );
@@ -214,8 +223,8 @@ impl Record {
 }
 
 /// 每个真实账号的两行路由块；恢复只根据已记录失败后的成功或 tries 判定。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct RouteCard {
     pub id: String,
     pub session_id: String,
@@ -226,6 +235,9 @@ pub struct RouteCard {
     pub history_session: Option<String>,
     pub account: String,
     pub model: String,
+    /// 响应报告模型。完成卡的 model 在有 served 时与它对齐，发送模型仍留在统计分组。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served: Option<String>,
     pub provider: String,
     pub effort: String,
     pub state: String,
@@ -256,8 +268,8 @@ pub struct RouteCard {
 }
 
 /// 会话的路由块、最新两行说明和当日统计，前端可无需再次读文件直接切换。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct SessionView {
     pub id: String,
     pub label: String,
@@ -286,17 +298,22 @@ pub struct SessionView {
     /// 网关调用方密钥名称。缺失保持空字符串，不用供应商账号或默认名代替。
     #[serde(default)]
     pub caller_key_name: String,
+    /// 无密钥时的设备/管理员来源。有 callerKeyId 时只作标签，不改变 sourceKey。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub via: String,
 }
 
 /// 一个来源身份的当日完成统计。Agent 只做 claude-desktop 显示名转换，其余保持日志原值。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct AgentStats {
     pub agent: String,
     /// 网关 callerKeyId。空字符串表示日志没有提供，不能当成某个具体密钥。
     pub caller_key_id: String,
     /// 有 callerKeyId 时取该 ID 最后一条非空名称。没有 ID 时，名称本身就是分组键。
     pub caller_key_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub via: String,
     pub daily: DailyStats,
     /// 该分组实际出现过的会话 ID，只用于核对网关费用覆盖，不发给前端。
     #[serde(skip)]
@@ -304,8 +321,8 @@ pub struct AgentStats {
 }
 
 /// 图、会话列表、全局统计使用同一次原子快照，revision 控制前端去重。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct RouteSnapshot {
     pub revision: u64,
     /// 仅随当日账本变化递增，避免实时路由刷新反复触发逐请求费用查询。
@@ -347,6 +364,7 @@ pub struct UsageLedger {
     seen: HashSet<String>,
     pub revision: u64,
     malformed: u64,
+    include_unassociated: bool,
 }
 
 impl UsageLedger {
@@ -366,7 +384,13 @@ impl UsageLedger {
             seen: HashSet::new(),
             revision: 0,
             malformed: 0,
+            include_unassociated: false,
         }
+    }
+
+    /// 服务端纳入无会话的有效调用。不造会话行，统计与扫描函数共用这一开关。
+    pub fn set_include_unassociated(&mut self, include: bool) {
+        self.include_unassociated = include;
     }
 
     /// 本地日期变更时清空当日数据；返回是否发生变更。
@@ -376,18 +400,22 @@ impl UsageLedger {
         }
         let earliest = self.earliest_day;
         let caller_key_names = std::mem::take(&mut self.caller_key_names);
+        let include = self.include_unassociated;
         let revision = self.revision + 1;
         *self = Self::new(day);
         self.caller_key_names = caller_key_names;
         self.earliest_day = earliest;
+        self.include_unassociated = include;
         self.revision = revision;
         true
     }
 
     /// 文件轮转后从头重建，避免旧文件累计值与新文件重复。
     pub fn reset(&mut self) {
+        let include = self.include_unassociated;
         let revision = self.revision + 1;
         *self = Self::new(self.day);
+        self.include_unassociated = include;
         self.revision = revision;
     }
 
@@ -409,8 +437,8 @@ impl UsageLedger {
         if value.get("kind").and_then(Value::as_str) == Some("routing") {
             return;
         }
-        // 无会话身份的记录无法准确归属会话，因此不进入账本与 HUD。
-        if string(&value, "session").unwrap_or("").is_empty() {
+        // 无会话身份的记录无法归属会话。桌面直接忽略；服务端计入统计，但不造会话。
+        if string(&value, "session").unwrap_or("").is_empty() && !self.include_unassociated {
             return;
         }
         let timestamp =
@@ -477,6 +505,8 @@ impl UsageLedger {
                 .or_else(|| string(&value, "host"))
                 .unwrap_or("账号未提供")
                 .into(),
+            served: string(&value, "served").map(str::to_owned),
+            via: string(&value, "via").unwrap_or("").into(),
             model: string(&value, "model")
                 .or_else(|| string(&value, "served"))
                 .unwrap_or("服务模型未提供")
@@ -519,7 +549,9 @@ impl UsageLedger {
         let mut daily = DailyStats::default();
         for record in &self.records {
             daily.add(record);
-            grouped.entry(&record.session).or_default().push(record);
+            if !record.session.is_empty() {
+                grouped.entry(&record.session).or_default().push(record);
+            }
         }
         let agent_stats = agent_groups(&self.records);
         let mut sessions = Vec::new();
@@ -566,7 +598,8 @@ impl UsageLedger {
                     session_label: label.clone(),
                     history_session: None,
                     account: record.account.clone(),
-                    model: record.model.clone(),
+                    model: record.shown_model().to_owned(),
+                    served: record.served.clone().filter(|served| !served.is_empty()),
                     provider: record.provider.clone(),
                     effort: record.effort.clone(),
                     state: state.into(),
@@ -640,7 +673,7 @@ impl UsageLedger {
             let mut quota_routes: Vec<_> = quota_by_account.into_values().collect();
             quota_routes.sort_by(|a, b| b.0.cmp(&a.0));
             let quota_routes: Vec<_> = quota_routes.into_iter().map(|(_, route)| route).collect();
-            let (caller_key_id, caller_key_name) = caller_identity(&records);
+            let (caller_key_id, caller_key_name, via) = caller_identity(&records);
             let (anchor, anchor_card) = if let Some(latest_root) = latest_root {
                 let card = routes.iter().find(|route| route.current).expect("根请求当前卡片");
                 (latest_root, card.note.clone())
@@ -697,6 +730,7 @@ impl UsageLedger {
                 daily: stats,
                 caller_key_id,
                 caller_key_name,
+                via,
             });
         }
         sessions.sort_by(|a, b| b.latest_sequence.cmp(&a.latest_sequence).then(a.id.cmp(&b.id)));
@@ -772,17 +806,17 @@ impl UsageLedger {
             let canonical = aliases.get(&r.session).map(String::as_str).unwrap_or(&r.session);
             if session.is_some_and(|s| s != canonical) { return false; }
             let agent = canonical_agent(&r.agent);
-            let identity = if r.caller_key_id.is_empty() { &r.caller_key_name } else { &r.caller_key_id };
-            let key = serde_json::to_string(&[&agent, identity]).unwrap_or_default();
+            let (id, name, _) = source_of(&r.caller_key_id, &r.caller_key_name, &r.via);
+            let key = composed_source_key(&agent, &id, &name);
             !source_key.is_some_and(|wanted| wanted != key)
         }).map(|r| {
             let agent = canonical_agent(&r.agent);
-            let identity = if r.caller_key_id.is_empty() { &r.caller_key_name } else { &r.caller_key_id };
+            let (id, name, via) = source_of(&r.caller_key_id, &r.caller_key_name, &r.via);
             UsageDetailRow {
                 id: r.identity.clone(), timestamp: r.timestamp_ms, date: r.day.to_string(), hour: r.hour,
                 // 保留原始会话：费用接口按日志会话精确匹配，规范别名只用于上面的筛选。
-                session: r.session.clone(), source_key: serde_json::to_string(&[&agent, identity]).unwrap_or_default(), agent,
-                caller_key_id: r.caller_key_id.clone(), caller_key_name: r.caller_key_name.clone(),
+                session: r.session.clone(), source_key: composed_source_key(&agent, &id, &name), agent,
+                caller_key_id: id, caller_key_name: name, via,
                 provider: r.provider.clone(), account: r.account.clone(), model: r.model.clone(), effort: r.effort.clone(),
                 outcome: r.outcome().into(), input: r.input, output: r.output, cache_read: r.cache_read, tokens: r.tokens,
                 generation_ms: if r.success() { r.generation_ms } else { None }, cost_matchable: r.tokens_known,
@@ -802,8 +836,9 @@ impl UsageLedger {
     pub fn scoped_days_in_range(&self) -> Vec<(String, String, String, Vec<DayUsage>)> {
         let mut groups: BTreeMap<(String, String, String), BTreeMap<NaiveDate, DayUsage>> = BTreeMap::new();
         for record in &self.records {
-            let key = (canonical_agent(&record.agent), record.caller_key_id.clone(),
-                if record.caller_key_id.is_empty() { record.caller_key_name.clone() } else { String::new() });
+            let (id, name, _) = source_of(&record.caller_key_id, &record.caller_key_name, &record.via);
+            let name_key = if id.is_empty() { name } else { String::new() };
+            let key = (canonical_agent(&record.agent), id, name_key);
             let day = groups.entry(key).or_default().entry(record.day)
                 .or_insert(DayUsage { date: record.day, tokens: 0, requests: 0 });
             day.tokens = day.tokens.saturating_add(record.tokens);
@@ -846,7 +881,16 @@ pub fn scan_day_stats(
     path: &std::path::Path,
     day: NaiveDate,
 ) -> Result<(DailyStats, Vec<AgentStats>, Option<NaiveDate>), String> {
+    scan_day_stats_with(path, day, false)
+}
+
+pub fn scan_day_stats_with(
+    path: &std::path::Path,
+    day: NaiveDate,
+    include_unassociated: bool,
+) -> Result<(DailyStats, Vec<AgentStats>, Option<NaiveDate>), String> {
     let mut ledger = UsageLedger::new(day);
+    ledger.set_include_unassociated(include_unassociated);
     let mut cursor = crate::tail::LogCursor::default();
     cursor.update_for_day(path, &mut ledger, day)?;
     if cursor.missing {
@@ -856,8 +900,8 @@ pub fn scan_day_stats(
 }
 
 /// 详情查询仅输出统计字段；正文、凭据和原始错误文本不会进入详情窗口。
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct UsageDetailRow {
     pub id: String,
     pub timestamp: i64,
@@ -867,6 +911,8 @@ pub struct UsageDetailRow {
     pub agent: String,
     pub caller_key_id: String,
     pub caller_key_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub via: String,
     pub source_key: String,
     pub provider: String,
     pub account: String,
@@ -886,19 +932,31 @@ pub struct UsageDetailRow {
 pub fn scan_detail_rows(path: &std::path::Path, start: NaiveDate, end: NaiveDate)
     -> Result<Vec<UsageDetailRow>, String>
 {
+    scan_detail_rows_with(path, start, end, false)
+}
+
+pub fn scan_detail_rows_with(path: &std::path::Path, start: NaiveDate, end: NaiveDate, include_unassociated: bool)
+    -> Result<Vec<UsageDetailRow>, String>
+{
     let mut ledger = UsageLedger::spanning(start, end);
+    ledger.set_include_unassociated(include_unassociated);
     let mut cursor = crate::tail::LogCursor::default();
     cursor.update_for_day(path, &mut ledger, start)?;
     if cursor.missing { return Err("用量日志文件未找到".into()); }
     let mut rows: Vec<_> = ledger.records.iter().map(|r| {
         let agent = canonical_agent(&r.agent);
-        let identity = if r.caller_key_id.is_empty() { &r.caller_key_name } else { &r.caller_key_id };
+        let (id, mut name, via) = source_of(&r.caller_key_id, &r.caller_key_name, &r.via);
+        if !id.is_empty() {
+            if let Some((_, latest)) = ledger.caller_key_names.get(&id) {
+                name = latest.clone();
+            }
+        }
         UsageDetailRow {
             id: r.identity.clone(), timestamp: r.timestamp_ms, date: r.day.to_string(), hour: r.hour,
-            session: r.session.clone(), source_key: serde_json::to_string(&[&agent, identity]).unwrap(), agent,
-            caller_key_id: r.caller_key_id.clone(),
-            caller_key_name: ledger.caller_key_names.get(&r.caller_key_id).map(|(_, name)| name.clone())
-                .unwrap_or_else(|| r.caller_key_name.clone()),
+            session: r.session.clone(), source_key: composed_source_key(&agent, &id, &name), agent,
+            caller_key_id: id,
+            caller_key_name: name,
+            via,
             provider: r.provider.clone(), account: r.account.clone(), model: r.model.clone(), effort: r.effort.clone(),
             outcome: r.outcome().into(), input: r.input, output: r.output, cache_read: r.cache_read, tokens: r.tokens,
             generation_ms: if r.success() { r.generation_ms } else { None }, cost_matchable: r.tokens_known,
@@ -909,13 +967,15 @@ pub fn scan_detail_rows(path: &std::path::Path, start: NaiveDate, end: NaiveDate
 }
 
 /// 一个会话来源下的模型/强度用量。空模型或强度保持账本的未知标记，不推测。
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ModelUsage {
     pub session: String,
     pub agent: String,
     pub caller_key_id: String,
     pub caller_key_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub via: String,
     /// success | failed | cancelled | unknown
     pub outcome: String,
     pub model: String,
@@ -930,20 +990,37 @@ pub struct ModelUsage {
     pub speed_samples: u64,
 }
 
+/// 有密钥时身份是 callerKeyId，显示名仍是密钥名称，via 只作标签。
+/// 没有密钥时用 via 分组并显示；via 也没有才退回 callerKeyName。空身份仍是「本机」。
+fn source_of(id: &str, name: &str, via: &str) -> (String, String, String) {
+    if !id.is_empty() {
+        (id.to_owned(), name.to_owned(), via.to_owned())
+    } else if !via.is_empty() {
+        (String::new(), via.to_owned(), via.to_owned())
+    } else {
+        (String::new(), name.to_owned(), String::new())
+    }
+}
+
+fn composed_source_key(agent: &str, id: &str, name: &str) -> String {
+    let identity = if id.is_empty() { name } else { id };
+    serde_json::to_string(&[agent, identity]).unwrap_or_default()
+}
+
 /// 按现有会话与 Agent/caller 分组口径展开模型用量，保留首次出现顺序。
 fn model_usage(records: &[Record]) -> Vec<ModelUsage> {
     let mut order = Vec::new();
     let mut groups: HashMap<(String, String, String, String, String, String, String), ModelUsage> = HashMap::new();
     for record in records.iter().filter(|record| !record.handed_on) {
-        let name_key = if record.caller_key_id.is_empty() { record.caller_key_name.clone() } else { String::new() };
-        let key = (record.session.clone(), record.agent.clone(), record.caller_key_id.clone(), name_key,
+        let (id, name, via) = source_of(&record.caller_key_id, &record.caller_key_name, &record.via);
+        let name_key = if id.is_empty() { name.clone() } else { String::new() };
+        let key = (record.session.clone(), record.agent.clone(), id.clone(), name_key,
             record.model.clone(), record.effort.clone(), record.outcome().into());
         if !groups.contains_key(&key) {
             order.push(key.clone());
             groups.insert(key.clone(), ModelUsage {
                 session: record.session.clone(), agent: record.agent.clone(),
-                caller_key_id: record.caller_key_id.clone(),
-                caller_key_name: if record.caller_key_id.is_empty() { record.caller_key_name.clone() } else { String::new() },
+                caller_key_id: id.clone(), caller_key_name: if id.is_empty() { name } else { String::new() }, via,
                 outcome: record.outcome().into(), model: record.model.clone(), effort: record.effort.clone(),
                 requests: 0, tokens: 0, unknown_token_requests: 0,
                 output_tokens: 0, generation_ms: 0.0, speed_samples: 0,
@@ -952,6 +1029,9 @@ fn model_usage(records: &[Record]) -> Vec<ModelUsage> {
         let group = groups.get_mut(&key).expect("刚插入的模型用量");
         if !record.caller_key_id.is_empty() && !record.caller_key_name.is_empty() {
             group.caller_key_name.clone_from(&record.caller_key_name);
+        }
+        if group.via.is_empty() && !record.via.is_empty() {
+            group.via.clone_from(&record.via);
         }
         group.requests += 1;
         if record.tokens_known {
@@ -976,23 +1056,28 @@ fn agent_groups(records: &[Record]) -> Vec<AgentStats> {
     let mut order: Vec<(String, String, String)> = Vec::new();
     let mut groups: HashMap<(String, String, String), AgentStats> = HashMap::new();
     for record in records {
-        let name_key = if record.caller_key_id.is_empty() { record.caller_key_name.clone() } else { String::new() };
-        let key = (record.agent.clone(), record.caller_key_id.clone(), name_key);
+        let (id, name, via) = source_of(&record.caller_key_id, &record.caller_key_name, &record.via);
+        let name_key = if id.is_empty() { name.clone() } else { String::new() };
+        let key = (record.agent.clone(), id.clone(), name_key);
         if !groups.contains_key(&key) {
             order.push(key.clone());
             groups.insert(key.clone(), AgentStats {
                 agent: record.agent.clone(),
-                caller_key_id: record.caller_key_id.clone(),
-                caller_key_name: if record.caller_key_id.is_empty() { record.caller_key_name.clone() } else { String::new() },
+                caller_key_id: id.clone(),
+                caller_key_name: if id.is_empty() { name.clone() } else { String::new() },
+                via: via.clone(),
                 daily: DailyStats::default(),
                 cost_sessions: Vec::new(),
             });
         }
         let group = groups.get_mut(&key).expect("刚插入的来源分组");
-        if !record.caller_key_id.is_empty() && !record.caller_key_name.is_empty() {
-            group.caller_key_name.clone_from(&record.caller_key_name);
+        if !id.is_empty() && !name.is_empty() {
+            group.caller_key_name = name;
         }
-        if !group.cost_sessions.iter().any(|id| id == &record.session) {
+        if group.via.is_empty() && !via.is_empty() {
+            group.via = via;
+        }
+        if !record.session.is_empty() && !group.cost_sessions.iter().any(|id| id == &record.session) {
             group.cost_sessions.push(record.session.clone());
         }
         group.daily.add(record);
@@ -1008,9 +1093,10 @@ fn agent_groups(records: &[Record]) -> Vec<AgentStats> {
 }
 
 /// 会话展示用最后一条真实带有调用方字段的完成记录，不拿供应商账号填补。
-fn caller_identity(records: &[&Record]) -> (String, String) {
+fn caller_identity(records: &[&Record]) -> (String, String, String) {
     let mut id = String::new();
     let mut name = String::new();
+    let mut via = String::new();
     for record in records {
         if !record.caller_key_id.is_empty() {
             id.clone_from(&record.caller_key_id);
@@ -1018,8 +1104,11 @@ fn caller_identity(records: &[&Record]) -> (String, String) {
         if !record.caller_key_name.is_empty() {
             name.clone_from(&record.caller_key_name);
         }
+        if !record.via.is_empty() {
+            via.clone_from(&record.via);
+        }
     }
-    (id, name)
+    source_of(&id, &name, &via)
 }
 
 /// 一次只读扫描所选本地月的每日 Token 与调用数，并返回日志中最早的有效日期。
@@ -1028,7 +1117,17 @@ pub fn scan_month_usage(
     month_start: NaiveDate,
     month_end: NaiveDate,
 ) -> Result<(Vec<DayUsage>, Option<NaiveDate>), String> {
+    scan_month_usage_with(path, month_start, month_end, false)
+}
+
+pub fn scan_month_usage_with(
+    path: &std::path::Path,
+    month_start: NaiveDate,
+    month_end: NaiveDate,
+    include_unassociated: bool,
+) -> Result<(Vec<DayUsage>, Option<NaiveDate>), String> {
     let mut ledger = UsageLedger::spanning(month_start, month_end);
+    ledger.set_include_unassociated(include_unassociated);
     let mut cursor = crate::tail::LogCursor::default();
     cursor.update_for_day(path, &mut ledger, month_start)?;
     if cursor.missing {
@@ -1040,7 +1139,14 @@ pub fn scan_month_usage(
 pub fn scan_month_scoped_usage(
     path: &std::path::Path, start: NaiveDate, end: NaiveDate,
 ) -> Result<(Vec<DayUsage>, Vec<(String, String, String, Vec<DayUsage>)>, Option<NaiveDate>), String> {
+    scan_month_scoped_usage_with(path, start, end, false)
+}
+
+pub fn scan_month_scoped_usage_with(
+    path: &std::path::Path, start: NaiveDate, end: NaiveDate, include_unassociated: bool,
+) -> Result<(Vec<DayUsage>, Vec<(String, String, String, Vec<DayUsage>)>, Option<NaiveDate>), String> {
     let mut ledger = UsageLedger::spanning(start, end);
+    ledger.set_include_unassociated(include_unassociated);
     let mut cursor = crate::tail::LogCursor::default();
     cursor.update_for_day(path, &mut ledger, start)?;
     if cursor.missing { return Err("历史日志文件未找到，无法确认月份用量".into()); }
@@ -1301,6 +1407,37 @@ mod tests {
         assert_eq!(view.sessions[0].routes[0].state, "recovered");
         assert_eq!(view.daily.credits, None);
         assert_eq!(view.daily.tokens_per_second, None);
+        assert_eq!(view.daily.requests, 2);
+    }
+
+    /// 无密钥时 via 进入来源名和 sourceKey；有密钥时 via 只是标签，不改 sourceKey。
+    #[test]
+    fn via_groups_only_when_caller_key_is_absent() {
+        let mut ledger = ledger();
+        let mut keyed = fixture(1, "alpha", 200);
+        keyed["callerKeyId"] = json!("key-1");
+        keyed["callerKeyName"] = json!("密钥甲");
+        keyed["via"] = json!("admin-device");
+        ledger.ingest(keyed.to_string().as_bytes());
+        let mut bare = fixture(2, "beta", 200);
+        bare["via"] = json!("admin-device");
+        ledger.ingest(bare.to_string().as_bytes());
+        let view = ledger.snapshot("h", "ready", None);
+        assert_eq!(view.sessions.len(), 2);
+        let keyed_session = view.sessions.iter().find(|session| session.id == "alpha").unwrap();
+        assert_eq!(keyed_session.caller_key_id, "key-1");
+        assert_eq!(keyed_session.caller_key_name, "密钥甲");
+        assert_eq!(keyed_session.via, "admin-device");
+        let bare_session = view.sessions.iter().find(|session| session.id == "beta").unwrap();
+        assert!(bare_session.caller_key_id.is_empty());
+        assert_eq!(bare_session.caller_key_name, "admin-device");
+        assert_eq!(bare_session.via, "admin-device");
+        let keyed_group = view.agent_stats.iter().find(|group| group.caller_key_id == "key-1").unwrap();
+        assert_eq!(keyed_group.via, "admin-device");
+        assert_eq!(composed_source_key(&keyed_group.agent, &keyed_group.caller_key_id, &keyed_group.caller_key_name),
+            serde_json::to_string(&[&keyed_group.agent, "key-1"]).unwrap());
+        let via_group = view.agent_stats.iter().find(|group| group.caller_key_id.is_empty()).unwrap();
+        assert_eq!(via_group.caller_key_name, "admin-device");
         assert_eq!(view.daily.requests, 2);
     }
 

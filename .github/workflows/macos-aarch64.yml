@@ -30,7 +30,10 @@ jobs:
           rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
           rustup default stable
 
-      - name: Test on macOS
+      - name: Test shared core on macOS
+        run: cargo test -p magpie-hud-core --locked --target aarch64-apple-darwin
+
+      - name: Test desktop on macOS
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked --target aarch64-apple-darwin
 
       - name: Install Tauri CLI

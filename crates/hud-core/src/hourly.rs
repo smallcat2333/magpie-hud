@@ -72,10 +72,20 @@ struct History {
     sessions: HashMap<String, Counter>,
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+enum CacheMode {
+    #[default]
+    Lazy,
+    Bound,
+    Off,
+}
+
 #[derive(Default)]
 pub struct HourlyCosts {
     history: History,
     path: Option<PathBuf>,
+    mode: CacheMode,
+    loaded: bool,
     pub error: Option<String>,
 }
 
@@ -93,16 +103,43 @@ impl HourlyCosts {
             Err(_) => History::default(),
         };
         if history.host != host { history = History { host: host.into(), ..Default::default() }; }
-        Self { history, path: Some(path), error }
+        Self { history, path: Some(path), mode: CacheMode::Bound, loaded: true, error }
+    }
+
+    /// 服务端注入缓存文件。未调用时桌面仍回退到配置目录旁的 hourly-cost.json。
+    pub fn bind_cache(&mut self, path: PathBuf) {
+        self.mode = CacheMode::Bound;
+        if self.path.as_ref() != Some(&path) {
+            self.path = Some(path);
+            self.loaded = false;
+        }
+    }
+
+    /// 没有缓存目录时只保留内存，不创建桌面配置目录。
+    pub fn disable_persistence(&mut self) {
+        self.mode = CacheMode::Off;
+        self.path = None;
+        self.loaded = false;
     }
 
     /// 缓存仅包含当日会话小时金额和会话 ID，不保存账号、请求或正文。
     pub fn observe(&mut self, usage: &Usage, now: DateTime<Local>, host: &str) {
-        if self.path.is_none() {
-            let path = crate::config::config_path().with_file_name("hourly-cost.json");
-            let mut loaded = Self::load(path, host);
-            loaded.error = loaded.error.take().or(self.error.take());
-            *self = loaded;
+        if !self.loaded {
+            match self.mode {
+                CacheMode::Off => {
+                    self.loaded = true;
+                    if self.error.is_none() {
+                        self.error = Some("小时金额缓存目录未配置，暂停写入".into());
+                    }
+                }
+                CacheMode::Lazy | CacheMode::Bound => {
+                    let path = self.path.clone().unwrap_or_else(|| crate::paths::config_path().with_file_name("hourly-cost.json"));
+                    let previous = self.error.take();
+                    let mut loaded = Self::load(path, host);
+                    loaded.error = loaded.error.take().or(previous);
+                    *self = loaded;
+                }
+            }
         }
         let Some(day) = DateTime::parse_from_rfc3339(&usage.since).ok().map(|time| time.with_timezone(&Local).date_naive()) else { return };
         if day != now.date_naive() { return; }

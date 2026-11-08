@@ -1,5 +1,6 @@
 :root{color-scheme:dark;--surface:#17191e;--raised:rgb(26 28 33/.78);--ink:#f2f0f2;--muted:#b4b6bf;--route:#e064a2;--route-running:#38bdf8;--route-error:#ff4f5e;--warning:#e2b67a;--failed:#ed919b;--completed:#8dd7b0;--running:#9ccfff;--edge:rgb(190 192 205/.2);--stat-tokens:#a9c9ef;--stat-speed:#9cd5c9;--stat-cost:#e6c58f;--stat-cache:#c6b6ec;--stat-calls:#e8ba9c;--stat-average:#e7b1cd;font-family:"Segoe UI Variable Text","Microsoft YaHei UI","Segoe UI",sans-serif;font-size:13px;color:var(--ink);background:transparent;-webkit-font-smoothing:antialiased}
 *{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;overflow:clip;cursor:default;user-select:none}button,select{font:inherit;color:inherit}button,select,.daily .metric{cursor:pointer}button:focus-visible,select:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--route);outline-offset:2px}[hidden]{display:none!important}
+#quota-scope{width:auto;max-width:90px;height:22px;padding:0 3px;font-size:10px;color:var(--muted);flex-shrink:0}
 /* 聚焦与失焦共用 50% 底色；桌面磨砂由原生窗口负责，文字不参与透明。 */
 .hud{height:100vh;width:100vw;display:grid;grid-template-rows:46px minmax(0,1fr)76px;background:rgb(23 25 30/.5);backdrop-filter:blur(22px);border:1px solid var(--edge);overflow:clip}
 .window-bar{display:flex;align-items:center;gap:9px;padding:0 16px;user-select:none}.brand-mark{width:19px;height:19px;flex-shrink:0}.brand-mark path,.router-emblem path{stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}.brand-name{display:flex;align-items:baseline;gap:8px;margin:0;font-size:18px;line-height:1;font-weight:600;letter-spacing:-.4px;white-space:nowrap;flex-shrink:0}.app-version{font-size:11px;font-weight:400;letter-spacing:0;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}.brand-subtitle{font-size:11px;color:var(--muted);border-left:1px solid var(--edge);padding-left:11px}.watch-state{margin-left:auto;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:230px}.hud[data-state="warning"] .watch-state,.hud[data-state="missing"] .watch-state{color:var(--warning)}.scope-label{font-size:11px;color:var(--muted);margin-left:10px}select{height:28px;max-width:194px;width:170px;background:var(--raised);border:1px solid #555761;border-radius:5px;padding:0 7px;font-size:11px}select option{background:var(--surface)}.window-button{width:29px;height:29px;display:grid;place-items:center;background:transparent;color:var(--muted);border:0;border-radius:4px;flex-shrink:0}.window-button svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}.window-button:hover,.window-button[aria-pressed="true"]{background:rgb(70 72 80/.45);color:var(--ink)}#redact[aria-pressed="true"]{color:var(--warning)}#redact[aria-pressed="true"] svg{stroke-dasharray:2 1.6}
@@ -181,9 +182,9 @@
 .agent-select{margin-left:auto;flex:0 1 160px;min-width:105px;max-width:160px}#session-select{flex:1 1 170px;min-width:90px;max-width:230px}
 .hud[data-layout="wide"][data-sources] .router-node>small,.hud[data-layout="wide"][data-sources] .router-node>span{max-width:120px;overflow:visible}
 @media(max-width:679px){
-.hud[data-layout="tall"] .window-bar{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr) 26px 26px 26px 26px;grid-template-rows:30px 24px;gap:3px 6px;padding:5px 12px}
+.hud[data-layout="tall"] .window-bar{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr) 26px 26px 26px 26px 26px;grid-template-rows:30px 24px;gap:3px 6px;padding:5px 12px}
 .hud[data-layout="tall"] .agent-select{grid-column:1;grid-row:1;width:100%;max-width:none;min-width:0;margin:0}.hud[data-layout="tall"] #session-select{grid-column:2;grid-row:1;width:100%;max-width:none;min-width:0}
-.hud[data-layout="tall"] #redact{grid-column:3;grid-row:1}.hud[data-layout="tall"] #pin{grid-column:4;grid-row:1}.hud[data-layout="tall"] #hide-window{grid-column:5;grid-row:1}.hud[data-layout="tall"] #close-window{grid-column:6;grid-row:1}.hud[data-layout="tall"] .window-button{width:26px}
+.hud[data-layout="tall"] #redact{grid-column:3;grid-row:1}.hud[data-layout="tall"] #settings{grid-column:4;grid-row:1}.hud[data-layout="tall"] #pin{grid-column:5;grid-row:1}.hud[data-layout="tall"] #hide-window{grid-column:6;grid-row:1}.hud[data-layout="tall"] #close-window{grid-column:7;grid-row:1}.hud[data-layout="tall"] .window-button{width:26px}
 .hud[data-layout="tall"] .brand-mark{display:none}.hud[data-layout="tall"] .brand-name{grid-column:1/-1;grid-row:2;font-size:14px}.hud[data-layout="tall"] .watch-state{display:none}
 .hud[data-layout="tall"]{grid-template-rows:66px minmax(0,1fr)76px}
 }
@@ -201,3 +202,22 @@
 .quota-tooltip-balance{margin:12px 0 0}.quota-tooltip-error{margin:12px 0 0;color:var(--warning);font-size:11px;overflow-wrap:anywhere}.quota-tooltip-footer{margin-top:12px;padding-top:8px;border-top:1px solid var(--edge);color:var(--muted);font-size:11px}
 @media(max-width:420px){.quota-tooltip{padding:12px}.quota-tooltip-window-heading{flex-wrap:wrap;gap:2px 8px}.quota-tooltip-value{margin-left:auto}}
 @media(forced-colors:active){.quota-tooltip{background:Canvas;border-color:CanvasText;color:CanvasText}.quota-tooltip-track{border:1px solid CanvasText}.quota-tooltip-fill{background:Highlight}.hud,.sidebar,.daily,.quota,.route-card{border-color:CanvasText;background:Canvas}.branch,.route-active{stroke:Highlight}.quota-track{border:1px solid CanvasText}.quota-fill{background:Highlight}.request-spinner{color:Highlight}.route-card::before{background:Highlight}.route-card.failed{border-style:dashed}}
+/* 浏览器没有窗口壳；断线时保留画面，只把监视状态标成陈旧。 */
+html[data-hud-shell="browser"] #pin,html[data-hud-shell="browser"] #hide-window,html[data-hud-shell="browser"] #close-window,html[data-hud-shell="browser"] .resize-edge,html[data-hud-shell="browser"] .resize-corner{display:none!important}
+html[data-hud-shell="browser"],html[data-hud-shell="browser"] body,html[data-hud-shell="browser"] .hud{background:#17191e}
+html[data-hud-shell="browser"] .hud[data-layout="tall"] .window-bar{grid-template-columns:minmax(0,1.15fr) minmax(0,1fr) 26px 26px}
+.hud[data-stream="stale"] .watch-state,.hud[data-state="disconnected"] .watch-state{display:block;position:absolute;top:44px;left:20px;z-index:5;max-width:calc(100vw - 40px);margin:0;color:var(--warning);background:var(--surface)}
+.connection-dialog{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:16px;background:rgb(0 0 0/.35)}
+.connection-panel{width:min(340px,100%);display:grid;gap:10px;padding:14px 16px;background:var(--surface);color:var(--ink);border:1px solid var(--edge);border-radius:8px;box-shadow:0 6px 20px rgb(0 0 0/.3);user-select:text}
+.connection-heading,.connection-modes,.connection-actions{display:flex;align-items:center;gap:8px}
+.connection-heading{justify-content:space-between}.connection-heading strong{font-size:14px;font-weight:600}
+#connection-close{width:28px;height:28px;border:0;background:transparent;color:var(--muted);font-size:18px}
+.connection-modes label,.connection-field{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+.connection-field{display:grid;gap:4px}
+.connection-panel input[type="text"],.connection-panel input[type="password"]{width:100%;height:30px;padding:0 8px;background:#1d2025;border:1px solid #555761;border-radius:5px;color:var(--ink);font:inherit;user-select:text}
+.connection-panel button{min-height:30px;padding:4px 10px;background:transparent;border:1px solid var(--edge);border-radius:5px;font:inherit}
+.connection-panel button:hover{background:rgb(70 72 80/.45)}
+.connection-actions{justify-content:flex-end}
+.connection-hint,.connection-status,.connection-instance{margin:0;color:var(--muted);font-size:12px;line-height:1.5;white-space:pre-line}
+.connection-status:not(:empty){color:var(--warning)}
+.connection-panel button{user-select:none}
