@@ -10,15 +10,15 @@
   const table = document.getElementById('model-usage-table-body');
   const tooltip = document.getElementById('model-usage-tooltip');
   const ns = 'http://www.w3.org/2000/svg';
-  // 固定色序：蓝、橙、青绿、紫、玫红；灰色仅用于合并项，模型切换口径时保持同色。
-  const colors = ['#3987e5', '#d95926', '#199e70', '#9085e9', '#d55181'];
+  // 固定色序：蓝、橙、青绿、紫、玫红、青、柠绿、琥珀、蓝紫、浅粉；灰色仅用于合并项，模型切换口径时保持同色。
+  const colors = ['#3987e5', '#d95926', '#199e70', '#9085e9', '#d55181', '#4cb8d8', '#a9c93f', '#f4a340', '#b48ef0', '#e58cd0'];
   const effortColors = { low: '#9ccfff', medium: '#8dd7b0', high: '#e6cf89', xhigh: '#f2b17c', max: '#ef97ab', ultra: '#e4acdf', none: '#969aa5' };
   const effortOrder = ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
   const format = new Intl.NumberFormat('zh-CN');
   const compact = value => value >= 1e6 ? `${(value / 1e6).toFixed(1)}M` : value >= 1e3 ? `${(value / 1e3).toFixed(1)}k` : format.format(value);
   let rows = [], scope = '', mode = 'tokens', selected = null, hideTimer = 0, layoutFrame = 0, lastRender = '', colorsByModel = new Map();
-  let context = { date: '', session: null, sourceKey: null, revision: 0 };
-  let costState = { key: '', status: 'idle', hasData: false, rows: [], warnings: [] }, costRequest = 0;
+  let context = { date: '', session: null, sourceKey: null, revision: 0, historical: false };
+  let costState = { key: '', status: 'idle', hasData: false, rows: [], warnings: [] };
   const node = (tag, className, text) => {
     const element = document.createElement(tag);
     if (className) element.className = className;
@@ -195,7 +195,7 @@
     const value = measure(model);
     const title = node('h3', '', model.name);
     const suffix = mode === 'speed' ? ` · TPS 相对占比 ${percent(value, total)}` : ` · 占当前范围 ${percent(value, total)}`;
-    const desc = node('p', 'model-usage-tooltip-meta', `今日 ${metricText(model)}${suffix}`);
+    const desc = node('p', 'model-usage-tooltip-meta', `${context.historical ? context.date : '今日'} ${metricText(model)}${suffix}`);
     const content = [title, desc];
     if (model.unknownTokenRequests && mode === 'tokens') content.push(node('p', 'model-usage-tooltip-meta', '部分请求未记录输入或输出 Token，占比按已知用量统计'));
     if (mode === 'cost') {
@@ -243,8 +243,8 @@
       content.push(node('p', 'model-usage-tooltip-meta', explanation), breakdown);
     }
     if (mode === 'speed') content.push(node('p', 'model-usage-outcomes', model.name === '其他'
-      ? '模型汇总 TPS = 有效输出 Token ÷ 生成时长；面积按各模型 TPS 之和计算。'
-      : 'TPS = 有效成功请求的输出 Token ÷ 生成时长；面积按各模型 TPS 的相对大小计算。'));
+      ? '模型汇总 TPS = 有效输出 Token ÷ 生成时长；面积按各模型 TPS 之和计算。生成窗口不足 1 秒且超过 2000 token/s 的样本已排除。'
+      : 'TPS = 有效成功请求的输出 Token ÷ 生成时长；面积按各模型 TPS 的相对大小计算。生成窗口不足 1 秒且超过 2000 token/s 的样本已排除。'));
     tooltip.replaceChildren(...content);
   }
   function openTooltip(cell, model, total) {
@@ -270,7 +270,7 @@
     const unknownTokens = models.some(item => item.unknownTokenRequests > 0);
     summary.title = mode === 'speed' ? '矩形面积按模型 TPS 的相对大小；各模型 TPS 按有效输出和生成时长加权' : mode === 'cost' ? (costState.warnings || []).join('；') : unknownTokens ? '部分请求未记录 Token，仅展示已知用量' : '';
     summary.textContent = mode === 'cost' ? costState.status === 'loading' && !costState.hasData ? '正在匹配费用…' : costState.status === 'error' && !costState.hasData ? '费用读取失败，点击费用重试' : `已知费用 ${dollars(models.some(item => item.priced) ? total : null)}${models.some(item => item.unmatched || item.unpriced) ? ' · 部分未定价' : ''}`
-      : mode === 'speed' ? '今日 · 矩形按 TPS 相对大小' : `今日 · ${compact(total)} Token${unknownTokens ? ' · 部分未知' : ''}`;
+      : mode === 'speed' ? `${context.historical ? context.date : '今日'} · 矩形按 TPS 相对大小` : `${context.historical ? context.date : '今日'} · ${compact(total)} Token${unknownTokens ? ' · 部分未知' : ''}`;
     if (section.hidden) return;
     if (mode === 'cost' && !costState.hasData) {
       if (costState.status === 'loading') {
@@ -333,43 +333,23 @@
       else closeTooltip();
     }
   }
-  let costReadAt = 0;
-  async function loadCosts() {
-    const key = JSON.stringify(context);
+  const costReader = window.hudModelCosts.create({
+    query: scope => window.HudData.invoke('query_model_costs', {
+      session: scope.session, sourceKey: scope.sourceKey, date: scope.historical ? scope.date : null,
+    }),
+    changed(state) { costState = state; render(true); },
+  });
+  function loadCosts(force = false) {
     if (section.hidden || !context.date || window.HudData.preview) { render(); return; }
-    if (costState.status === 'loading') { render(); return; }
-    if (costState.key === key && Date.now() - costReadAt < 15000) { render(); return; }
-    costReadAt = Date.now();
-    const request = ++costRequest;
-    // 后台持续读取；有上次结果时保持当前图表，不切换到读取提示。
-    costState = { ...costState, key, status: 'loading' };
-    if (!costState.hasData) render(true);
-    try {
-      const result = await window.HudData.invoke('query_model_costs', { session: context.session, sourceKey: context.sourceKey });
-      if (request !== costRequest || key !== JSON.stringify(context)) return;
-      if (result.date !== context.date || result.ledgerRevision !== context.revision) {
-        throw new Error('账本已更新，请重试');
-      }
-      if (result.fetchFailed) throw new Error('费用读取失败，请重试');
-      // 网关可能尚未收录账本：全部无法匹配时保留此前已定价结果，允许重试。
-      if (costState.hasData && costState.rows.some(row => row.priced > 0)
-          && (!Array.isArray(result.rows) || !result.rows.length
-            || result.rows.every(row => !row.priced && !row.unpriced))) {
-        throw new Error('费用尚未匹配，请重试');
-      }
-      costState = { key, status: 'ready', hasData: true, rows: result.rows || [], warnings: result.warnings || [] };
-    } catch (error) {
-      if (request !== costRequest || key !== JSON.stringify(context)) return;
-      if (error?.hudStale) return;
-      costState = { ...costState, key, status: 'error', warnings: [String(error)] };
-    }
-    render(true);
+    const pending = costReader.load(force);
+    render();
+    return pending;
   }
-  setInterval(loadCosts, 15000);
+  setInterval(loadCosts, 30000);
   section.querySelectorAll('[data-model-mode]').forEach(button => button.addEventListener('click', () => {
     mode = button.dataset.modelMode;
     section.querySelectorAll('[data-model-mode]').forEach(other => other.setAttribute('aria-pressed', String(other === button)));
-    if (mode === 'cost') loadCosts();
+    if (mode === 'cost') loadCosts(costState.status === 'error');
     else render(true);
   }));
   tooltip.addEventListener('pointerenter', () => clearTimeout(hideTimer));
@@ -383,23 +363,17 @@
     update(data, currentScope, nextContext) {
       rows = Array.isArray(data) ? data : [];
       scope = currentScope || '全部会话';
-      const previous = context;
-      context = { date: '', session: null, sourceKey: null, revision: 0, ...nextContext };
-      const scopeChanged = previous.date !== context.date || previous.session !== context.session || previous.sourceKey !== context.sourceKey;
-      if (scopeChanged) {
-        costRequest++;
-        costState = { key: '', status: 'idle', hasData: false, rows: [], warnings: [] };
-      } else if (previous.revision !== context.revision) {
-        // 同一范围账本追加时保留旧数据，但丢弃旧请求，后台重新匹配费用。
-        costRequest++;
-        costState = { ...costState, key: '', status: 'idle' };
-      }
+      context = { date: '', session: null, sourceKey: null, revision: 0, historical: false, ...nextContext };
+      const dayLabel = context.historical ? context.date : '今日';
+      plot.setAttribute('aria-label', `${dayLabel}模型使用比例`);
+      document.querySelector('.model-usage-table caption').textContent = `${dayLabel}模型使用明细`;
+      costReader.update(context);
       scheduleSpace();
       loadCosts();
     },
   };
   window.HudData.listen('source-change', () => {
-    costRequest += 1;
+    costReader.reset();
     costState = { key: '', status: 'idle', hasData: false, rows: [], warnings: [] };
     render(true);
   });

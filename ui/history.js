@@ -76,6 +76,7 @@
   panel.append(heading, status, viewport, footer);
   document.body.append(panel);
 
+  const REFRESH_MS = 10_000;
   const cache = new Map();
   const fixtures = new Map();
   let view = null;
@@ -218,7 +219,7 @@
     const key = JSON.stringify([scope.session, scope.subagent, limit]);
     const previous = cache.get(key);
     if (previous?.pending) return previous.pending;
-    if (!force && previous?.data && performance.now() - previous.at < 1000) return Promise.resolve(previous.data);
+    if (!force && previous?.data && performance.now() - previous.at < REFRESH_MS) return Promise.resolve(previous.data);
     const entry = previous || {};
     const query = window.HudData.preview
       ? fixtures.has(keyOf(scope)) ? Promise.resolve(fixtures.get(keyOf(scope))) : Promise.reject(new Error('预览尚未提供履历数据'))
@@ -238,7 +239,6 @@
     if (!view) return;
     if (document.hidden) {
       clearTimeout(refreshTimer);
-      refreshTimer = setTimeout(() => load(false), 1000);
       return;
     }
     const current = view;
@@ -267,7 +267,7 @@
       if (view === current && token === generation && request === requestSequence) {
         panel.setAttribute('aria-busy', 'false');
         position();
-        refreshTimer = setTimeout(() => load(false), 1000);
+        if (!document.hidden) refreshTimer = setTimeout(() => load(false), REFRESH_MS);
       }
     }
   }
@@ -447,7 +447,10 @@
   window.addEventListener('resize', position);
   document.addEventListener('scroll', event => { if (view && !panel.contains(event.target)) position(); }, true);
   window.addEventListener('blur', () => { if (!view?.pinned) close(false); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && view) load(false); });
+  document.addEventListener('visibilitychange', () => {
+    clearTimeout(refreshTimer);
+    if (!document.hidden && view) load(false);
+  });
   if (window.HudData.preview) window.addEventListener('hud-preview-history', event => {
     const { session, subagent = '', data } = event.detail;
     fixtures.set(keyOf({ session, subagent }), data);

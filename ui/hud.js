@@ -1707,9 +1707,20 @@
     requestDraw();
   }
 
-  /** 换源后丢掉快照代际，查询缓存由各页自己清；路由先降为未知，等新快照替换。 */
+  /** 换源后丢掉快照代际与全部来源绑定的状态，查询缓存由各页自己清。 */
   function resetForSourceChange() {
     snapshot = null;
+    childPresence.clear();
+    childSessions.clear();
+    subagentNumbers.clear();
+    childPresenceDate = '';
+    clearTimeout(childGraceTimer);
+    sessionOrder.clear();
+    clearTimeout(sessionOrderTimer);
+    selectedAgent = '*';
+    selectedCard = null;
+    renderedIds.clear();
+    agentOptionsKey = '';
     softenLiveRoutes();
   }
 
@@ -2085,6 +2096,7 @@
     renderStats(daily, scope, costError, historical);
     window.dispatchEvent(new CustomEvent('hud-hourly-update', { detail: {
       hourly: daily.hourly, date, scope, error: costError,
+      sourceKey: selectedAgent === '*' ? null : selectedAgent,
     } }));
   });
 

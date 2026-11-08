@@ -1,6 +1,6 @@
 [package]
 name = "magpie-hud-core"
-version = "1.0.20"
+version = "1.0.32"
 description = "Magpie HUD 只读采集与统计核心"
 edition = "2021"
 
@@ -11,5 +11,6 @@ name = "hud_core"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
+iana-time-zone = "0.1"
 notify = "8"
 ureq = { version = "3", default-features = false }

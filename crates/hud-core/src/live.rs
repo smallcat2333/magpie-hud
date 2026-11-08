@@ -379,7 +379,7 @@ pub struct DecisionView {
 /// 累积的轮次索引上限；超出后按 route_id 递增顺序淘汰最旧条目。
 const TURN_HISTORY_CAP: usize = 8192;
 
-/// 实时状态与已完成用量独立；失联后清空活跃态并显示提示，避免动画永远运行。
+/// 实时状态与已完成用量独立；短暂失联保留最后状态，由通道健康状态明确标注过期。
 #[derive(Default)]
 pub struct LiveState {
     pub seq: i64,
@@ -405,6 +405,8 @@ impl LiveState {
         if self.pid != update.pid || update.seq < self.seq {
             self.routes.clear();
             self.turn_history.clear();
+            // 已确认网关重启时，旧进程的 activity 不能与新 route_id 配对。
+            if self.pid != 0 { self.activity = Activity::default(); }
         }
         self.pid = update.pid;
         self.seq = update.seq;
@@ -458,11 +460,16 @@ impl LiveState {
             .filter(|route| desktop_auxiliary(route)).map(|route| route.session.as_str()).collect();
         view.sessions.retain(|session| !auxiliary_sessions.contains(session.id.as_str())
             && !self.auxiliary_sessions.contains(&session.id));
-        // 账本卡没有完整链，按日志 route_id 复用同一条已结束 trace；只补空链，
-        // 不改日志算出的 time/updatedAt。活跃卡稍后由自身选中尝试单独计算。
+        // 账本卡没有完整链，按精确请求身份复用同一条已结束 trace；route_id 只
+        // 是网关重启后会复用的序号，必须再核对会话、子 Agent 与开始时间才补链
+        // 和响应报告模型，不能把相邻请求的数据借过来。
         for session in &mut view.sessions {
+            let session_id = session.id.clone();
             for card in session.routes.iter_mut().chain(session.completed_subagents.iter_mut()) {
                 let Some(route) = card.route_id.and_then(|id| self.routes.get(&id)) else { continue };
+                if !self.trace_matches_card(route, &session_id, card) {
+                    continue;
+                }
                 if card.route_groups.is_empty() {
                     let chain = trace_chain(route);
                     if !chain.is_empty() { card.route_groups = chain; }
@@ -590,7 +597,7 @@ impl LiveState {
                 subagent_label: child.map(|id| self.child_label(session_id, id)),
                 route_groups: route.map(|r| route_chain(r, attempt, candidate)).unwrap_or_default(),
                 served: attempt.and_then(|item| nonempty(&item.served)).or_else(|| route.and_then(|item| nonempty(&item.served))),
-                updated_at: started.map(|start| updated_at(start, active.ms)),
+                updated_at: started.and_then(|start| updated_at(start, active.ms)),
                 note: note.clone(),
             };
             if child.is_some() {
@@ -677,11 +684,6 @@ impl LiveState {
             view.watch_label = format!("{shown} 个会话请求中");
         } else if aliases_changed && shown == 0 && view.state != "warning" && view.state != "missing" {
             view.watch_label = if view.sessions.is_empty() { "等待今日记录".into() } else { "当日记录 · 只读监视".into() };
-        }
-        if let Some(error) = &self.error {
-            view.state = "warning".into();
-            view.watch_label = "实时连接中断 · 保留完成记录".into();
-            view.error = Some(error.clone());
         }
     }
 
@@ -840,6 +842,38 @@ impl LiveState {
     /// 历史 CLI ID 归到标题元数据声明的当前 ID；没有显式关联时保持自身。
     fn canonical<'a>(&'a self, id: &'a str) -> &'a str {
         self.aliases.get(id).map(String::as_str).unwrap_or(id)
+    }
+
+    /// 仅当 trace 与账本卡指向同一请求时才允许借用其链与响应模型。
+    /// 校验会话（按显式别名归一）、子 Agent 身份与请求开始时刻；
+    /// route_id 只是重启可复用的序号，单独不能证明同一请求。
+    fn trace_matches_card(&self, route: &LiveRoute, session_id: &str, card: &RouteCard) -> bool {
+        // 会话身份：卡片原始会话（history_session 或会话视图 ID）与 trace 原始会话
+        // 经同一别名规则归一后须相等；归并不靠展示名猜测。
+        let card_session = card.history_session.as_deref().unwrap_or(session_id);
+        if !route.session.is_empty()
+            && self.canonical(&route.session) != self.canonical(card_session)
+        {
+            return false;
+        }
+        // 子 Agent 身份：卡片有子身份时 trace 必须完全一致；根卡片不能借子请求 trace。
+        let card_child = card.subagent_id.as_deref().unwrap_or("");
+        if card_child != route.subagent_id.trim() {
+            return false;
+        }
+        // 开始时刻：卡片保留请求时刻（本地 HH:MM:SS），trace 开始时间落到同一秒才吻合；
+        // 两侧任一缺失不视为证据不足，因为 route_id + 会话 + 子身份已收窄到唯一请求。
+        if let (Some(route_time), card_time) = (route.time.as_deref(), card.time.as_str()) {
+            if !route_time.is_empty() && card_time != "--:--:--" {
+                return match DateTime::parse_from_rfc3339(route_time) {
+                    Ok(start) => {
+                        start.with_timezone(&Local).format("%H:%M:%S").to_string() == card_time
+                    }
+                    Err(_) => false,
+                };
+            }
+        }
+        true
     }
 
     /// 把历史 CLI ID 的模型用量归到当前规范会话，前端选中展示 ID 时不会漏计。
@@ -1334,11 +1368,12 @@ fn trace_chain(route: &LiveRoute) -> Vec<String> {
     route_chain(route, attempt, candidate)
 }
 
-/// 活跃卡的更新时间跟随 Magpie 报告的已用时长；start 不可解析时由调用方留空。
-fn updated_at(start: DateTime<chrono::FixedOffset>, elapsed_ms: u64) -> String {
-    (start + chrono::Duration::milliseconds(elapsed_ms.min(i64::MAX as u64) as i64))
-        .with_timezone(&chrono::Utc)
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+/// 活跃卡的更新时间跟随 Magpie 报告的已用时长；开始时间无效或结果超出日期范围时留空。
+fn updated_at(start: DateTime<chrono::FixedOffset>, elapsed_ms: u64) -> Option<String> {
+    let elapsed = i64::try_from(elapsed_ms).ok()?;
+    let finished = start.timestamp_millis().checked_add(elapsed)?;
+    DateTime::from_timestamp_millis(finished)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
 /// 根卡的请求时序标记：完成卡是真实完成时刻，活跃卡是 start + 已用时长。
@@ -1507,12 +1542,16 @@ pub fn wanted_children(view: &RouteSnapshot) -> HashSet<(String, String)> {
 
 /// 实时接口仅允许回环 HTTP，避免读取配置地址时向远端发出请求。
 pub fn gateway_url(host: &str) -> Result<String, String> {
-    let url = if host.starts_with("http://") { host.trim_end_matches('/').to_string() } else { format!("http://{}", host.trim_end_matches('/')) };
-    let authority = url.strip_prefix("http://").unwrap();
-    let valid = ["127.0.0.1:", "localhost:", "[::1]:"].iter()
-        .any(|prefix| authority.strip_prefix(prefix).is_some_and(|port| port.parse::<u16>().is_ok()));
-    if !valid { return Err("实时路由地址必须是本机回环 HTTP 地址和端口".into()); }
-    Ok(url)
+    let authority = host.strip_prefix("http://").unwrap_or(host).trim_end_matches('/');
+    let address = ["127.0.0.1:", "localhost:", "[::1]:"].iter().find_map(|prefix| {
+        let port = authority.strip_prefix(prefix)?;
+        if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) { return None; }
+        let port = port.parse::<u16>().ok().filter(|port| *port > 0)?;
+        // localhost 固定到 IPv4 回环，不经 hosts/DNS 解析。
+        let ip = if *prefix == "[::1]:" { "[::1]" } else { "127.0.0.1" };
+        Some(format!("http://{ip}:{port}"))
+    });
+    address.ok_or_else(|| "实时路由地址必须是本机回环 HTTP 地址和端口".into())
 }
 
 /// 创建绕过代理的回环客户端；超时覆盖最长 25 秒的路由长轮询。
@@ -1521,10 +1560,17 @@ pub fn client(timeout: Duration) -> ureq::Agent {
         .proxy(None).max_redirects(0).timeout_global(Some(timeout)).build())
 }
 
-/// 读取外部 JSON；网络、状态码及字段错误向界面报告。
+/// JSON 响应最多 8 MiB，避免依赖 HTTP 库的隐式默认值。分类与详细两条读取路径共用。
+pub(crate) const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 读取外部 JSON；网络、状态码、大小及字段错误向界面报告。
 pub fn read_json<T: serde::de::DeserializeOwned>(agent: &ureq::Agent, url: &str) -> Result<T, String> {
     let mut response = agent.get(url).call().map_err(|e| format!("实时路由读取失败：{e}"))?;
-    let body = response.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("实时路由读取失败：HTTP {}", response.status()));
+    }
+    let body = response.body_mut().with_config().limit(MAX_JSON_BYTES).read_to_string()
+        .map_err(|e| format!("实时路由响应读取失败（上限 8 MiB）：{e}"))?;
     serde_json::from_str(&body).map_err(|e| format!("实时路由字段无效：{e}"))
 }
 
@@ -1605,10 +1651,107 @@ impl CustomTitles {
     }
 }
 
+/// Claude Code 的显式标题行；消息正文从不参与命名。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliTitleRow {
+    #[serde(rename = "type")]
+    kind: String,
+    session_id: String,
+    custom_title: String,
+}
+
+#[derive(Default)]
+struct CliTitleCursor {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    offset: u64,
+    title: Option<String>,
+}
+
+/// 仅扫描当前快照的精确会话文件；缓存完整行偏移，追加时只处理新行。
+#[derive(Default)]
+pub struct CliTitles {
+    files: HashMap<PathBuf, CliTitleCursor>,
+}
+
+impl CliTitles {
+    pub fn scan(&mut self, wanted: &HashSet<String>) -> HashMap<String, String> {
+        let home = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from)
+            .unwrap_or_else(|| crate::paths::directories_base().join(".claude"));
+        self.scan_root(&home.join("projects"), wanted)
+    }
+
+    pub fn scan_root(&mut self, root: &Path, wanted: &HashSet<String>) -> HashMap<String, String> {
+        let mut found = HashSet::new();
+        let mut result = HashMap::new();
+        for project in directories(root) {
+            for id in wanted.iter().filter(|id| safe_session_id(id)) {
+                let path = project.join(format!("{id}.jsonl"));
+                let Ok(meta) = fs::metadata(&path) else { continue };
+                if !meta.is_file() { continue; }
+                found.insert(path.clone());
+                let cursor = self.files.entry(path.clone()).or_default();
+                if cursor.modified != meta.modified().ok() || cursor.len != meta.len() {
+                    if meta.len() <= cursor.len { *cursor = CliTitleCursor::default(); }
+                    if read_cli_titles(&path, id, cursor).is_ok() {
+                        cursor.modified = meta.modified().ok();
+                        cursor.len = meta.len();
+                    }
+                }
+                if let Some(title) = &cursor.title { add_title(&mut result, id, title, 0); }
+            }
+        }
+        self.files.retain(|path, _| found.contains(path));
+        result.into_iter().filter(|(_, (_, title))| !title.is_empty())
+            .map(|(id, (_, title))| (id, title)).collect()
+    }
+}
+
+/// 有界逐行读取：超长正文直接跳过，只反序列化显式 custom-title 元数据。
+fn read_cli_titles(path: &Path, id: &str, cursor: &mut CliTitleCursor) -> std::io::Result<()> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    const MAX_TITLE_LINE: usize = 16 * 1024;
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(cursor.offset))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    let mut oversized = false;
+    let mut position = cursor.offset;
+    loop {
+        let bytes = reader.fill_buf()?;
+        if bytes.is_empty() { break; }
+        let end = bytes.iter().position(|byte| *byte == b'\n');
+        let count = end.map_or(bytes.len(), |index| index + 1);
+        if !oversized {
+            if line.len() + count <= MAX_TITLE_LINE { line.extend_from_slice(&bytes[..count]); }
+            else { oversized = true; line.clear(); }
+        }
+        position += count as u64;
+        reader.consume(count);
+        if end.is_some() {
+            if !oversized && line.windows(b"\"custom-title\"".len()).any(|part| part == b"\"custom-title\"") {
+                if let Ok(row) = serde_json::from_slice::<CliTitleRow>(&line) {
+                    if row.kind == "custom-title" && row.session_id == id {
+                        let title: String = row.custom_title.split_whitespace().collect::<Vec<_>>()
+                            .join(" ").chars().take(160).collect();
+                        cursor.title = (!title.is_empty()).then_some(title);
+                    }
+                }
+            }
+            cursor.offset = position;
+            line.clear();
+            oversized = false;
+        }
+    }
+    Ok(())
+}
+
 /// 缓存未变的标题文件；外部文件短暂写坏时保留上次有效标题，删除则移除。
 #[derive(Default)]
 pub struct Titles {
     files: HashMap<PathBuf, (std::time::SystemTime, u64, DesktopTitle)>,
+    codex: crate::title_index::CodexTitles,
     /// 显式 CLI ID 关联；与显示名无关，只描述同一个 Desktop 会话的身份轮换。
     aliases: HashMap<String, String>,
 }
@@ -1616,6 +1759,13 @@ pub struct Titles {
 impl Titles {
     /// 与 Magpie 相同：当前 ID 优先历史 ID；同优先级冲突不随意认领名称。
     pub fn scan(&mut self, roots: &[PathBuf]) -> HashMap<String, String> {
+        let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| {
+            crate::paths::directories_base().join(".codex")
+        }).join("session_index.jsonl");
+        self.scan_paths(roots, &codex)
+    }
+
+    fn scan_paths(&mut self, roots: &[PathBuf], codex: &Path) -> HashMap<String, String> {
         let mut found = HashSet::new();
         let mut result = HashMap::<String, (u8, String)>::new();
         for root in roots {
@@ -1654,27 +1804,13 @@ impl Titles {
         }
         self.files.retain(|path, _| found.contains(path));
         self.aliases = alias_links(self.files.values().map(|(_, _, title)| title));
-        let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| {
-            crate::paths::directories_base().join(".codex")
-        }).join("session_index.jsonl");
-        // Magpie 也从此只追加索引读取名称，未换行记录留到下次扫描。
-        if let Ok(file) = fs::File::open(codex) {
-            use std::io::BufRead;
-            let mut reader = std::io::BufReader::new(file);
-            let mut row = String::new();
-            while reader.read_line(&mut row).is_ok_and(|n| n > 0) {
-                if row.ends_with('\n') {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&row) {
-                        if let (Some(id), Some(name)) = (value["id"].as_str(), value["thread_name"].as_str()) {
-                            result.insert(id.into(), (2, name.into()));
-                        }
-                    }
-                }
-                row.clear();
-            }
-        }
+        // Codex 同一 ID 的最新完整索引行覆盖此前名称，保留既有跨来源优先级。
+        result.extend(self.codex.scan(codex).into_iter().map(|(id, name)| (id, (2, name))));
         result.into_iter().filter(|(_, (_, name))| !name.is_empty()).map(|(id, (_, name))| (id, name)).collect()
     }
+
+    /// 大索引尚未追平时，后台线程缩短补扫间隔；不改变并发请求轮询节拍。
+    pub fn catching_up(&self) -> bool { self.codex.catching_up() }
 
     /// 最近一次扫描得到的显式 CLI 身份关联；只做展示归一，不改变账本或统计。
     pub fn aliases(&self) -> HashMap<String, String> {
@@ -1758,6 +1894,44 @@ mod tests {
     use super::*;
     use crate::usage::UsageLedger;
 
+    #[test]
+    fn cli_titles_follow_exact_ids_latest_complete_metadata_and_rewrites() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("hud-cli-titles-{}", std::process::id()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let id = "11111111-1111-4111-8111-111111111111";
+        let other = "22222222-2222-4222-8222-222222222222";
+        let path = project.join(format!("{id}.jsonl"));
+        let row = |session: &str, title: &str| serde_json::json!({
+            "type":"custom-title", "sessionId":session, "customTitle":title
+        }).to_string();
+        let first = row(id, "  本机  标题  ");
+        fs::write(&path, format!("{first}\n{{\"type\":\"user\",\"message\":\"不要当作标题\"}}\n{}\n", row(other, "错误 ID"))).unwrap();
+        let wanted = HashSet::from([id.to_string()]);
+        let mut titles = CliTitles::default();
+        assert_eq!(titles.scan_root(&root, &wanted)[id], "本机 标题");
+        let initial_offset = titles.files[&path].offset;
+        assert_eq!(titles.scan_root(&root, &wanted)[id], "本机 标题");
+        assert_eq!(titles.files[&path].offset, initial_offset);
+        let renamed = row(id, "最新会话名称");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", "x".repeat(200_000)).unwrap();
+        write!(file, "{renamed}").unwrap();
+        file.flush().unwrap();
+        assert_eq!(titles.scan_root(&root, &wanted)[id], "本机 标题");
+        writeln!(file).unwrap();
+        file.flush().unwrap();
+        assert_eq!(titles.scan_root(&root, &wanted)[id], "最新会话名称");
+        drop(file);
+        fs::write(&path, format!("{}\n", row(id, "重写后标题"))).unwrap();
+        assert_eq!(titles.scan_root(&root, &wanted)[id], "重写后标题");
+        assert!(titles.scan_root(&root, &HashSet::from(["../escape".into()])).is_empty());
+        fs::remove_file(&path).unwrap();
+        assert!(titles.scan_root(&root, &wanted).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// 完成卡从同 route_id 的 trace 补组链，但保留日志算出的完成时间；
     /// 没有同 id 的 trace 时保持空链并继续显示完成时间。
     #[test]
@@ -1794,6 +1968,52 @@ mod tests {
             .find(|card| card.route_id == Some(7) && !card.id.starts_with("live-")).unwrap();
         assert!(card.route_groups.is_empty());
         assert_eq!(card.updated_at, baseline_time);
+    }
+
+    /// route_id 相同但会话、子 Agent 或开始时刻不同时，不能借用响应报告模型。
+    #[test]
+    fn served_enrichment_requires_exact_session_subagent_and_time() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        let row = serde_json::json!({"route_id":7,"t":now.to_rfc3339(),"session":"alpha",
+            "subagent":"child-a","providerAccount":"one@example.com","provider":"codex",
+            "model":"sent-model","status":200,"in":10,"out":10,"ms":2000});
+        ledger.ingest(row.to_string().as_bytes());
+        let base = || ledger.snapshot("h", "ready", None);
+
+        // 会话不同：即使 route_id 相同也不能把别的会话的 served 借过来。
+        let mut live = LiveState::default();
+        live.routes.insert(7, LiveRoute { id: 7, session: "beta".into(), served: "borrowed".into(),
+            time: Some(now.to_rfc3339()), done: true, ..Default::default() });
+        let mut view = base();
+        live.apply(&mut view);
+        let card = &view.sessions[0].completed_subagents[0];
+        assert_eq!(card.served, None, "不同会话不能借用 served");
+        assert_eq!(card.model, "sent-model");
+
+        // 子 Agent 不同：根请求的 trace 不能覆盖子请求卡片。
+        live.routes.insert(7, LiveRoute { id: 7, session: "alpha".into(), subagent_id: String::new(),
+            served: "root-served".into(), time: Some(now.to_rfc3339()), done: true, ..Default::default() });
+        let mut view = base();
+        live.apply(&mut view);
+        assert_eq!(view.sessions[0].completed_subagents[0].served, None, "根 trace 不能覆盖子卡片");
+
+        // 开始时刻不同：网关重启复用 route_id 后，旧请求不能吃到新请求的 served。
+        let earlier = now - chrono::Duration::hours(2);
+        live.routes.insert(7, LiveRoute { id: 7, session: "alpha".into(), subagent_id: "child-a".into(),
+            served: "later-served".into(), time: Some(earlier.to_rfc3339()), done: true, ..Default::default() });
+        let mut view = base();
+        live.apply(&mut view);
+        assert_eq!(view.sessions[0].completed_subagents[0].served, None, "不同时刻不能借用 served");
+
+        // 三者都吻合时才补上响应报告模型。
+        live.routes.insert(7, LiveRoute { id: 7, session: "alpha".into(), subagent_id: "child-a".into(),
+            served: "exact-served".into(), time: Some(now.to_rfc3339()), done: true, ..Default::default() });
+        let mut view = base();
+        live.apply(&mut view);
+        let card = &view.sessions[0].completed_subagents[0];
+        assert_eq!(card.served.as_deref(), Some("exact-served"));
+        assert_eq!(card.model, "exact-served");
     }
 
     /// 活跃请求提前显示，不重复累计；完成与失联都停止活跃态。
@@ -2545,13 +2765,102 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn codex_incremental_titles_keep_source_precedence_and_exact_ids() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("hud-title-merge-{}", std::process::id()));
+        let org = root.join("claude-code-sessions/profile/org");
+        fs::create_dir_all(&org).unwrap();
+        let current = "11111111-1111-4111-8111-111111111111";
+        let prior = "22222222-2222-4222-8222-222222222222";
+        fs::write(org.join("local_sample.json"), serde_json::json!({"sessionId":"local_sample",
+            "cliSessionId":current,"priorCliSessionIds":[prior],"title":"Desktop title"}).to_string()).unwrap();
+        let codex = root.join("session_index.jsonl");
+        fs::write(&codex, format!("{}\n", serde_json::json!({"id":current,"thread_name":"Codex title"}))).unwrap();
+        let mut titles = Titles::default();
+        let names = titles.scan_paths(std::slice::from_ref(&root), &codex);
+        assert_eq!(names[current], "Codex title");
+        assert_eq!(names[prior], "Desktop title");
+        assert_eq!(titles.aliases()[prior], current);
+        assert!(!names.contains_key("11111111"));
+        let mut file = fs::OpenOptions::new().append(true).open(&codex).unwrap();
+        writeln!(file, "{}", serde_json::json!({"id":current,"thread_name":"Renamed"})).unwrap();
+        assert_eq!(titles.scan_paths(std::slice::from_ref(&root), &codex)[current], "Renamed");
+        writeln!(file, "{}", serde_json::json!({"id":current,"thread_name":""})).unwrap();
+        assert!(!titles.scan_paths(std::slice::from_ref(&root), &codex).contains_key(current));
+        drop(file);
+        fs::remove_file(&codex).unwrap();
+        assert_eq!(titles.scan_paths(std::slice::from_ref(&root), &codex)[current], "Desktop title");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gateway_addresses_are_literal_loopback_only() {
+        for (input, expected) in [
+            ("127.0.0.1:3425", "http://127.0.0.1:3425"),
+            ("http://localhost:3425/", "http://127.0.0.1:3425"),
+            ("[::1]:3425", "http://[::1]:3425"),
+        ] {
+            assert_eq!(gateway_url(input).unwrap(), expected);
+        }
+        for input in ["example.com:3425", "localhost.example.com:3425", "https://localhost:3425",
+            "127.0.0.1:3425@remote.example", "localhost:3425/path", "localhost:3425?x=1",
+            "localhost:3425#remote", "localhost:0", "localhost:65536", "localhost:+3425", "localhost:"] {
+            assert!(gateway_url(input).is_err(), "{input}");
+        }
+    }
+
+    /// 只监听临时回环端口；不依赖正在运行的 Magpie。
+    fn json_test_response(headers: &str, body: String) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let response = format!("HTTP/1.1 {headers}\r\nConnection: close\r\n\r\n{body}");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).unwrap();
+            // 客户端超限后主动断开是预期行为。
+            let _ = socket.write_all(response.as_bytes());
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn gateway_json_enforces_size_with_and_without_content_length() {
+        let agent = client(Duration::from_secs(5));
+        let (url, server) = json_test_response("200 OK\r\nContent-Length: 11", "{\"ok\":true}".into());
+        assert_eq!(read_json::<serde_json::Value>(&agent, &url).unwrap()["ok"], true);
+        server.join().unwrap();
+        for length_header in [false, true] {
+            // 没有 Content-Length 时也必须限制流式读取。
+            let body = format!("\"{}\"", "x".repeat(MAX_JSON_BYTES as usize));
+            let headers = if length_header { format!("200 OK\r\nContent-Length: {}", body.len()) }
+                else { "200 OK".into() };
+            let (url, server) = json_test_response(&headers, body);
+            assert!(read_json::<serde_json::Value>(&agent, &url).unwrap_err().contains("上限 8 MiB"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn gateway_client_rejects_redirects() {
+        let (url, server) = json_test_response("302 Found\r\nLocation: http://example.com/\r\nContent-Length: 0", String::new());
+        let error = read_json::<serde_json::Value>(&client(Duration::from_secs(3)), &url).unwrap_err();
+        assert!(error.contains("实时路由读取失败"), "{error}");
+        server.join().unwrap();
+    }
+
     /// 重启替换路由缓存；同级标题争议未知，当前身份优先历史身份。
     #[test]
     fn handles_restart_and_exact_title_identity() {
         let mut live = LiveState::default();
         live.update(TraceUpdate { pid: 1, seq: 10, ids: vec![1], routes: vec![LiveRoute { id: 1, ..Default::default() }] });
+        live.activity.active.push(Active { id: 1, route: 1, ..Active::default() });
         live.update(TraceUpdate { pid: 2, seq: 1, ..Default::default() });
         assert!(live.routes.is_empty());
+        assert!(live.activity.active.is_empty(), "旧进程的 activity 不得沿用到新网关");
         let mut names = HashMap::new();
         add_title(&mut names, "id", "old", 1);
         add_title(&mut names, "id", "current", 2);
@@ -2737,11 +3046,40 @@ mod tests {
         let mut view = ledger.snapshot("h", "ready", None);
         live.apply(&mut view);
         let card = &view.sessions[0].routes[0];
-        assert_eq!(card.updated_at.as_deref(), Some(updated_at(now.into(), 3_200).as_str()));
+        assert_eq!(card.updated_at, updated_at(now.into(), 3_200));
         assert!(card.updated_at.as_deref().unwrap().ends_with('Z'));
         assert_eq!(card.time.len(), 8);
         // 无子组信息时组链为空，不用模型名填充。
         assert!(card.route_groups.is_empty());
+    }
+
+    #[test]
+    fn active_card_handles_extreme_elapsed_time_and_recovers() {
+        let now = Local::now();
+        let mut live = LiveState::default();
+        live.activity.active.push(Active { id: 1, session: "alpha".into(), agent: "test".into(),
+            started: now.to_rfc3339(), ms: u64::MAX, phase: "upstream".into(), route: 10, ..Active::default() });
+        live.routes.insert(10, LiveRoute { id: 10, session: "alpha".into(), ..LiveRoute::default() });
+        let ledger = UsageLedger::new(now.date_naive());
+        for elapsed in [u64::MAX, i64::MAX as u64, 0, 3_200] {
+            live.activity.active[0].ms = elapsed;
+            let mut view = ledger.snapshot("h", "ready", None);
+            live.apply(&mut view);
+            let timestamp = &view.sessions[0].routes[0].updated_at;
+            if elapsed > i64::MAX as u64 / 2 {
+                assert!(timestamp.is_none(), "超出日期范围时省略更新时间");
+            } else {
+                assert!(timestamp.as_deref().is_some_and(|value| DateTime::parse_from_rfc3339(value).is_ok()));
+            }
+        }
+    }
+
+    #[test]
+    fn active_elapsed_time_rejects_negative_and_non_numeric_values() {
+        for ms in [serde_json::json!(-1), serde_json::json!(1.5), serde_json::json!("100"), serde_json::Value::Null] {
+            let payload = serde_json::json!({"id":1, "agent":"test", "started":"2026-11-06T00:00:00Z", "ms":ms});
+            assert!(serde_json::from_value::<Active>(payload).is_err());
+        }
     }
 
     /// 规则白名单只取 use/pick；when 表达式与其余字段不进入结构，时间/状态/响应模型可用。

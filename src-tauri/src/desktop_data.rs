@@ -25,6 +25,8 @@ pub(crate) struct Runtime {
     pub config: AppConfig,
     pub config_error: Option<String>,
     pub snapshot: RouteSnapshot,
+    pub timezone: String,
+    pub server_clock_offset_ms: i64,
     pub window_save: Arc<WindowSave>,
     pub details_save: Arc<WindowSave>,
     local: Option<Arc<Service>>,
@@ -49,6 +51,8 @@ impl Runtime {
             config,
             config_error,
             snapshot,
+            timezone: hud_core::paths::local_timezone(),
+            server_clock_offset_ms: 0,
             local: None,
             remote: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -90,7 +94,9 @@ pub(crate) fn start_source(app: AppHandle) {
         runtime.remote_stamp = None;
         runtime.stop = Arc::new(AtomicBool::new(false));
         runtime.snapshot = empty_snapshot(&runtime.config, runtime.config_error.clone());
-        let _ = app.emit("source-change", json!({"mode":runtime.config.connection.mode,"remoteUrl":runtime.config.connection.remote_url,"generation":runtime.generation}));
+        runtime.timezone = if runtime.config.connection.mode == "remote" { String::new() } else { hud_core::paths::local_timezone() };
+        runtime.server_clock_offset_ms = 0;
+        let _ = app.emit("source-change", json!({"mode":runtime.config.connection.mode,"remoteUrl":runtime.config.connection.remote_url,"generation":runtime.generation,"timezone":runtime.timezone}));
         let _ = app.emit("route-update", &runtime.snapshot);
         (
             runtime.config.clone(),
@@ -124,7 +130,9 @@ pub(crate) fn start_source(app: AppHandle) {
                             return;
                         }
                         runtime.remote = Some(client.clone());
-                        let _ = app.emit("connection-status", json!({"connected":true,"timezone":capabilities["timezone"],"collectors":capabilities["collectors"]}));
+                        runtime.timezone = capabilities["timezone"].as_str().unwrap_or("UTC").to_owned();
+                        note_server_clock(&mut runtime, &capabilities);
+                        let _ = app.emit("connection-status", json!({"connected":true,"timezone":capabilities["timezone"],"serverNow":capabilities["serverNow"],"collectors":capabilities["collectors"]}));
                         break;
                     }
                     Err(error) => {
@@ -167,9 +175,9 @@ pub(crate) fn start_source(app: AppHandle) {
             }
             let mut previous = None;
             while !stop.load(Ordering::Acquire) {
-                let mut snapshot = service.snapshot();
-                if previous != Some(snapshot.revision) {
-                    previous = Some(snapshot.revision);
+                if let Some(current) = service.snapshot_if_changed(previous) {
+                    previous = Some(current.revision);
+                    let mut snapshot = (*current).clone();
                     let mut runtime = lock(&state);
                     if runtime.generation != generation {
                         break;
@@ -227,6 +235,15 @@ fn source_error(app: &AppHandle, generation: u64, error: &str) {
     );
     let _ = app.emit("route-update", &runtime.snapshot);
 }
+fn note_server_clock(runtime: &mut Runtime, value: &Value) {
+    if let Some(stamp) = value["serverNow"].as_str()
+        .or_else(|| value["collectedAt"].as_str())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+    {
+        runtime.server_clock_offset_ms = stamp.timestamp_millis() - chrono::Utc::now().timestamp_millis();
+    }
+}
+
 fn accept_remote(app: &AppHandle, generation: u64, value: Value) {
     let Some(instance) = value["instanceId"].as_str() else {
         return;
@@ -261,15 +278,26 @@ fn accept_remote(app: &AppHandle, generation: u64, value: Value) {
         let _ = app.emit("source-change", json!({"mode":"remote","remoteUrl":runtime.config.connection.remote_url,"instanceId":instance,"bootId":boot,"generation":runtime.generation}));
     }
     runtime.remote_stamp = Some((instance.into(), boot.into(), revision));
+    note_server_clock(&mut runtime, &value);
+    if let Some(timezone) = value["timezone"].as_str().filter(|zone| !zone.is_empty()) {
+        runtime.timezone = timezone.to_owned();
+    }
     // UI revisions are local monotonic counters; the upstream revision is kept
     // separately so a restart or disconnect marker cannot suppress fresh data.
     snapshot.revision = runtime.snapshot.revision + 1;
     runtime.snapshot = snapshot;
     let _ = app.emit(
         "connection-status",
-        json!({"connected":true,"collectedAt":value["collectedAt"]}),
+        json!({"connected":true,"collectedAt":value["collectedAt"],"timezone":runtime.timezone,"serverNow":value["serverNow"]}),
     );
     let _ = app.emit("route-update", &runtime.snapshot);
+}
+
+pub(crate) fn clear_local_detail_cache(app: &AppHandle) {
+    let service = lock(&shared(app)).local.clone();
+    if let Some(service) = service {
+        std::thread::spawn(move || { let _ = service.clear_detail_cache(); });
+    }
 }
 
 pub(crate) async fn query(

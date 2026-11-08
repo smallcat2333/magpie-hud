@@ -41,7 +41,8 @@
   function readout(hour) {
     const item = series[hour];
     const interval = `${String(hour).padStart(2, '0')}:00–${String(hour + 1).padStart(2, '0')}:00`;
-    return `${interval}\n${item.tokens == null ? '—' : item.tokens.toLocaleString('zh-CN')} Token\n${item.cost == null ? '金额未提供' : `$${item.cost.toFixed(6)} USD${item.partial ? ' · 部分观测' : ''}`}`;
+    const coverage = item.requests == null ? '' : ` · 已定价 ${item.priced}/${item.requests} 次${item.unpriced ? `，未定价 ${item.unpriced}` : ''}${item.unmatched ? `，未匹配 ${item.unmatched}` : ''}`;
+    return `${interval}\n${item.tokens == null ? '—' : item.tokens.toLocaleString('zh-CN')} Token\n${item.cost == null ? '金额未提供' : `$${item.cost.toFixed(6)} USD${item.partial ? item.requests == null ? ' · 部分观测' : ' · 已知金额' : ''}`}${coverage}`;
   }
 
   function inspect(hour) {
@@ -196,7 +197,7 @@
     inspect(Math.floor((event.clientX - plot.getBoundingClientRect().left - geometry.left) / geometry.slot));
   });
   plot.addEventListener('pointerleave', () => { if (document.activeElement !== plot) hide(); });
-  plot.addEventListener('focus', () => inspect(activeHour ?? new Date().getHours()));
+  plot.addEventListener('focus', () => inspect(activeHour ?? serverHour()));
   plot.addEventListener('blur', hide);
   plot.addEventListener('keydown', event => {
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End', 'Escape'].includes(event.key)) return;
@@ -204,27 +205,127 @@
     if (event.key === 'Escape') { hide(); return; }
     inspect(event.key === 'Home' ? 0 : event.key === 'End' ? 23 : (activeHour ?? 0) + (event.key === 'ArrowRight' ? 1 : -1));
   });
+  // 服务器时区下的当前小时与今天；未知时区时退回本地时钟。
+  function serverDate() { return new Date(window.HudData.now ? window.HudData.now() : Date.now()); }
+  function serverHour() {
+    const zone = window.HudData.timeZone();
+    if (zone) {
+      try { return Number(new Intl.DateTimeFormat('en-GB', { timeZone: zone, hour: '2-digit', hourCycle: 'h23' }).format(serverDate())); }
+      catch { /* 时区名称无效时退回本地小时 */ }
+    }
+    return serverDate().getHours();
+  }
+  function serverToday() {
+    // 没有服务器时钟校准时用后端报告的日期，避免客户端时钟偏差把今天判成历史。
+    if (window.HudData.serverNowKnown !== true && window.HudData.today()) return window.HudData.today();
+    const zone = window.HudData.timeZone();
+    if (zone) {
+      try { return new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(serverDate()); }
+      catch { /* 时区名称无效时退回本地日期 */ }
+    }
+    return serverDate().toLocaleDateString('en-CA');
+  }
+
+  let currentView = null, refreshTimer = 0;
+  const priceCache = new Map();
+  // 缓存键包含数据源代际：换源后旧条目自然失效，晚到的响应按代际丢弃。
+  const priceKey = view => JSON.stringify([window.HudData.generation, view.date, view.sourceKey]);
+  const priceTtl = view => view.date === serverToday() ? 60_000 : 300_000;
+
+  function showCurrentView() {
+    if (!currentView) return;
+    const view = currentView;
+    const cached = view.sourceKey ? priceCache.get(priceKey(view)) : null;
+    const hours = cached?.data?.hours;
+    renderView({ ...view,
+      error: view.error || cached?.error,
+      priceStatus: view.sourceKey ? cached?.error ? '小时金额更新失败' : !hours ? '小时金额正在更新' : '' : '',
+      hourly: view.sourceKey ? Array.from({ length: 24 }, (_, hour) => {
+        const price = hours?.[hour];
+        return { ...view.hourly?.[hour], cost: price?.cost ?? null,
+          costPartial: Boolean(price && price.priced < price.requests),
+          requests: price?.requests, priced: price?.priced, unpriced: price?.unpriced, unmatched: price?.unmatched };
+      }) : view.hourly,
+    });
+  }
+
+  async function loadHourlyPrices() {
+    clearTimeout(refreshTimer);
+    const view = currentView;
+    if (!view?.sourceKey || window.HudData.preview) return;
+    const cacheKey = priceKey(view);
+    const generation = window.HudData.generation;
+    let entry = priceCache.get(cacheKey);
+    const ttl = priceTtl(view);
+    if (entry?.pending) return;
+    if (entry && Date.now() - entry.at < ttl) {
+      refreshTimer = setTimeout(loadHourlyPrices, Math.max(0, ttl - (Date.now() - entry.at)));
+      return;
+    }
+    entry ||= { at: 0, data: null, error: '', pending: false };
+    entry.pending = true;
+    entry.at = Date.now();
+    priceCache.set(cacheKey, entry);
+    // 只淘汰已完成的非当前项；异步任务继续持有自己的 entry。
+    if (priceCache.size > 32) {
+      const old = [...priceCache.keys()].find(key => key !== cacheKey && !priceCache.get(key).pending);
+      if (old) priceCache.delete(old);
+    }
+    try {
+      const data = await window.HudData.invoke('query_hourly_costs', { date: view.date, sourceKey: view.sourceKey });
+      if (!data || data.date !== view.date || data.hours?.length !== 24 || data.fetchFailed) throw new Error('小时费用未能完整读取');
+      entry.data = data;
+      entry.error = '';
+    } catch (error) {
+      if (error?.hudStale) { priceCache.delete(cacheKey); return; }
+      entry.error = String(error);
+    } finally {
+      entry.pending = false;
+      // 切换日期、来源或数据源后，不让旧查询覆盖当前图。
+      if (generation === window.HudData.generation && currentView?.sourceKey && priceKey(currentView) === cacheKey) {
+        showCurrentView();
+        refreshTimer = setTimeout(loadHourlyPrices, Math.max(0, priceTtl(currentView)));
+      }
+    }
+  }
+
   window.addEventListener('hud-hourly-update', event => {
-    const { hourly, date, scope, error } = event.detail;
-    const nextKey = JSON.stringify([hourly, date, scope, error, new Date().getHours()]);
+    currentView = event.detail;
+    // 每次切换都取消上一个视图的刷新定时器，避免它在新视图下触发。
+    clearTimeout(refreshTimer);
+    showCurrentView();
+    loadHourlyPrices();
+  });
+  window.HudData.listen('source-change', () => {
+    priceCache.clear();
+    clearTimeout(refreshTimer);
+    showCurrentView();
+    loadHourlyPrices();
+  });
+
+  function renderView({ hourly, date, scope, error, priceStatus, sourceKey }) {
+    const nextKey = JSON.stringify([hourly, date, scope, error, priceStatus, sourceKey, serverHour()]);
     if (nextKey === key) return;
     key = nextKey;
     animateUpdate = true;
-    const today = date === new Date().toLocaleDateString('en-CA');
+    const today = date === serverToday();
+    const hourNow = serverHour();
     series = Array.from({ length: 24 }, (_, hour) => {
       const value = hourly?.[hour];
       return {
-        tokens: today && hour > new Date().getHours() ? null : Number.isFinite(value?.tokens) ? value.tokens : null,
-        cost: today && hour > new Date().getHours() ? null : Number.isFinite(value?.cost) ? value.cost : null,
+        tokens: today && hour > hourNow ? null : Number.isFinite(value?.tokens) ? value.tokens : null,
+        cost: today && hour > hourNow ? null : Number.isFinite(value?.cost) ? value.cost : null,
         partial: Boolean(value?.costPartial),
+        requests: value?.requests, priced: value?.priced, unpriced: value?.unpriced, unmatched: value?.unmatched,
       };
     });
-    context = `${date} ${scope}，24 小时 Token 柱状图与金额折线图，分别缩放，范围为最值外留百分之五；全局金额使用网关小时历史，会话金额记录连续观测增量，缺失时段留空${error ? '，金额为上次读数' : ''}`;
+    const priceNote = sourceKey ? '来源金额按逐请求定价及请求开始小时汇总，部分覆盖只显示已知金额' : '全局金额使用网关小时历史';
+    context = `${date} ${scope}，24 小时 Token 柱状图与金额折线图，分别缩放，范围为最值外留百分之五；${priceNote}，缺失时段留空${priceStatus ? `，${priceStatus}` : ''}${error && !priceStatus ? '，金额为上次读数' : ''}`;
     plot.title = context;
     plot.setAttribute('aria-label', `${context}，左右方向键查看每小时数值`);
     const rows = series.map((item, hour) => {
       const row = document.createElement('tr');
-      for (const value of [`${hour}h–${hour + 1}h`, item.tokens == null ? '—' : item.tokens.toLocaleString('zh-CN'), item.cost == null ? '—' : `${item.cost.toFixed(6)}${item.partial ? '（部分观测）' : ''}`]) {
+      for (const value of [`${hour}h–${hour + 1}h`, item.tokens == null ? '—' : item.tokens.toLocaleString('zh-CN'), item.cost == null ? '—' : `${item.cost.toFixed(6)}${item.partial ? item.requests == null ? '（部分观测）' : '（已知金额）' : ''}${item.requests == null ? '' : `；已定价 ${item.priced}/${item.requests}`}`]) {
         const cell = document.createElement('td');
         cell.textContent = value;
         row.append(cell);
@@ -233,5 +334,5 @@
     });
     document.querySelector('#hourly-table tbody').replaceChildren(...rows);
     schedule();
-  });
+  }
 })();

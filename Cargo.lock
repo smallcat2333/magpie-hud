@@ -2104,7 +2104,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "magpie-hud"
-version = "1.0.20"
+version = "1.0.32"
 dependencies = [
  "chrono",
  "keyring",
@@ -2121,9 +2121,10 @@ dependencies = [
 
 [[package]]
 name = "magpie-hud-core"
-version = "1.0.20"
+version = "1.0.32"
 dependencies = [
  "chrono",
+ "iana-time-zone",
  "notify",
  "serde",
  "serde_json",
@@ -2132,7 +2133,7 @@ dependencies = [
 
 [[package]]
 name = "magpie-hud-server"
-version = "1.0.20"
+version = "1.0.32"
 dependencies = [
  "async-stream",
  "axum",

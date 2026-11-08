@@ -157,18 +157,16 @@ impl App {
         if self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        let snapshot = self.service.snapshot();
-        let old = self.current.borrow();
+        let previous_revision = self.current.borrow().get("revision").and_then(Value::as_u64);
+        let Some(snapshot) = self.service.snapshot_if_changed(previous_revision) else { return };
         let revision = snapshot.revision;
-        if old.get("revision").and_then(Value::as_u64) == Some(revision) {
-            return;
-        }
-        drop(old);
-        let mut value = serde_json::to_value(snapshot).unwrap_or(Value::Null);
+        let mut value = serde_json::to_value(snapshot.as_ref()).unwrap_or(Value::Null);
         self.scrub(&mut value);
         self.current.send_replace(Arc::new(json!({
             "instanceId": self.instance_id, "bootId": self.boot_id, "revision": revision,
-            "collectedAt": chrono::Utc::now().to_rfc3339(), "snapshot": value,
+            "collectedAt": chrono::Utc::now().to_rfc3339(),
+            "serverNow": chrono::Local::now().to_rfc3339(),
+            "timezone": self.config.timezone.clone().unwrap_or_else(hud_core::paths::local_timezone), "snapshot": value,
         })));
     }
     fn scrub(&self, value: &mut Value) {
@@ -400,8 +398,9 @@ async fn capabilities(State(app): State<Arc<App>>) -> Json<Value> {
     app.scrub(&mut health);
     Json(
         json!({"protocolVersion":1,"instanceId":app.instance_id,"bootId":app.boot_id,
-        "timezone":app.config.timezone.clone().or_else(||std::env::var("TZ").ok()).unwrap_or_else(||chrono::Local::now().format("%Z %:z").to_string()),
-        "features":{"fullSnapshots":true,"history":true,"details":true,"sourceFilter":true},"collectors":health}),
+        "timezone":app.config.timezone.clone().unwrap_or_else(hud_core::paths::local_timezone),
+        "serverNow":chrono::Local::now().to_rfc3339(),
+        "features":{"fullSnapshots":true,"history":true,"details":true,"detailsPaged":true,"sourceFilter":true},"collectors":health}),
     )
 }
 async fn snapshot(State(app): State<Arc<App>>) -> Json<Value> {
@@ -418,6 +417,9 @@ async fn query(
             | "query_month_usage"
             | "query_route_history"
             | "query_usage_details"
+            | "query_usage_details_overview"
+            | "query_usage_details_view"
+            | "query_hourly_costs"
             | "query_model_costs"
     ) {
         return failure(StatusCode::NOT_FOUND, "未知查询");

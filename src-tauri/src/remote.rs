@@ -60,8 +60,10 @@ impl RemoteClient {
                 .connect_timeout(Duration::from_secs(5))
                 .redirect(reqwest::redirect::Policy::none())
         };
+        // Pricing may paginate for up to 90 seconds in the service; leave room
+        // for log scanning and serialization as well. Streams use a separate cap.
         let client = build()
-            .timeout(Duration::from_secs(40))
+            .timeout(Duration::from_secs(150))
             .build()
             .map_err(|_| "无法初始化 HTTPS 客户端")?;
         // Reopen the stream periodically to bound cancellation latency. Every
@@ -96,6 +98,7 @@ impl RemoteClient {
             200 => Ok(response),
             401 | 403 => Err("HUD 查看密钥无效、已撤销或访问被拒绝".into()),
             429 => Err("远端 HUD 查询繁忙，请稍后重试".into()),
+            404 => Err("远端 HUD 不支持此查询，请升级服务端以启用分页详情和小时费用".into()),
             _ => Err("远端 HUD 返回错误，请检查服务版本和状态".into()),
         }
     }
@@ -106,6 +109,9 @@ impl RemoteClient {
                 | "query_month_usage"
                 | "query_route_history"
                 | "query_usage_details"
+                | "query_usage_details_overview"
+                | "query_usage_details_view"
+                | "query_hourly_costs"
                 | "query_model_costs"
         ) {
             return Err("未知远端查询".into());
@@ -219,9 +225,25 @@ impl RemoteClient {
         }
     }
 }
+const MAX_QUERY_BYTES: u64 = 16 * 1024 * 1024;
+
 fn read_json(response: reqwest::blocking::Response) -> Result<Value, String> {
-    serde_json::from_reader(response.take(16 * 1024 * 1024))
-        .map_err(|_| "远端 HUD 数据格式无效或超过大小限制".into())
+    // Details now travel as an overview plus bounded pages. Keep a transport
+    // ceiling for other DTOs, but report oversize separately from malformed JSON.
+    if response.content_length().is_some_and(|len| len > MAX_QUERY_BYTES) {
+        return Err("远端查询结果过大，请缩小日期范围或使用分页详情".into());
+    }
+    decode_json(response)
+}
+
+fn decode_json(reader: impl Read) -> Result<Value, String> {
+    let mut bytes = Vec::new();
+    reader.take(MAX_QUERY_BYTES + 1).read_to_end(&mut bytes)
+        .map_err(|_| "远端 HUD 响应读取失败".to_string())?;
+    if bytes.len() as u64 > MAX_QUERY_BYTES {
+        return Err("远端查询结果过大，请缩小日期范围或使用分页详情".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "远端 HUD 数据格式无效".into())
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -274,6 +296,14 @@ pub fn forget_key(reference: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn remote_json_distinguishes_large_results_from_invalid_data() {
+        assert_eq!(decode_json(&b"{\"rows\":[],\"pageSize\":30}"[..]).unwrap()["pageSize"], 30);
+        assert!(decode_json(&b"{broken"[..]).unwrap_err().contains("格式无效"));
+        let too_large = vec![b' '; MAX_QUERY_BYTES as usize + 1];
+        assert!(decode_json(too_large.as_slice()).unwrap_err().contains("分页详情"));
+    }
+
+    #[test]
     fn remote_addresses_require_tls_and_never_embed_credentials() {
         for bad in [
             "http://example.com",
@@ -297,6 +327,8 @@ mod tests {
             for route in [
                 "/api/v1/capabilities",
                 "/api/v1/query/query_date_stats",
+                "/api/v1/query/query_usage_details_overview",
+                "/api/v1/query/query_usage_details_view",
                 "/api/v1/events",
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -336,6 +368,12 @@ mod tests {
                         "2026-11-08"
                     );
                     ("application/json", r#"{"daily":{"tokens":14}}"#.to_owned())
+                } else if route.ends_with("query_usage_details_overview") {
+                    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["start"], "2026-11-08");
+                    ("application/json", r#"{"datasetId":42,"total":20000}"#.to_owned())
+                } else if route.ends_with("query_usage_details_view") {
+                    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["query"]["datasetId"], 42);
+                    ("application/json", r#"{"page":1,"pageSize":30,"rows":[]}"#.to_owned())
                 } else {
                     ("text/event-stream", "event: snapshot\ndata: {\"instanceId\":\"instance\",\"bootId\":\"boot\",\"revision\":3,\"snapshot\":{\"date\":\"2026-11-08\"}}\n\n".to_owned())
                 };
@@ -351,6 +389,8 @@ mod tests {
                 .unwrap()["daily"]["tokens"],
             14
         );
+        assert_eq!(client.query("query_usage_details_overview", serde_json::json!({"start":"2026-11-08","end":"2026-11-08"})).unwrap()["datasetId"], 42);
+        assert_eq!(client.query("query_usage_details_view", serde_json::json!({"query":{"datasetId":42,"page":1}})).unwrap()["pageSize"], 30);
         let stop = Arc::new(AtomicBool::new(false));
         let (send, receive) = std::sync::mpsc::channel();
         client.subscribe(

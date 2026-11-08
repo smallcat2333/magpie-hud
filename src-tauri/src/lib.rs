@@ -58,6 +58,9 @@ impl WindowSave {
 struct StartupState {
     snapshot: RouteSnapshot,
     pinned: bool,
+    timezone: String,
+    #[serde(rename = "serverNow")]
+    server_now: String,
 }
 
 /// 窗口创建尚未完成时，后续双击等待同一轮创建，避免并发注册相同标签。
@@ -89,6 +92,8 @@ pub fn run() {
             open_usage_details,
             usage_details_context,
             query_usage_details,
+            query_usage_details_view,
+            query_hourly_costs,
             query_model_costs,
             query_route_history,
             set_pinned,
@@ -186,18 +191,18 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 /// 提供已缓存的快照，避免页面每次切会话都重读日志。
 #[tauri::command]
 fn startup_state(app: AppHandle) -> StartupState {
-    let snapshot = app
-        .state::<Arc<Mutex<Runtime>>>()
-        .lock()
-        .expect("状态锁损坏")
-        .snapshot
-        .clone();
+    let (snapshot, timezone, server_clock_offset_ms) = {
+        let state = app.state::<Arc<Mutex<Runtime>>>();
+        let runtime = state.lock().expect("状态锁损坏");
+        (runtime.snapshot.clone(), runtime.timezone.clone(), runtime.server_clock_offset_ms)
+    };
     let pinned = app
         .get_webview_window("main")
         .expect("缺少窗口")
         .is_always_on_top()
         .unwrap_or(true);
-    StartupState { snapshot, pinned }
+    let server_now = (chrono::Utc::now() + chrono::Duration::milliseconds(server_clock_offset_ms)).to_rfc3339();
+    StartupState { snapshot, pinned, timezone, server_now }
 }
 
 /// 单实例详情窗口；启动先订阅再读取上下文，避免首次打开丢失事件。
@@ -240,6 +245,7 @@ async fn open_usage_details(app: AppHandle, context: details::DetailContext) -> 
                 schedule_details_save(&handle);
             }
             tauri::WindowEvent::CloseRequested{..} | tauri::WindowEvent::Focused(false) => {let _=remember_details(&handle);}
+            tauri::WindowEvent::Destroyed => desktop_data::clear_local_detail_cache(&handle),
             _=>{}
         });
     }
@@ -253,12 +259,22 @@ fn usage_details_context(app: AppHandle) -> details::DetailContext {
 
 #[tauri::command]
 async fn query_usage_details(app: AppHandle, start: String, end: String, filters: Option<details::DetailFilters>) -> Result<Value, String> {
-    desktop_data::query(app, "query_usage_details", json!({"start":start,"end":end,"filters":filters})).await
+    desktop_data::query(app, "query_usage_details_overview", json!({"start":start,"end":end,"filters":filters})).await
 }
 
 #[tauri::command]
-async fn query_model_costs(app: AppHandle, session: Option<String>, source_key: Option<String>) -> Result<Value, String> {
-    desktop_data::query(app, "query_model_costs", json!({"session":session,"sourceKey":source_key})).await
+async fn query_usage_details_view(app: AppHandle, query: Value) -> Result<Value, String> {
+    desktop_data::query(app, "query_usage_details_view", json!({"query":query})).await
+}
+
+#[tauri::command]
+async fn query_hourly_costs(app: AppHandle, date: String, source_key: String) -> Result<Value, String> {
+    desktop_data::query(app, "query_hourly_costs", json!({"date":date,"sourceKey":source_key})).await
+}
+
+#[tauri::command]
+async fn query_model_costs(app: AppHandle, session: Option<String>, source_key: Option<String>, date: Option<String>) -> Result<Value, String> {
+    desktop_data::query(app, "query_model_costs", json!({"session":session,"sourceKey":source_key,"date":date})).await
 }
 
 #[tauri::command]

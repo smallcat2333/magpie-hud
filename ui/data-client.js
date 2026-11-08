@@ -18,6 +18,10 @@
   let capabilities = null;
   let serverToday = '';
   let serverTimeZone = '';
+  // serverNow 是后端采集时刻（RFC3339/毫秒），用于校准客户端时钟偏差；
+  // 缺省按实时 Date.now，偏差只在远端返回后生效。
+  let serverNowOffset = 0;
+  let serverNowKnown = false;
   let stale = false;
   let es = null;
   let streamWanted = false;
@@ -45,15 +49,44 @@
     return serverToday;
   }
 
+  // 服务器时钟校准：远端收集时刻与本地接收时刻相减，作为客户端时钟偏差。
+  // 只接受有限时间戳；无效值不改变既有校准。
+  function noteServerNow(value) {
+    let stamp = null;
+    if (typeof value === 'number' && Number.isFinite(value)) stamp = value;
+    else if (typeof value === 'string' && value) {
+      const parsed = Date.parse(value);
+      if (Number.isFinite(parsed)) stamp = parsed;
+    }
+    if (stamp === null) return;
+    // 服务器时间戳减去本地接收时刻，得到本地相对服务器的偏移。
+    serverNowOffset = stamp - Date.now();
+    serverNowKnown = true;
+  }
+
+  function noteClockSource(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    // 支持多种字段名；capabilities 与快照信封都可能携带采集时刻。
+    for (const key of ['serverNow', 'serverTime', 'now', 'collectedAt', 'time']) {
+      if (payload[key] !== undefined) { noteServerNow(payload[key]); break; }
+    }
+  }
+
+  function now() {
+    return Date.now() + serverNowOffset;
+  }
+
   function noteSnapshotDate(snapshot) {
     if (!snapshot || typeof snapshot !== 'object') return serverToday;
     if (typeof snapshot.timezone === 'string' && snapshot.timezone) serverTimeZone = snapshot.timezone;
+    noteClockSource(snapshot);
     return noteToday(snapshot.latestDate || snapshot.date);
   }
 
   function noteCapabilities(caps) {
     capabilities = caps || null;
     if (typeof caps?.timezone === 'string' && caps.timezone) serverTimeZone = caps.timezone;
+    noteClockSource(caps);
     return capabilities;
   }
 
@@ -82,6 +115,10 @@
     if (!force && ident === sourceKey && !genChanged) return;
     sourceKey = ident;
     generation += 1;
+    serverToday = '';
+    serverTimeZone = typeof body.timezone === 'string' ? body.timezone : '';
+    serverNowOffset = 0;
+    serverNowKnown = false;
     emit('source-change', {
       generation, sourceKey,
       mode: body.mode || '', remoteUrl: body.remoteUrl || '',
@@ -107,6 +144,9 @@
       lastRevision = rev;
     }
     envelope = env;
+    // 信封自己的 serverNow/collectedAt 比快照内部字段更可靠。
+    if (typeof env.timezone === 'string' && env.timezone) serverTimeZone = env.timezone;
+    noteClockSource(env);
     noteSnapshotDate(env.snapshot);
     if (notify) emit('route-update', env.snapshot);
     return true;
@@ -153,7 +193,14 @@
 
   function browserInvoke(command, args) {
     if (!/^[a-z][a-z0-9_]*$/.test(command)) throw fail('未知查询');
-    return postJson(`/api/v1/query/${command}`, args ?? {});
+    // 浏览器走分页概览；旧版服务端没有该命令时给出明确升级提示。
+    const mapped = command === 'query_usage_details' ? 'query_usage_details_overview' : command;
+    return postJson(`/api/v1/query/${mapped}`, args ?? {}).catch(error => {
+      if (mapped !== command && /未知查询/.test(String(error?.message || ''))) {
+        throw fail('远端 HUD 版本过旧，不支持用量详情分页。请升级到 1.0.32 或更新版本。');
+      }
+      throw error;
+    });
   }
 
   function bindShellEvent(event) {
@@ -166,6 +213,7 @@
 
   function noteConnection(payload) {
     const body = payload && typeof payload === 'object' ? payload : {};
+    noteClockSource(body);
     if (typeof body.timezone === 'string' && body.timezone) serverTimeZone = body.timezone;
     if (body.connected === false) {
       connectionError = typeof body.error === 'string' && body.error ? body.error : '远端已断开 · 最后数据';
@@ -365,9 +413,16 @@
     return () => set.delete(handler);
   }
 
+  function noteDesktopState(state) {
+    if (typeof state?.timezone === 'string' && state.timezone) serverTimeZone = state.timezone;
+    noteClockSource(state);
+    return noteSnapshotDate(state?.snapshot);
+  }
+
   async function refreshDesktopSnapshot() {
     try {
       const state = await desktopInvoke('startup_state');
+      noteDesktopState(state);
       if (state?.snapshot) emit('route-update', state.snapshot);
     } catch { /* 后端随后的 route-update 仍会补上。 */ }
   }
@@ -378,7 +433,7 @@
     if (preview) return '';
     if (shell) {
       const state = await desktopInvoke('startup_state');
-      return noteSnapshotDate(state?.snapshot);
+      return noteDesktopState(state);
     }
     try {
       return noteSnapshotDate((await getJson('/api/v1/snapshot'))?.snapshot);
@@ -393,7 +448,7 @@
     if (preview) return { snapshot: null, pinned: false, preview: true };
     if (shell) {
       const state = await desktopInvoke('startup_state');
-      noteSnapshotDate(state?.snapshot);
+      noteDesktopState(state);
       return state;
     }
     streamWanted = true;
@@ -486,6 +541,9 @@
     noteToday,
     serverToday: serverTodayValue,
     timeZone() { return serverTimeZone; },
+    // 校准后的服务器毫秒时刻；未知服务器时间时等于 Date.now()。
+    now,
+    get serverNowKnown() { return serverNowKnown; },
     connectionError() { return connectionError; },
     invoke,
     listen,

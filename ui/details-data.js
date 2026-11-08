@@ -44,7 +44,33 @@
       && Object.entries(filters).every(([key, values]) => !values.size || values.has(r[key]))
       && (!cycle || r.provider === cycle.provider && r.account === cycle.account && r.timestamp >= cycle.start && r.timestamp < cycle.end));
   }
-  const api = { aggregate, group, filter };
+  // 请求表先对轻量排序键分页，仅为可见行构建统计和格式化文本。
+  function requestPage(rows, costs = [], { metric = 'tokens', sort = 'time', descending = true, page = 0, pageSize = 30 } = {}) {
+    const prices = costIndex(costs);
+    const value = row => {
+      const key = sort === 'value' ? metric : sort;
+      if (key === 'time' || key === 'label') return row.timestamp;
+      if (key === 'calls') return 1;
+      if (key === 'speed') return row.generationMs > 0 ? row.output * 1000 / row.generationMs : null;
+      if (key === 'cache') return row.input + row.cacheRead > 0 ? row.cacheRead * 100 / (row.input + row.cacheRead) : null;
+      if (key === 'cost' || key === 'average') {
+        const group = prices.get(row.id);
+        if (!group || group.rowIds.length !== 1) return null;
+        return key === 'average' ? (group.priced ? group.cost / group.priced : null) : group.cost;
+      }
+      return row[key];
+    };
+    const ordered = rows.map(row => ({ row, value: value(row) }));
+    ordered.sort((a,b) => {
+      if (a.value == null) return b.value == null ? 0 : 1;
+      if (b.value == null) return -1;
+      const comparison = typeof a.value === 'string' ? a.value.localeCompare(b.value, 'zh-CN') : a.value - b.value;
+      return descending ? -comparison : comparison;
+    });
+    const selected = Math.max(0, Math.min(page, Math.max(0, Math.ceil(rows.length / pageSize) - 1)));
+    return { rows: ordered.slice(selected * pageSize, (selected + 1) * pageSize).map(entry => entry.row), page: selected, total: rows.length };
+  }
+  const api = { aggregate, group, filter, requestPage };
   if (typeof module !== 'undefined') module.exports = api;
   else window.usageDetailsData = api;
 })();
