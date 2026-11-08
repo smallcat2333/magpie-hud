@@ -40,6 +40,9 @@
 /* 有明确等待依据时使用黄色；普通上游请求保持蓝色，不从缺失首字字段推断等待。 */
 :root{--route-waiting:#e6cf89}
 .branch.waiting{stroke:var(--route-waiting);stroke-dasharray:6 8;animation:route-stream 1s linear infinite}
+/* 连线独立绘制；每秒仍移动 28px，每步不足 1px，避免高刷新率屏幕逐帧重栅格化整层。 */
+#route-lines,#source-lines{contain:paint;transform:translateZ(0)}
+.branch.running,.branch.waiting,.route-active.flowing{animation-timing-function:steps(30,end)}
 .branch-base.waiting{stroke:var(--route-waiting)}
 .state-tag[data-status="waiting"]{color:var(--route-waiting)}
 .route-card.waiting::before{background:var(--route-waiting)}.route-card.waiting{border-color:#8a7748}

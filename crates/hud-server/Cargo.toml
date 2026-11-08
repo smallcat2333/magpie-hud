@@ -1,6 +1,6 @@
 [package]
 name = "magpie-hud-server"
-version = "1.0.32"
+version = "1.0.33"
 edition = "2021"
 description = "Headless Magpie HUD collector, authenticated API and web dashboard"
 

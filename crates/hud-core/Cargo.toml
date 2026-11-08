@@ -1,6 +1,6 @@
 [package]
 name = "magpie-hud-core"
-version = "1.0.32"
+version = "1.0.33"
 description = "Magpie HUD 只读采集与统计核心"
 edition = "2021"
 
