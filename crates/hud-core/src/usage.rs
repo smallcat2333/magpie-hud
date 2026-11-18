@@ -778,7 +778,7 @@ impl UsageLedger {
             notes[0].kind = "文件".into();
             notes[0].text = "未检测到 Magpie usage.jsonl，请确认 Magpie 已运行过".into();
         }
-        let warning = error.is_some() || self.malformed > 0;
+        let warning = error.is_some() || (self.malformed > 0 && !self.records.is_empty());
         let state = if warning {
             "warning"
         } else if file_state == "missing" {
@@ -816,8 +816,10 @@ impl UsageLedger {
             quota_error: None,
             cost_error: None,
             notes,
-            error: error
-                .or_else(|| (self.malformed > 0).then(|| "日志中有无效行，已保留有效记录".into())),
+            error: error.or_else(|| {
+                (self.malformed > 0 && !self.records.is_empty())
+                    .then(|| "日志中有无效行，已保留有效记录".into())
+            }),
         }
     }
 
@@ -1356,6 +1358,24 @@ mod tests {
                 .with_timezone(&Local)
                 .date_naive(),
         )
+    }
+
+    /// 当天没有任何有效记录时，历史坏行不显示“保留有效数据”。
+    #[test]
+    fn empty_day_hides_malformed_warning_until_valid_records_exist() {
+        let mut ledger = ledger();
+        ledger.ingest(b"not json");
+        let view = ledger.snapshot("h", "ready", None);
+        assert!(view.sessions.is_empty());
+        assert_eq!(view.state, "waiting");
+        assert_eq!(view.watch_label, "等待今日记录");
+        assert!(view.error.is_none());
+        ledger.ingest(fixture(1, "alpha", 200).to_string().as_bytes());
+        ledger.ingest(b"still bad");
+        let view = ledger.snapshot("h", "ready", None);
+        assert_eq!(view.daily.requests, 1);
+        assert_eq!(view.state, "warning");
+        assert_eq!(view.watch_label, "读取异常 · 保留有效数据");
     }
 
     /// 首字时间被戳到请求末尾时，生成窗口只剩几十毫秒，折算速度失真，不计入速度统计。

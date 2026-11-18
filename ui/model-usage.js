@@ -10,13 +10,16 @@
   const table = document.getElementById('model-usage-table-body');
   const tooltip = document.getElementById('model-usage-tooltip');
   const ns = 'http://www.w3.org/2000/svg';
-  // 固定色序：蓝、橙、青绿、紫、玫红、青、柠绿、琥珀、蓝紫、浅粉；灰色仅用于合并项，模型切换口径时保持同色。
-  const colors = ['#3987e5', '#d95926', '#199e70', '#9085e9', '#d55181', '#4cb8d8', '#a9c93f', '#f4a340', '#b48ef0', '#e58cd0'];
+  // 系列决定主色相，具体型号再用名称哈希生成附近的色相和明度。
+  const familyHues = new Map([
+    ['gpt', 255], ['claude', 48], ['deepseek', 354], ['gemini', 170],
+    ['qwen', 300], ['grok', 110], ['llama', 205], ['mistral', 75], ['glm', 145], ['kimi', 325],
+  ]);
   const effortColors = { low: '#9ccfff', medium: '#8dd7b0', high: '#e6cf89', xhigh: '#f2b17c', max: '#ef97ab', ultra: '#e4acdf', none: '#969aa5' };
   const effortOrder = ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
   const format = new Intl.NumberFormat('zh-CN');
   const compact = value => value >= 1e6 ? `${(value / 1e6).toFixed(1)}M` : value >= 1e3 ? `${(value / 1e3).toFixed(1)}k` : format.format(value);
-  let rows = [], scope = '', mode = 'tokens', selected = null, hideTimer = 0, layoutFrame = 0, lastRender = '', colorsByModel = new Map();
+  let rows = [], scope = '', mode = 'tokens', selected = null, hideTimer = 0, layoutFrame = 0, lastRender = '';
   let context = { date: '', session: null, sourceKey: null, revision: 0, historical: false };
   let costState = { key: '', status: 'idle', hasData: false, rows: [], warnings: [] };
   const node = (tag, className, text) => {
@@ -92,10 +95,23 @@
     }
     return result;
   }
+  function hashName(name) {
+    let hash = 2166136261;
+    for (let i = 0; i < name.length; i++) hash = Math.imul(hash ^ name.charCodeAt(i), 16777619);
+    return (hash ^ (hash >>> 16)) >>> 0;
+  }
   function colorFor(name) {
-    if (name === '其他') return '#626b7a';
-    if (!colorsByModel.has(name)) colorsByModel.set(name, colors[colorsByModel.size] || '#696f79');
-    return colorsByModel.get(name);
+    if (name === '其他' || name === '服务模型未提供') return '#626b7a';
+    // 去掉供应商路径；未知系列用版本号之前的名称推断，例如 aurora-2 和 aurora-3。
+    const normalized = name.trim().toLowerCase();
+    const model = normalized.split('/').at(-1) || normalized;
+    const prefix = model.split(/[-_.:\d]/, 1)[0];
+    const family = model.split(/[-_.:]?v?\d/, 1)[0] || model;
+    const baseHue = familyHues.get(prefix) ?? (hashName(family) % 360);
+    const hash = hashName(model);
+    const hue = (baseHue + (hash % 17) - 8 + 360) % 360;
+    const lightness = 51 + ((hash >>> 16) % 15);
+    return `oklch(${lightness}% 0.14 ${hue})`;
   }
   // 按面积二分；优先保留每个能单独展示的模型，其余汇入同一个“其他”。
   function rectangles(items, x, y, width, height) {
@@ -296,7 +312,6 @@
     }
     // 清理上一次空/加载状态，再按当前尺寸计算比例。
     plot.querySelector('.model-usage-empty')?.remove();
-    sorted.forEach(item => colorFor(item.name));
     const rects = layoutModels(sorted, plot.clientWidth, plot.clientHeight);
     const existing = new Map([...plot.querySelectorAll('.model-usage-cell')].map(cell => [cell.dataset.model, cell]));
     for (const { item, x, y, width, height } of rects) {
