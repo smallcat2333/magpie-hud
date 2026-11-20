@@ -7,7 +7,7 @@ const vm = require('node:vm');
 const window = {};
 const script = path.join(__dirname, '../ui/live-speed.js');
 vm.runInNewContext(fs.readFileSync(script, 'utf8'), { window }, { filename: script });
-const { cardSpeed, aggregate, createAverage, createTrend, relativeChange } = window.hudLiveSpeed;
+const { cardSpeed, aggregate, createAverage, relativeChange } = window.hudLiveSpeed;
 
 const running = { liveTokensPerSecond: 82.3, liveOutputTokens: 1234, tokensPerSecond: 42.6 };
 const fallback = { value: 42.6, live: false, text: '42.6 TPS' };
@@ -59,19 +59,52 @@ for (const [previous, current, expected] of [
   assert.equal(relativeChange(previous, current), expected);
 }
 
-// 趋势图按分钟统计，最多保留最近 30 分钟（30 个点）。
-const trend = createTrend(100, 10_000);
-assert.equal(trend.deadline, 60_100);
-assert.equal(trend.record(100, 150, 2), undefined);
-assert.equal(trend.record(30_100, 50, 1), undefined);
-assert.deepEqual({ ...trend.record(60_100, null, 1) }, { end: 70_000, tps: 100, concurrency: 1.5 });
-assert.deepEqual({ ...trend.record(120_100, 0, 0) }, { end: 130_000, tps: null, concurrency: 1 });
-assert.deepEqual({ ...trend.record(180_100, null, null) }, { end: 190_000, tps: 0, concurrency: 0 });
-assert.deepEqual({ ...trend.record(300_100, 90, 1) }, { end: 310_000, tps: null, concurrency: null });
-assert.deepEqual({ ...trend.points.at(-2) }, { end: 250_000, tps: null, concurrency: null });
-for (let i = 6; i <= 40; i++) trend.record(100 + i * 60_000);
-assert.equal(trend.points.length, 30);
-assert.equal(trend.points[0].end, 670_000);
-assert.deepEqual({ ...trend.points.at(-1) }, { end: 2_410_000, tps: 90, concurrency: 1 });
+const { createTrend, recentTrend } = window.hudLiveSpeed;
+const minute = 60_000;
+const plain = points => structuredClone(points);
+
+// 打开时立即从磁盘生成 30 格，输出从首字开始，并发从请求开始。
+const requests = [
+  { session: 'a', start: 0, firstToken: minute, end: 2 * minute, output: 120 },
+  { session: 'a', start: 30_000, end: 90_000, output: 60 },
+  { session: 'b', start: 30_000, end: 90_000, output: 0 },
+];
+const initial = plain(recentTrend(requests, new Map(), 2 * minute + 1, true));
+assert.equal(initial.length, 30);
+assert.deepEqual(initial.slice(-2), [
+  { end: minute, tps: 0.5, concurrency: 1.5 },
+  { end: 2 * minute, tps: 2.5, concurrency: 1.5 },
+]);
+assert.deepEqual(initial.at(-3), { end: 0, tps: 0, concurrency: 0 });
+// 超长请求仍回填，但只遍历图中的 30 格。
+const long = recentTrend([{ session: 'a', start: 0, end: 90 * minute, output: 5400 }], new Map(), 90 * minute, true);
+assert.equal(long[0].end, 61 * minute);
+assert.equal(long.at(-1).tps, 1);
+
+// 零值也入图，空闲超过 30 分钟后仍逐分钟推移。
+const trend = createTrend(30_000);
+trend.record(30_000, 100, 2);
+assert.equal(trend.record(minute, 0, 0), true);
+assert.equal(trend.points.has(minute), false);
+for (let i = 2; i <= 42; i++) assert.equal(trend.record(i * minute), true);
+assert.equal(trend.points.size, 30);
+const idle = plain(recentTrend([], trend.points, 42 * minute, false));
+assert.deepEqual(idle[0], { end: 13 * minute, tps: 0, concurrency: 0 });
+assert.deepEqual(idle.at(-1), { end: 42 * minute, tps: 0, concurrency: 0 });
+
+// 睡眠时不把旧读数延伸到间隔里，回来后的完整分钟继续记。
+assert.equal(trend.record(75 * minute, 40, 2), true);
+assert.equal(trend.points.size, 0);
+assert.deepEqual(plain(recentTrend([], trend.points, 75 * minute, false)).at(-1),
+  { end: 75 * minute, tps: null, concurrency: null });
+assert.equal(trend.record(76 * minute), true);
+assert.deepEqual({ ...trend.points.get(76 * minute) }, { tps: 40, concurrency: 2 });
+const weighted = createTrend(0);
+weighted.record(0, 40, 2);
+assert.equal(weighted.record(30_000, 20, 1), false);
+weighted.record(60_005);
+assert.deepEqual({ ...weighted.points.get(minute) }, { tps: 30, concurrency: 1.5 });
+weighted.record(2 * minute);
+assert.deepEqual({ ...weighted.points.get(2 * minute) }, { tps: 20, concurrency: 1 });
 
 console.log('live-speed tests passed');

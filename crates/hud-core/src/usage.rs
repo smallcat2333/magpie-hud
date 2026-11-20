@@ -368,6 +368,9 @@ pub struct RouteSnapshot {
     /// 今日已结束外部请求按会话、来源、模型和强度展开，供前端按当前筛选合计。
     #[serde(default)]
     pub model_usage: Vec<ModelUsage>,
+    /// 最近结束的已完成请求区间，前端按分钟回填 TPS 与并发趋势，打开时不必从零累计。
+    #[serde(default)]
+    pub recent_requests: Vec<RecentRequest>,
     /// 所有日期日志中同一密钥 ID 最新的名称，仅用于展示。
     pub caller_key_names: HashMap<String, String>,
     pub quotas: Vec<crate::telemetry::Quota>,
@@ -385,6 +388,7 @@ pub struct UsageLedger {
     earliest_day: Option<NaiveDate>,
     caller_key_names: HashMap<String, (i64, String)>,
     records: Vec<Record>,
+    prior_requests: Vec<RecentRequest>,
     seen: HashSet<String>,
     pub revision: u64,
     malformed: u64,
@@ -405,6 +409,7 @@ impl UsageLedger {
             earliest_day: None,
             caller_key_names: HashMap::new(),
             records: Vec::new(),
+            prior_requests: Vec::new(),
             seen: HashSet::new(),
             revision: 0,
             malformed: 0,
@@ -489,7 +494,16 @@ impl UsageLedger {
                 self.caller_key_names.insert(id.into(), (time, name.into()));
             }
         }
-        if record_day < self.day || record_day > self.end_day {
+        let duration = finite_number(&value, "ms");
+        let prior_day = record_day < self.day;
+        if record_day > self.end_day || (prior_day && !duration
+            .and_then(|ms| request_end(timestamp.timestamp_millis(), ms))
+            .and_then(DateTime::from_timestamp_millis)
+            .is_some_and(|end| {
+                let midnight = self.day.and_hms_opt(0, 0, 0).unwrap();
+                end.with_timezone(&Local).naive_local()
+                    >= midnight - chrono::Duration::milliseconds(RECENT_REQUEST_SPAN_MS)
+            })) {
             return;
         }
         let identity = record_identity(&value, timestamp.timestamp_millis());
@@ -497,13 +511,12 @@ impl UsageLedger {
             return;
         }
         let number = |key| value.get(key).and_then(Value::as_u64).unwrap_or(0);
-        let duration = finite_number(&value, "ms");
         let generation = duration
             .zip(finite_number(&value, "ttft_ms"))
             .map(|(ms, ttft)| ms - ttft)
             .filter(|ms| *ms > 0.0);
         let agent = string(&value, "agent").unwrap_or("Agent 未提供");
-        self.records.push(Record {
+        let record = Record {
             identity,
             route_id: value.get("route_id").and_then(Value::as_i64),
             subagent: string(&value, "subagent").unwrap_or("").into(),
@@ -562,7 +575,15 @@ impl UsageLedger {
             },
             generation_ms: generation,
             credits: finite_number(&value, "credits"),
-        });
+        };
+        if prior_day {
+            if let Some(request) = record.recent_request(i64::MIN, i64::MAX) {
+                self.prior_requests.push(request);
+                self.revision += 1;
+            }
+            return;
+        }
+        self.records.push(record);
         self.malformed = 0;
         self.revision += 1;
     }
@@ -819,6 +840,7 @@ impl UsageLedger {
             daily,
             agent_stats,
             model_usage: model_usage(&self.records),
+            recent_requests: self.recent_requests(Local::now().timestamp_millis()),
             caller_key_names: self.caller_key_names.iter().map(|(id, (_, name))| (id.clone(), name.clone())).collect(),
             quotas: Vec::new(),
             quota_error: None,
@@ -829,6 +851,15 @@ impl UsageLedger {
                     .then(|| "日志中有无效行，已保留有效记录".into())
             }),
         }
+    }
+
+    fn recent_requests(&self, now: i64) -> Vec<RecentRequest> {
+        let cutoff = now.saturating_sub(RECENT_REQUEST_SPAN_MS);
+        // 容许少量时钟偏差，前端只显示已结束的记录。
+        let latest = now.saturating_add(60_000);
+        self.prior_requests.iter().filter(|request| (cutoff..=latest).contains(&request.end))
+            .cloned().chain(self.records.iter().filter_map(|record| record.recent_request(cutoff, latest)))
+            .collect()
     }
 
     /// 费用按需查询只复制当前范围的窄身份字段，不重新扫描日志。
@@ -1020,6 +1051,54 @@ pub struct ModelUsage {
     pub output_tokens: u64,
     pub generation_ms: f64,
     pub speed_samples: u64,
+}
+
+/// 趋势回填覆盖的时长。比 30 分钟图多留余量，快照缓存期间也够前端裁剪。
+const RECENT_REQUEST_SPAN_MS: i64 = 40 * 60_000;
+
+/// 一次已完成请求占用的时间区间（毫秒时间戳），不含正文与账号。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RecentRequest {
+    pub session: String,
+    pub agent: String,
+    pub caller_key_id: String,
+    pub caller_key_name: String,
+    pub start: i64,
+    pub end: i64,
+    /// 可信的首字时刻；输出按 [首字, 结束] 均摊。缺失时按整段请求均摊。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token: Option<i64>,
+    pub output: u64,
+}
+
+fn request_end(start: i64, duration: f64) -> Option<i64> {
+    (duration.is_finite() && duration >= 1.0).then(|| start.saturating_add(duration as i64))
+}
+
+impl Record {
+    fn recent_request(&self, cutoff: i64, latest: i64) -> Option<RecentRequest> {
+        if self.handed_on || self.session.is_empty() {
+            return None;
+        }
+        let start = self.timestamp_ms;
+        let end = request_end(start, self.duration_ms?)?;
+        if !(cutoff..=latest).contains(&end) {
+            return None;
+        }
+        let (id, name, _) = source_of(&self.caller_key_id, &self.caller_key_name, &self.via);
+        Some(RecentRequest {
+            session: self.session.clone(),
+            agent: self.agent.clone(),
+            caller_key_id: id,
+            caller_key_name: name,
+            start,
+            end,
+            first_token: self.ttft_ms.filter(|ms| *ms >= 0.0 && *ms < (end - start) as f64)
+                .map(|ms| start.saturating_add(ms as i64)),
+            output: self.output,
+        })
+    }
 }
 
 /// 有密钥时身份是 callerKeyId，显示名仍是密钥名称，via 只作标签。
@@ -2100,6 +2179,50 @@ mod tests {
         assert_eq!((success.output_tokens, success.generation_ms, success.speed_samples), (150, 4000.0, 3));
         let failed = usage.iter().find(|row| row.outcome == "failed").unwrap();
         assert_eq!((failed.output_tokens, failed.generation_ms, failed.speed_samples), (0, 0.0, 0));
+    }
+
+    #[test]
+    fn recent_requests_keep_forty_minutes_of_spans_for_trend_backfill() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        let old = now - chrono::Duration::minutes(50);
+        for (id, time, status, out, ms, ttft, extra) in [
+            (1, old, 200, 10, 2000, 500, json!({})),
+            (2, now, 200, 300, 4000, 1000, json!({"callerKeyId":"k1","callerKeyName":"Key"})),
+            (3, now, 499, 20, 1500, 100, json!({"via":"dev"})),
+            (4, now, 200, 99, 1000, 900, json!({"handed_on":true})),
+        ] {
+            let mut row = json!({"route_id":id,"t":time.to_rfc3339(),"session":"s","agent":"codex","model":"m",
+                "status":status,"in":1,"out":out,"ms":ms,"ttft_ms":ttft});
+            row.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            ledger.ingest(row.to_string().as_bytes());
+        }
+        let recent = ledger.snapshot("", "ready", None).recent_requests;
+        let start = now.timestamp_millis();
+        assert_eq!(recent.len(), 2, "超出 40 分钟与已转交的请求不回填");
+        assert_eq!(recent[0], RecentRequest { session: "s".into(), agent: "codex".into(), caller_key_id: "k1".into(),
+            caller_key_name: "Key".into(), start, end: start + 4000, first_token: Some(start + 1000), output: 300 });
+        // 取消请求同样占用并发时段，已记录的首字仍可用于分配输出。
+        assert_eq!((recent[1].caller_key_name.as_str(), recent[1].first_token, recent[1].output), ("dev", Some(start + 100), 20));
+    }
+
+    #[test]
+    fn trend_backfills_across_midnight_without_changing_daily_totals() {
+        use chrono::TimeZone;
+        let day = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+        let midnight = Local.from_local_datetime(&day.and_hms_opt(0, 0, 0).unwrap()).earliest().unwrap();
+        let mut ledger = UsageLedger::new(day);
+        for (id, minutes_ago) in [(1, 45), (2, 5)] {
+            let start = midnight - chrono::Duration::minutes(minutes_ago);
+            let row = json!({"route_id":id,"t":start.to_rfc3339(),"session":"s","status":200,
+                "in":1,"out":60,"ms":120_000,"ttft_ms":2_000});
+            ledger.ingest(row.to_string().as_bytes());
+            ledger.ingest(row.to_string().as_bytes());
+        }
+        let recent = ledger.recent_requests(midnight.timestamp_millis());
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].end, midnight.timestamp_millis() - 180_000);
+        assert_eq!(ledger.day_stats().0.requests, 0);
     }
 
     #[test]

@@ -161,7 +161,7 @@
   window.hudLiveTrend = {
     update(history) {
       points = history;
-      root.hidden = !points.some(point => point.tps !== null || point.concurrency !== null);
+      root.hidden = points.length === 0;
       select(points.findIndex(point => point.end === selectedEnd));
     },
   };

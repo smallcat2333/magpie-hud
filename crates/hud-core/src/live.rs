@@ -967,6 +967,9 @@ impl LiveState {
     /// 把历史 CLI ID 的模型用量归到当前规范会话，前端选中展示 ID 时不会漏计。
     fn fold_model_usage(&self, view: &mut RouteSnapshot) {
         if self.aliases.is_empty() { return; }
+        for request in &mut view.recent_requests {
+            if let Some(canonical) = self.aliases.get(&request.session) { request.session.clone_from(canonical); }
+        }
         let mut folded: Vec<crate::usage::ModelUsage> = Vec::new();
         let mut index = HashMap::<(String, String, String, String, String, String, String), usize>::new();
         for row in view.model_usage.drain(..) {

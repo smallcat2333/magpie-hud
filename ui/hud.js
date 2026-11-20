@@ -655,8 +655,10 @@
   }
 
   let activeSpeedScope;
+  let activeTrendSession;
   let activeSpeedWindow;
   let activeTrendWindow;
+  let activeTrendKey;
   let activeSpeedTimer;
   let previousActiveSpeed = null;
 
@@ -680,49 +682,67 @@
   function resetActiveSpeed() {
     clearTimeout(activeSpeedTimer);
     activeSpeedScope = undefined;
+    activeTrendSession = undefined;
     activeSpeedWindow = undefined;
     activeTrendWindow = undefined;
+    activeTrendKey = undefined;
     showActiveSpeed(null);
     window.hudLiveTrend.update([]);
   }
 
-  function sampleActiveSpeed(now, tps, count) {
+  function sampleActiveSpeed(now, clock, tps, count) {
     const speed = activeSpeedWindow.record(now, tps);
     if (speed !== undefined) showActiveSpeed(linkStale() ? null : speed);
-    const point = activeTrendWindow.record(now, tps, count);
-    if (point) {
-      window.hudLiveTrend.update(activeTrendWindow.points);
-      requestDraw();
-    }
+    return activeTrendWindow.record(clock, tps, count);
+  }
+
+  function scheduleActiveSpeed(now, clock) {
+    const delay = Math.min(activeSpeedWindow.deadline - now, activeTrendWindow.deadline - clock);
+    activeSpeedTimer = setTimeout(publishActiveSpeed, Math.max(1, Math.ceil(delay)));
   }
 
   function publishActiveSpeed() {
-    if (!activeSpeedWindow || !activeTrendWindow) return;
-    sampleActiveSpeed(performance.now());
-    const nextDeadline = Math.min(activeSpeedWindow.deadline, activeTrendWindow.deadline);
-    activeSpeedTimer = setTimeout(publishActiveSpeed, Math.max(0, nextDeadline - performance.now()));
+    if (!activeSpeedWindow) return;
+    const now = performance.now();
+    const clock = window.HudData.now();
+    if (sampleActiveSpeed(now, clock)) showActiveTrend(clock);
+    scheduleActiveSpeed(now, clock);
   }
 
   /** 同一筛选范围内按时间累积主请求与子 Agent 的合计 TPS：读数按 15 秒窗口，趋势图按分钟。 */
-  function renderActiveSpeed(sessions, scope, activeCount) {
-    if (linkStale()) return;
+  function renderActiveSpeed(sessions, sessionId, activeCount) {
+    const scope = JSON.stringify([selectedAgent, sessionId]);
+    const now = performance.now();
+    const clock = window.HudData.now();
     if (activeSpeedScope !== scope) {
       resetActiveSpeed();
       activeSpeedScope = scope;
-    }
-    const cards = sessions.flatMap(session => [
-      ...session.routes.filter(card => isLiveState(card.state)), ...activeSubagents(session),
-    ]);
-    const { tokensPerSecond, streams } = window.hudLiveSpeed.aggregate(cards);
-    const now = performance.now();
-    if (!activeSpeedWindow) {
+      activeTrendSession = sessionId;
       activeSpeedWindow = window.hudLiveSpeed.createAverage(now);
-      activeTrendWindow = window.hudLiveSpeed.createTrend(now, Date.now());
-      const nextDeadline = Math.min(activeSpeedWindow.deadline, activeTrendWindow.deadline);
-      activeSpeedTimer = setTimeout(publishActiveSpeed, Math.max(0, nextDeadline - now));
+      activeTrendWindow = window.hudLiveSpeed.createTrend(clock);
+      scheduleActiveSpeed(now, clock);
     }
-    const rate = streams ? tokensPerSecond : activeCount ? null : 0;
-    sampleActiveSpeed(now, rate, activeCount);
+    if (!linkStale()) {
+      const cards = sessions.flatMap(session => [
+        ...session.routes.filter(card => isLiveState(card.state)), ...activeSubagents(session),
+      ]);
+      const { tokensPerSecond, streams } = window.hudLiveSpeed.aggregate(cards);
+      const rate = streams ? tokensPerSecond : activeCount ? null : 0;
+      sampleActiveSpeed(now, clock, rate, activeCount);
+    }
+    showActiveTrend(clock);
+  }
+
+  function showActiveTrend(clock) {
+    const hasLog = Array.isArray(snapshot.recentRequests) && snapshot.state !== 'missing' && !linkStale();
+    const key = JSON.stringify([snapshot.revision, activeTrendWindow.deadline, hasLog]);
+    if (key === activeTrendKey) return;
+    activeTrendKey = key;
+    const requests = (snapshot.recentRequests || []).filter(request =>
+      (!activeTrendSession || request.session === activeTrendSession) &&
+      (selectedAgent === '*' || sourceKey(request) === selectedAgent));
+    window.hudLiveTrend.update(window.hudLiveSpeed.recentTrend(requests, activeTrendWindow.points, clock, hasLog));
+    requestDraw();
   }
 
   /** 当日输出速度为 Σout / Σ(ms−ttft_ms)，不把输入或缓存读计为输出吞吐。 */
@@ -1459,7 +1479,7 @@
     const activeScope = session ? session.label : statsScope();
     const activeHint = `${activeScope}：${activeCount} 个会话正在同时请求（含正在请求的子 Agent，同一会话只计一次）`;
     window.hudMotion.roll(byId('active-session-count'), String(activeCount));
-    renderActiveSpeed(session ? [session] : allSessions, JSON.stringify([selectedAgent, session?.id]), activeCount);
+    renderActiveSpeed(session ? [session] : allSessions, session?.id, activeCount);
     byId('active-sessions').title = activeHint;
     byId('active-sessions').setAttribute('aria-label', activeHint);
     hud.dataset.scope = session ? 'session' : 'all';
@@ -1791,7 +1811,7 @@
     if (linkStale()) hud.dataset.state = 'disconnected';
     if (!snapshot) resetActiveSpeed();
     else if (activeSpeedWindow) {
-      sampleActiveSpeed(performance.now(), null, null);
+      sampleActiveSpeed(performance.now(), window.HudData.now(), null, null);
       showActiveSpeed(null);
     }
     // 连同退场动画内的卡片一起恢复上一轮读数。
