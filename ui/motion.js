@@ -92,7 +92,7 @@
     return changed;
   }
 
-  function roll(node, value) {
+  function roll(node, value, direction = 'down') {
     const previous = node.dataset.motionValue ?? node.textContent;
     node.dataset.motionValue = value;
     if (previous === value) return;
@@ -124,12 +124,13 @@
       reel.append(cell);
     });
     node.replaceChildren(reel, label);
+    const travel = direction === 'up' ? -100 : 100;
     reel.querySelectorAll('.metric-digit').forEach(cell => {
       const old = cell.querySelector('.metric-digit-old');
       const next = cell.querySelector('.metric-digit-new');
-      const outgoing = animate(old, [{ transform: 'translateY(0)' }, { transform: 'translateY(100%)' }], 360);
+      const outgoing = animate(old, [{ transform: 'translateY(0)' }, { transform: `translateY(${travel}%)` }], 360);
       outgoing.effect.updateTiming({ fill: 'forwards' });
-      animate(next, [{ transform: 'translateY(-100%)' }, { transform: 'translateY(0)' }], 360);
+      animate(next, [{ transform: `translateY(${-travel}%)` }, { transform: 'translateY(0)' }], 360);
     });
     const finish = () => { if (reel.isConnected) node.replaceChildren(document.createTextNode(value)); };
     setTimeout(finish, 400);

@@ -4,31 +4,32 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Magpie HUD V.1.0.36</title>
+  <title>Magpie HUD V.1.0.39</title>
   <link rel="icon" href="icons/magpie.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="hud.css?v=1.0.36">
-  <script src="data-client.js?v=1.0.36" defer></script>
-  <script src="motion.js?v=1.0.36" defer></script>
-  <script src="hourly.js?v=1.0.36" defer></script>
-  <link rel="stylesheet" href="dates.css?v=1.0.36">
-  <script src="dates.js?v=1.0.36" defer></script>
-  <link rel="stylesheet" href="history.css?v=1.0.36">
-  <script src="history.js?v=1.0.36" defer></script>
-  <link rel="stylesheet" href="model-usage.css?v=1.0.36">
-  <script src="model-costs.js?v=1.0.36" defer></script>
-  <script src="model-usage.js?v=1.0.36" defer></script>
-  <link rel="stylesheet" href="decision-route.css?v=1.0.36">
-  <script src="decision-route.js?v=1.0.36" defer></script>
-  <script src="redact.js?v=1.0.36" defer></script>
-  <script src="source-icons.js?v=1.0.36" defer></script>
-  <script src="live-speed.js?v=1.0.36"></script>
-  <script src="hud.js?v=1.0.36" defer></script>
+  <link rel="stylesheet" href="hud.css?v=1.0.39">
+  <script src="data-client.js?v=1.0.39" defer></script>
+  <script src="motion.js?v=1.0.39" defer></script>
+  <script src="hourly.js?v=1.0.39" defer></script>
+  <link rel="stylesheet" href="dates.css?v=1.0.39">
+  <script src="dates.js?v=1.0.39" defer></script>
+  <link rel="stylesheet" href="history.css?v=1.0.39">
+  <script src="history.js?v=1.0.39" defer></script>
+  <link rel="stylesheet" href="model-usage.css?v=1.0.39">
+  <script src="model-costs.js?v=1.0.39" defer></script>
+  <script src="model-usage.js?v=1.0.39" defer></script>
+  <link rel="stylesheet" href="decision-route.css?v=1.0.39">
+  <script src="decision-route.js?v=1.0.39" defer></script>
+  <script src="redact.js?v=1.0.39" defer></script>
+  <script src="source-icons.js?v=1.0.39" defer></script>
+  <script src="live-speed.js?v=1.0.39" defer></script>
+  <script src="live-trend.js?v=1.0.39" defer></script>
+  <script src="hud.js?v=1.0.39" defer></script>
 </head>
 <body>
 <main class="hud" id="hud" data-state="waiting" data-sources="compact" data-focus="true">
   <header class="window-bar" id="drag-region" data-tauri-drag-region>
     <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 4-12 5 10 5-10 4 12M7 5l5 3 5-3"/></svg>
-    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.1.0.36</span></h1><span class="brand-subtitle">路由监视</span>
+    <h1 class="brand-name">Magpie HUD <span class="app-version" id="app-version">V.1.0.39</span></h1><span class="brand-subtitle">路由监视</span>
     <span class="watch-state" id="watch-label" role="status">等待今日记录</span>
     <button id="agent-select" class="agent-select" type="button" role="combobox" aria-label="按 Agent 筛选路由" aria-haspopup="listbox" aria-expanded="false" aria-controls="agent-options"><span class="agent-caption">Agent</span><span class="agent-icon" aria-hidden="true">∗</span><span class="agent-value">全部</span><span class="agent-arrow" aria-hidden="true">⌄</span></button>
     <label class="scope-label" for="session-select">查看</label>
@@ -83,7 +84,16 @@
     <section class="routing" aria-label="Agent 经 magpie 路由到会话账号">
       <svg id="route-lines" class="route-lines" aria-hidden="true"></svg>
       <div class="transit">
-      <div id="active-sessions" class="active-sessions" role="status" aria-live="polite" aria-label="0 个会话正在请求"><strong id="active-session-count">0</strong><span id="active-tps" title="" hidden></span></div>
+      <div class="active-monitor">
+        <div id="active-sessions" class="active-sessions" role="status" aria-live="polite" aria-label="0 个会话正在请求"><strong id="active-session-count">0</strong><span id="active-tps" title="" hidden></span></div>
+        <figure id="active-trend" hidden>
+          <div class="active-trend-plot" tabindex="0" role="group" aria-label="过去 30 分钟的 TPS 折线与平均并发会话数柱状图，每分钟一组。按左右方向键查看。">
+            <canvas aria-hidden="true"></canvas>
+            <span class="active-trend-value active-trend-peak"></span><span class="active-trend-value active-trend-floor"></span><span class="active-trend-value active-trend-mean"></span>
+          </div>
+          <output hidden><strong></strong><span></span></output>
+        </figure>
+      </div>
       <svg id="source-lines" class="source-lines" aria-hidden="true"></svg>
       <div class="source-node" tabindex="0" id="source-node">
         <div id="source-list" class="source-list"><div class="source-entry"><div class="source-heading"><span class="source-icon"><img src="icons/claude-color.svg" alt=""></span><strong>等待请求</strong></div></div></div>

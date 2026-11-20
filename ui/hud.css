@@ -116,13 +116,27 @@
 .hud[data-layout="wide"] .source-node{width:100%;min-height:0;justify-self:start;overflow-x:hidden;overflow-y:auto;scrollbar-width:none}
 .hud[data-layout="wide"] .source-heading{justify-content:flex-start;gap:8px;text-align:left;padding-left:12px}
 .source-icon{width:44px;height:44px;font-size:30px}.source-icon img{width:42px;height:42px}
-.active-sessions{position:absolute;top:8px;left:20px;z-index:2;color:var(--running);font-variant-numeric:tabular-nums;cursor:help}
+/* 并发读数与趋势独占左侧中转栏的上部，路由卡片布局不受影响。 */
+.active-monitor{position:absolute;top:8px;left:20px;width:128px;z-index:2;font-variant-numeric:tabular-nums}
+.active-sessions{display:flex;align-items:baseline;gap:8px;color:var(--running);cursor:help;white-space:nowrap}
 #active-session-count{display:block;height:40px;overflow:hidden;font-size:32px;line-height:40px;font-weight:500;position:relative}
 #active-session-count .metric-reel{display:block;line-height:40px}#active-session-count .metric-digit{height:40px}
-#active-tps{display:block;margin-top:-2px;font-size:12px;line-height:16px;font-weight:600;white-space:nowrap;opacity:.85}
+#active-tps{display:block;position:relative;margin-top:-2px;font-size:12px;line-height:16px;font-weight:600;white-space:nowrap;color:var(--muted);color:color-mix(in oklab,var(--muted),var(--tps-pole,var(--muted)) var(--tps-strength,0%));transition:color 360ms ease}
+#active-tps[data-trend="up"]{--tps-pole:#ec5e65}
+#active-tps[data-trend="down"]{--tps-pole:#4c95f3}
 #active-tps[hidden]{display:none}
-.hud[data-layout="tall"] .active-sessions{display:none}
-@media(max-height:540px){.active-sessions{display:none}}
+@media(prefers-reduced-motion:reduce){#active-tps{transition:none}}
+#active-trend{--trend-red:#ec5e65;--trend-blue:#4c95f3;margin:0}
+.active-trend-plot{position:relative;height:94px;touch-action:pan-y;border-radius:3px}
+.active-trend-plot canvas{display:block;width:100%;height:100%}
+.active-trend-value{position:absolute;pointer-events:none;font-size:10px;line-height:13px;transform:translateX(-50%)}
+.active-trend-peak{color:var(--trend-red)}.active-trend-floor{color:var(--trend-blue)}
+.active-trend-mean{left:2px;transform:translateY(-50%);color:var(--muted)}
+#active-trend output{display:block;padding:2px 4px;border-left:1px solid var(--edge);line-height:13px;font-size:10px;white-space:nowrap}
+#active-trend output span{display:block;color:var(--muted)}
+.hud[data-layout="tall"] .active-monitor{display:none}
+@media(max-height:540px){.active-monitor{display:none}}
+@media(min-height:541px){.hud[data-layout="wide"] .transit:has(#active-trend:not([hidden])){padding-top:173px}}
 .hud[data-layout="wide"] .routes{padding-left:20px}
 .source-copy{display:flex;flex:1;flex-direction:column;gap:3px;min-width:0}
 .source-copy strong{max-width:100%;font-size:11px}
