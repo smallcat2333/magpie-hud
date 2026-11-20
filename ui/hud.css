@@ -27,6 +27,7 @@
 .hud .daily .metric dt{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 .hud .daily .metric dd,.hud .daily .metric:nth-child(2) dd{font-size:14px;line-height:22px;margin:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:-.3px;font-weight:600}
 .hud .daily .metric small{display:none}
+.card-metrics[data-live="true"] .card-tps{font-weight:600}
 .hud .daily #daily-cache{color:var(--stat-cache)}.hud .daily #daily-calls{color:var(--stat-calls)}.hud .daily #daily-average{color:var(--stat-average)}
 .hud .daily .metric::before{content:none}
 .hud .daily .metric:not(:nth-child(3n + 1))::before{content:"";position:absolute;left:0;top:50%;width:0;height:10px;transform:translateY(-50%);border-left:1px solid var(--edge)}
@@ -118,6 +119,8 @@
 .active-sessions{position:absolute;top:8px;left:20px;z-index:2;color:var(--running);font-variant-numeric:tabular-nums;cursor:help}
 #active-session-count{display:block;height:40px;overflow:hidden;font-size:32px;line-height:40px;font-weight:500;position:relative}
 #active-session-count .metric-reel{display:block;line-height:40px}#active-session-count .metric-digit{height:40px}
+#active-tps{display:block;margin-top:-2px;font-size:12px;line-height:16px;font-weight:600;white-space:nowrap;opacity:.85}
+#active-tps[hidden]{display:none}
 .hud[data-layout="tall"] .active-sessions{display:none}
 @media(max-height:540px){.active-sessions{display:none}}
 .hud[data-layout="wide"] .routes{padding-left:20px}

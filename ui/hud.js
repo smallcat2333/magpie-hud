@@ -186,6 +186,18 @@
     });
   }
 
+  function speedBucket(value) {
+    return value < 30 ? 'red' : value < 60 ? 'yellow' : value < 120 ? 'blue' : value < 200 ? 'green' : 'purple';
+  }
+
+  function attachCardHistory(button, scope) {
+    // 履历会清除卡片内的原生提示；仅保留实时 TPS 的估算口径。
+    const metrics = button.querySelector('.card-metrics[data-live]');
+    const title = metrics?.title;
+    window.hudHistory?.attach(button, scope);
+    if (metrics) metrics.title = title;
+  }
+
   /** 创建一块两行路由卡；只有本地固定路径可用于图片 src。 */
   function createCard(card, session) {
     const button = document.createElement('button');
@@ -314,19 +326,29 @@
     copy.append(top, tag, bottom, effort);
     const metrics = document.createElement('span');
     metrics.className = 'card-metrics';
-    const tps = card.tokensPerSecond;
-    const hasSpeed = Number.isFinite(tps) && tps >= 0;
-    if (hasSpeed) metrics.dataset.speed = tps < 30 ? 'red' : tps < 60 ? 'yellow' : tps < 120 ? 'blue' : tps < 200 ? 'green' : 'purple';
+    const { value, live, text: speedText } = window.hudLiveSpeed.cardSpeed(card, isLiveState(card.state));
+    if (value !== null) metrics.dataset.speed = speedBucket(value);
     const tokens = document.createElement('span');
     tokens.className = 'card-tokens';
     const previous = Boolean(card.metricsArePrevious);
     tokens.textContent = card.tokens == null ? '-- TOK' : `${compact(card.tokens)} TOK`;
     const speed = document.createElement('span');
     speed.className = 'card-tps';
-    speed.textContent = hasSpeed ? `${tps.toFixed(1)} TPS` : '-- TPS';
+    speed.textContent = speedText;
     metrics.title = [card.tokens == null ? '' : `${Number(card.tokens).toLocaleString('zh-CN')} Token`, previous
       ? '进行中请求尚无精确用量；这里显示该会话上一轮已完成请求。Token = 输入 + 输出 + 缓存读取；TPS = 输出 / (总耗时 − 首字耗时)。'
       : '本次请求 Token = 输入 + 输出 + 缓存读取；TPS = 输出 / (总耗时 − 首字耗时)。暂无上轮记录时，进行中等待最终用量。'].filter(Boolean).join('\n');
+    if (live) {
+      const fallback = window.hudLiveSpeed.cardSpeed(card, false);
+      metrics.dataset.live = 'true';
+      metrics.dataset.fallbackSpeed = fallback.value === null ? '' : speedBucket(fallback.value);
+      metrics.dataset.fallbackText = fallback.text;
+      metrics.dataset.fallbackTitle = metrics.title;
+      const output = Number.isInteger(card.liveOutputTokens) && card.liveOutputTokens >= 0
+        ? `；本轮已输出 ≈${card.liveOutputTokens.toLocaleString('zh-CN')} Token` : '';
+      const tokenDetail = card.tokens == null ? '暂无上一轮 Token 记录。' : 'Token 为上一轮已完成请求。';
+      metrics.title = `TPS 为本轮实时估算（网关按已输出 Token 推算）${output}。${tokenDetail}完成后更新为精确值。`;
+    }
     metrics.append(tokens, speed);
     const clock = document.createElement('span');
     clock.className = 'card-time';
@@ -353,7 +375,7 @@
       routeList.querySelectorAll('.route-card,.subagent-row').forEach(element => element.classList.toggle('selected', element === button));
       renderNotes([card.note], [session]);
     });
-    window.hudHistory?.attach(button, {
+    attachCardHistory(button, {
       session: card.historySession || session.id, subagent: card.subagentId || '',
       label: session.label, source: sourceLabel(session), route: groups.length ? model.title : '',
     });
@@ -575,7 +597,7 @@
     created.title = start ? `请求创建时间 ${card.time}` : '请求创建时间未提供';
     created.setAttribute('aria-label', created.title);
     button.replaceChildren(button.querySelector('.model-icon'), name, model, created, state, effort, metrics);
-    window.hudHistory?.attach(button, {
+    attachCardHistory(button, {
       session: card.historySession || session.id, subagent: card.subagentId || card.id,
       label, source: sourceLabel(session),
     });
@@ -630,6 +652,17 @@
     if (!Number.isFinite(value)) return '—';
     if (value > 0 && value < .01) return '<$0.01';
     return `$${value.toFixed(value < 10 ? 2 : value < 100 ? 1 : 0)}`;
+  }
+
+  /** 合计当前范围内主请求与子 Agent 的实时 TPS。 */
+  function renderActiveSpeed(sessions) {
+    const element = byId('active-tps');
+    const cards = sessions.flatMap(session => [
+      ...session.routes.filter(card => isLiveState(card.state)), ...activeSubagents(session),
+    ]);
+    const { tokensPerSecond, streams } = window.hudLiveSpeed.aggregate(cards);
+    element.hidden = streams === 0;
+    element.textContent = streams ? `${Math.round(tokensPerSecond)} TPS` : '';
   }
 
   /** 当日输出速度为 Σout / Σ(ms−ttft_ms)，不把输入或缓存读计为输出吞吐。 */
@@ -1366,6 +1399,7 @@
     const activeScope = session ? session.label : statsScope();
     const activeHint = `${activeScope}：${activeCount} 个会话正在同时请求（含正在请求的子 Agent，同一会话只计一次）`;
     window.hudMotion.roll(byId('active-session-count'), String(activeCount));
+    renderActiveSpeed(session ? [session] : allSessions);
     byId('active-sessions').title = activeHint;
     byId('active-sessions').setAttribute('aria-label', activeHint);
     hud.dataset.scope = session ? 'session' : 'all';
@@ -1695,6 +1729,16 @@
   /** 断线先留下最后的路由，但去掉仍在流动的运行态。 */
   function softenLiveRoutes() {
     if (linkStale()) hud.dataset.state = 'disconnected';
+    byId('active-tps').hidden = true;
+    // 连同退场动画内的卡片一起恢复上一轮读数。
+    hud.querySelectorAll('.card-metrics[data-live]').forEach(metrics => {
+      const { fallbackSpeed, fallbackText, fallbackTitle } = metrics.dataset;
+      if (fallbackSpeed) metrics.dataset.speed = fallbackSpeed;
+      else delete metrics.dataset.speed;
+      metrics.querySelector('.card-tps').textContent = fallbackText;
+      metrics.title = fallbackTitle;
+      delete metrics.dataset.live;
+    });
     routeList.querySelectorAll('.route-card.running, .route-card.waiting').forEach(card => {
       card.classList.remove('running', 'waiting');
       card.classList.add('unknown');

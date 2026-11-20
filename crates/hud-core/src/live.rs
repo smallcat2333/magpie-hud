@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const FIRST_RESPONSE_WAIT_MS: u64 = 15_000;
+const LIVE_RATE_INTERVAL_MS: i64 = 1_000;
 
 /// 路由长轮询的增量响应；ids 是当前保留集合，用于移除已淘汰请求。
 #[derive(Default, Deserialize)]
@@ -43,6 +44,12 @@ pub struct LiveRoute {
     pub done: bool,
     #[serde(default, rename = "firstText")]
     pub first_text: Option<u64>,
+    /// 网关估算的累计输出 Token；正文尚未到达时为空。
+    #[serde(default, rename = "estTok")]
+    pub est_tok: Option<u64>,
+    /// 网关时钟下最近一段正文的 Unix 毫秒时间戳。
+    #[serde(default, rename = "contentAt")]
+    pub content_at: Option<i64>,
     #[serde(default)]
     pub kind: String,
     /// 入口组；子组及其归属只用于把选中尝试映射回实际组链。
@@ -379,12 +386,58 @@ pub struct DecisionView {
 /// 累积的轮次索引上限；超出后按 route_id 递增顺序淘汰最旧条目。
 const TURN_HISTORY_CAP: usize = 8192;
 
+#[derive(Clone, Copy)]
+struct OutputSample {
+    content_at: i64,
+    est_tok: u64,
+}
+
+/// 用同一网关时钟下的首末正文采样估算输出速度。
+struct LiveOutputRate {
+    first: OutputSample,
+    latest: OutputSample,
+    published_at: i64,
+    published_rate: Option<f64>,
+}
+
+impl LiveOutputRate {
+    fn new(sample: OutputSample) -> Self {
+        Self {
+            first: sample,
+            latest: sample,
+            published_at: sample.content_at,
+            published_rate: None,
+        }
+    }
+
+    fn observe(&mut self, sample: OutputSample) {
+        if sample.est_tok < self.latest.est_tok {
+            // 累计估算回退后，用新采样重新起算。
+            *self = Self::new(sample);
+            return;
+        }
+        self.latest = sample;
+        // 首次发布从首个采样计时，之后按网关正文时间节流。
+        if sample.content_at.saturating_sub(self.published_at) < LIVE_RATE_INTERVAL_MS
+            || sample.est_tok <= self.first.est_tok
+        {
+            return;
+        }
+        let span = sample.content_at.abs_diff(self.first.content_at);
+        let rate = (sample.est_tok - self.first.est_tok) as f64 * 1000.0 / span as f64;
+        self.published_at = sample.content_at;
+        self.published_rate =
+            (rate <= crate::usage::MAX_TRUSTED_TPS).then(|| (rate * 10.0).round() / 10.0);
+    }
+}
+
 /// 实时状态与已完成用量独立；短暂失联保留最后状态，由通道健康状态明确标注过期。
 #[derive(Default)]
 pub struct LiveState {
     pub seq: i64,
     pid: u32,
     routes: BTreeMap<i64, LiveRoute>,
+    output_rates: HashMap<i64, LiveOutputRate>,
     /// trace 淘汰后仍记住已确认的辅助会话，避免完成卡再次出现。
     auxiliary_sessions: HashSet<String>,
     /// 按输入折叠履历所需的轮次元数据；网关重启清空（route_id 空间随之重置）。
@@ -404,6 +457,7 @@ impl LiveState {
     pub fn update(&mut self, update: TraceUpdate) {
         if self.pid != update.pid || update.seq < self.seq {
             self.routes.clear();
+            self.output_rates.clear();
             self.turn_history.clear();
             // 已确认网关重启时，旧进程的 activity 不能与新 route_id 配对。
             if self.pid != 0 { self.activity = Activity::default(); }
@@ -412,16 +466,38 @@ impl LiveState {
         self.seq = update.seq;
         let ids: HashSet<_> = update.ids.into_iter().collect();
         self.routes.retain(|id, _| ids.contains(id));
+        self.output_rates.retain(|id, _| ids.contains(id));
         for route in update.routes {
             if desktop_auxiliary(&route) && !route.session.is_empty() {
                 self.auxiliary_sessions.insert(route.session.clone());
             }
             self.remember_turn(&route);
+            self.sample_output(&route);
             self.routes.insert(route.id, route);
         }
         while self.turn_history.len() > TURN_HISTORY_CAP {
             self.turn_history.pop_first();
         }
+    }
+
+    fn sample_output(&mut self, route: &LiveRoute) {
+        if route.done {
+            self.output_rates.remove(&route.id);
+            return;
+        }
+        let (Some(content_at), Some(est_tok)) = (route.content_at, route.est_tok) else { return };
+        if self.output_rates.get(&route.id).is_some_and(|rate| content_at < rate.latest.content_at) {
+            return;
+        }
+        if est_tok == 0 {
+            self.output_rates.remove(&route.id);
+            return;
+        }
+        let sample = OutputSample { content_at, est_tok };
+        self.output_rates
+            .entry(route.id)
+            .or_insert_with(|| LiveOutputRate::new(sample))
+            .observe(sample);
     }
 
     /// 记录用户输入（轮）内的请求序号；标题生成/压缩等辅助调用自成一个合成轮，
@@ -572,8 +648,18 @@ impl LiveState {
             } else {
                 previous_metrics.get(session_id).copied()
             };
+            let in_progress = route.filter(|r| !r.done);
+            let live_output_tokens = in_progress.and_then(|r| r.est_tok);
+            let live_tokens_per_second = in_progress
+                .filter(|r| r.content_at.is_some() && live_output_tokens.is_some())
+                .and_then(|r| self.output_rates.get(&r.id))
+                .and_then(|rate| rate.published_rate);
             let second = Note { time: time.clone(), kind: "统计".into(),
-                text: if child.is_some() {
+                text: if live_tokens_per_second.is_some() {
+                    let scope = if child.is_some() { "该子 Agent 的" } else { "该会话的" };
+                    let tokens = if previous.is_some() { "Token 为上轮已完成请求" } else { "暂无上轮 Token 记录" };
+                    format!("{scope} TPS 为本轮实时估算（网关按已输出 Token 推算），{tokens}；本轮结束后更新为精确值，当日统计仅含已完成请求")
+                } else if child.is_some() {
                     if previous.is_some() {
                         "卡片数值为该子 Agent 上轮已完成请求；本轮结束后更新，当日统计仅含已完成请求".into()
                     } else {
@@ -592,6 +678,8 @@ impl LiveState {
                 current: true, route_id: (active.route > 0).then_some(active.route),
                 tokens: previous.and_then(|(tokens, _)| tokens),
                 tokens_per_second: previous.and_then(|(_, speed)| speed),
+                live_tokens_per_second,
+                live_output_tokens,
                 metrics_are_previous: previous.is_some(),
                 subagent_id: child.map(str::to_owned),
                 subagent_label: child.map(|id| self.child_label(session_id, id)),
@@ -2038,6 +2126,185 @@ mod tests {
         let mut finished = ledger.snapshot("h", "ready", None);
         live.apply(&mut finished);
         assert!(finished.sessions.is_empty());
+    }
+
+    fn output_sample_route(content_at: i64, est_tok: u64) -> LiveRoute {
+        LiveRoute {
+            id: 10,
+            session: "alpha".into(),
+            content_at: Some(content_at),
+            est_tok: Some(est_tok),
+            ..Default::default()
+        }
+    }
+
+    fn update_output_sample(live: &mut LiveState, content_at: i64, est_tok: u64) {
+        live.update(TraceUpdate {
+            pid: 1,
+            seq: live.seq + 1,
+            ids: vec![10],
+            routes: vec![output_sample_route(content_at, est_tok)],
+        });
+    }
+
+    #[test]
+    fn live_tps_uses_first_positive_sample_and_throttles_publication() {
+        let now = Local::now();
+        let ledger = UsageLedger::new(now.date_naive());
+        let mut live = LiveState::default();
+        live.activity.active.push(Active {
+            id: 1, route: 10, session: "alpha".into(),
+            started: now.to_rfc3339(), phase: "upstream".into(), ..Default::default()
+        });
+        for (content_at, est_tok, expected) in [
+            (900, 0, None),
+            (1000, 100, None),
+            (1400, 110, None),
+            (1999, 130, None),
+            (2080, 137, Some(34.3)),
+            (3079, 220, Some(34.3)),
+            (3080, 227, Some(61.1)),
+        ] {
+            update_output_sample(&mut live, content_at, est_tok);
+            let mut view = ledger.snapshot("h", "ready", None);
+            live.apply(&mut view);
+            let card = &view.sessions[0].routes[0];
+            assert_eq!(card.live_tokens_per_second, expected, "{content_at}");
+            assert_eq!(card.live_output_tokens, Some(est_tok));
+            assert_eq!(view.daily.requests, 0);
+        }
+    }
+
+    #[test]
+    fn live_tps_ignores_backwards_time_and_resets_after_token_decrease() {
+        let mut live = LiveState::default();
+        for (content_at, est_tok, expected) in [
+            (1000, 100, None),
+            (2000, 100, None),
+            (2100, 210, Some(100.0)),
+            (2099, 300, Some(100.0)),
+            (3100, 250, Some(71.4)),
+            (3500, 20, None),
+            (4499, 55, None),
+            (4500, 60, Some(40.0)),
+        ] {
+            update_output_sample(&mut live, content_at, est_tok);
+            assert_eq!(live.output_rates[&10].published_rate, expected, "{content_at}");
+        }
+        update_output_sample(&mut live, 5000, 0);
+        assert!(live.output_rates.is_empty());
+        update_output_sample(&mut live, 6500, 200);
+        assert_eq!(live.output_rates[&10].published_rate, None);
+    }
+
+    #[test]
+    fn live_tps_clears_on_completion_eviction_pid_change_and_seq_rollback() {
+        let done = LiveRoute { done: true, ..output_sample_route(3000, 300) };
+        for (cause, update) in [
+            ("done", TraceUpdate { pid: 1, seq: 3, ids: vec![10], routes: vec![done] }),
+            ("eviction", TraceUpdate { pid: 1, seq: 3, ..Default::default() }),
+            ("pid", TraceUpdate { pid: 2, seq: 3, ids: vec![10], ..Default::default() }),
+            ("seq", TraceUpdate { pid: 1, seq: 1, ids: vec![10], ..Default::default() }),
+        ] {
+            let mut live = LiveState::default();
+            update_output_sample(&mut live, 1000, 100);
+            update_output_sample(&mut live, 2000, 200);
+            assert_eq!(live.output_rates[&10].published_rate, Some(100.0));
+            live.update(update);
+            assert!(live.output_rates.is_empty(), "{cause}");
+        }
+    }
+
+    #[test]
+    fn live_tps_handles_missing_gateway_fields() {
+        let now = Local::now();
+        let ledger = UsageLedger::new(now.date_naive());
+        let mut live = LiveState::default();
+        live.activity.active.push(Active {
+            id: 1, route: 10, session: "alpha".into(),
+            started: now.to_rfc3339(), phase: "upstream".into(), ..Default::default()
+        });
+        update_output_sample(&mut live, 1000, 100);
+        update_output_sample(&mut live, 2000, 200);
+        assert_eq!(live.output_rates[&10].published_rate, Some(100.0));
+        for (json, expected_tokens) in [
+            (r#"{"id":10,"session":"alpha"}"#, None),
+            (r#"{"id":10,"session":"alpha","estTok":null,"contentAt":null}"#, None),
+            (r#"{"id":10,"session":"alpha","contentAt":3000}"#, None),
+            (r#"{"id":10,"session":"alpha","estTok":300}"#, Some(300)),
+        ] {
+            live.update(TraceUpdate {
+                pid: 1,
+                seq: live.seq + 1,
+                ids: vec![10],
+                routes: vec![serde_json::from_str(json).unwrap()],
+            });
+            let mut view = ledger.snapshot("h", "ready", None);
+            live.apply(&mut view);
+            let session = &view.sessions[0];
+            let card = &session.routes[0];
+            assert_eq!(card.state, "running");
+            assert_eq!(card.live_tokens_per_second, None);
+            assert_eq!(card.live_output_tokens, expected_tokens);
+            assert_eq!(session.notes[1].text, "该会话暂无上轮记录，本次 Token / TPS 等待完成；当日统计仅含已完成请求");
+        }
+    }
+
+    #[test]
+    fn live_tps_discards_rates_above_the_trusted_limit() {
+        let mut live = LiveState::default();
+        for (content_at, est_tok, expected) in [
+            (1000, 10, None),
+            (2000, 2010, Some(2000.0)),
+            (3000, 4011, None),
+            (4000, 5510, Some(1833.3)),
+        ] {
+            update_output_sample(&mut live, content_at, est_tok);
+            assert_eq!(live.output_rates[&10].published_rate, expected, "{content_at}");
+        }
+    }
+
+    #[test]
+    fn live_tps_card_fields_serialize_and_preserve_previous_metrics() {
+        let now = Local::now();
+        let mut ledger = UsageLedger::new(now.date_naive());
+        let row = serde_json::json!({"route_id":1,"t":now.to_rfc3339(),"session":"alpha",
+            "providerAccount":"test@example.com","provider":"codex","model":"test","status":200,
+            "in":100,"out":100,"cache_read":800,"ms":3000,"ttft_ms":1000});
+        ledger.ingest(row.to_string().as_bytes());
+        let mut live = LiveState::default();
+        live.activity.active.push(Active {
+            id: 1, route: 10, session: "alpha".into(),
+            started: now.to_rfc3339(), phase: "upstream".into(), ..Default::default()
+        });
+        live.update(serde_json::from_str(r#"{"pid":1,"seq":1,"ids":[10],
+            "routes":[{"id":10,"session":"alpha","estTok":120,"contentAt":1000}]}"#).unwrap());
+        update_output_sample(&mut live, 2000, 140);
+        let baseline = ledger.snapshot("h", "ready", None);
+        let mut view = baseline.clone();
+        live.apply(&mut view);
+        let session = &view.sessions[0];
+        let card = &session.routes[0];
+        assert_eq!(card.tokens, Some(1000));
+        assert_eq!(card.tokens_per_second, Some(50.0));
+        assert!(card.metrics_are_previous);
+        assert_eq!(view.daily, baseline.daily);
+        assert!(session.notes[1].text.contains("TPS 为本轮实时估算"));
+        assert!(session.notes[1].text.contains("Token 为上轮已完成请求"));
+        let json = serde_json::to_value(card).unwrap();
+        assert_eq!(json["liveTokensPerSecond"], 20.0);
+        assert_eq!(json["liveOutputTokens"], 140);
+
+        live.update(TraceUpdate { pid: 1, seq: 3, ids: vec![10], routes: vec![
+            LiveRoute { done: true, ..output_sample_route(3000, 150) },
+        ] });
+        let mut settling = baseline.clone();
+        live.apply(&mut settling);
+        for card in [&baseline.sessions[0].routes[0], &settling.sessions[0].routes[0]] {
+            let json = serde_json::to_value(card).unwrap();
+            assert!(json.get("liveTokensPerSecond").is_none());
+            assert!(json.get("liveOutputTokens").is_none());
+        }
     }
 
     /// 进行中请求的 usage 记录还没落地，沿用该会话已完成记录的网关密钥，

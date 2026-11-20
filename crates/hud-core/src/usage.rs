@@ -81,7 +81,7 @@ impl DailyStats {
 }
 
 /// 单条速度样本可信的上限。生成窗口不足 1 秒还超过它，是首字时间被戳到请求末尾的假样本。
-const MAX_TRUSTED_TPS: f64 = 2000.0;
+pub(crate) const MAX_TRUSTED_TPS: f64 = 2000.0;
 /// 生成窗口达到这个长度时按实测保留，不再用速度上限筛选。
 const MIN_TRUSTED_WINDOW_MS: f64 = 1000.0;
 
@@ -266,6 +266,12 @@ pub struct RouteCard {
     pub route_id: Option<i64>,
     pub tokens: Option<u64>,
     pub tokens_per_second: Option<f64>,
+    /// 进行中请求的实时输出速度（网关估算 Token ÷ 正文时长）；完成或无数据时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_tokens_per_second: Option<f64>,
+    /// 进行中请求已输出的估算 Token（网关 estTok）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_output_tokens: Option<u64>,
     #[serde(default)]
     pub metrics_are_previous: bool,
     /// 子 Agent 请求身份。根会话请求为 None；前端用它挂到父会话下方。
@@ -635,6 +641,8 @@ impl UsageLedger {
                     tokens_per_second: record
                         .speed_duration()
                         .map(|ms| record.output as f64 * 1000.0 / ms),
+                    live_tokens_per_second: None,
+                    live_output_tokens: None,
                     metrics_are_previous: false,
                     subagent_id: (!record.subagent.is_empty()).then(|| record.subagent.clone()),
                     subagent_label: (!record.subagent.is_empty()).then(|| crate::live::fallback_child_label(&record.subagent)),
@@ -1956,7 +1964,7 @@ mod tests {
         assert!(view.sessions.is_empty());
         assert_eq!(view.notes[0].time, "--:--:--");
         assert_eq!(view.daily.requests, 0);
-        assert_eq!(view.state, "warning");
+        assert_eq!(view.state, "waiting");
     }
 
     /// 跨日日志能记住最早有效记录日期，且按日独立扫描不会污染实时账本，同时完整统计当天全部会话。
